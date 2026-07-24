@@ -1,14 +1,18 @@
 package com.dicacros.picture;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.View;
 import android.webkit.CookieManager;
@@ -25,36 +29,22 @@ import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
+import android.widget.Toast;
 
-import org.json.JSONArray;
-import org.json.JSONObject;
-import org.json.JSONTokener;
-
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 네이버 블로그 글쓰기 자동화.
+ * 네이버 블로그 글쓰기 + 완전 자동화 콘솔.
  *
- *  - macdcross / dicajohn / 임의 아이디 로그인 (쿠키 스냅샷으로 다계정 세션 유지 — nfriendcl 방식)
- *  - adsensefarm.kr/realtime 의 다음·구글·크리에이터 어드바이저 실시간 검색어를 WebView DOM 에서 추출
- *  - Gemini / ChatGPT API 로 상세 지침에 맞춘 블로그 초안 생성 + 후처리 정리
- *  - 하단 스플릿뷰(네이버/ChatGPT), 시크바로 비율 조절
- *  - 문단 사이 사진 업로드 슬롯 삽입, 옵션 저장, 일괄 실행
- *  - WebView 파일 선택 지원 → 네이버 에디터에서 작업한 사진 직접 업로드
+ *  - macdcross/dicajohn/임의 아이디 다계정 로그인(쿠키 스냅샷)
+ *  - adsensefarm 실시간 검색어 추출 → Gemini/ChatGPT 로 지침 기반 초안 생성(BlogGenerator)
+ *  - 발행 방식: 초안만 / 앱 내 WebView 자동 발행 / 네이버 앱 스플릿뷰 + 접근성 자동 탭
+ *  - 화면 꺼짐·백그라운드 1시간 주기 완전 자동화(BlogAutoService + AlarmManager)
+ *  - 모든 옵션은 AutoConfig 에 저장되어 앱을 껏다 켜도, 재부팅해도 유지
  */
 public class BlogWriterActivity extends Activity {
 
@@ -63,10 +53,8 @@ public class BlogWriterActivity extends Activity {
     private static final String DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     + "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
-    private static final String PREFS = "picture_blog";
     private static final int REQUEST_FILE_CHOOSER = 2001;
-    private static final String DEFAULT_OPENAI_MODEL = "gpt-4.1";
-    private static final String DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
+    private static final int REQUEST_NOTIFICATIONS = 2002;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -79,10 +67,12 @@ public class BlogWriterActivity extends Activity {
     private EditText geminiModelInput;
     private EditText topicInput;
     private EditText draftInput;
+    private EditText intervalInput;
     private EditText resultOutput;
     private TextView statusText;
     private TextView accountStatusText;
     private TextView keywordPreview;
+    private TextView autoStatusText;
     private ProgressBar progressBar;
 
     private WebView workWeb;
@@ -92,14 +82,15 @@ public class BlogWriterActivity extends Activity {
     private CheckBox optImageSlots;
     private CheckBox optRealtime;
     private CheckBox optRelated;
+    private CheckBox autoPublishCheck;
     private CheckBox srcDaum;
     private CheckBox srcGoogle;
     private CheckBox srcCreator;
 
     private final List<String> collectedKeywords = new ArrayList<>();
     private boolean pendingKeywordExtract = false;
-    private boolean generateAfterKeywords = false;
-    private boolean openWriterAfterGenerate = false;
+    private boolean pendingWebPublish = false;
+    private Runnable afterKeywords = null;
 
     private ValueCallback<Uri[]> fileChooserCallback;
 
@@ -111,10 +102,18 @@ public class BlogWriterActivity extends Activity {
         setupWebView(workWeb, true);
         setupWebView(chatgptWeb, false);
         loadSettings();
+        requestNotificationsIfNeeded();
         NaverAccounts.applyTo(this, currentBlogId, had -> updateAccountLabel(had));
         chatgptWeb.loadUrl(CHATGPT_URL);
         workWeb.loadUrl(REALTIME_URL);
-        setStatus(currentBlogId + " 선택됨. 로그인하거나 블로그 초안을 생성하세요.");
+        updateAutoStatus();
+        setStatus(currentBlogId + " 선택됨. 로그인하거나 초안을 생성하세요.");
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        updateAutoStatus();
     }
 
     @Override
@@ -154,7 +153,7 @@ public class BlogWriterActivity extends Activity {
         controlsScroll.addView(controls);
         root.addView(controlsScroll, new LinearLayout.LayoutParams(-1, 0, 7f));
 
-        controls.addView(title("네이버 블로그 글쓰기"));
+        controls.addView(title("네이버 블로그 자동화"));
 
         LinearLayout accountRow = row();
         accountRow.addView(smallButton(NaverAccounts.IDS[0], v -> selectAccount(NaverAccounts.IDS[0])));
@@ -165,15 +164,13 @@ public class BlogWriterActivity extends Activity {
         controls.addView(customIdInput);
         controls.addView(fullButton("선택한 계정으로 로그인", v -> loginSelected()));
 
-        accountStatusText = new TextView(this);
-        accountStatusText.setTextColor(Color.rgb(52, 64, 84));
-        accountStatusText.setTextSize(13);
+        accountStatusText = smallLabel("");
         controls.addView(accountStatusText);
 
         openAiKeyInput = input("ChatGPT API key");
         geminiKeyInput = input("Gemini API key");
-        openAiModelInput = input("ChatGPT 모델 (기본 " + DEFAULT_OPENAI_MODEL + ")");
-        geminiModelInput = input("Gemini 모델 (기본 " + DEFAULT_GEMINI_MODEL + ")");
+        openAiModelInput = input("ChatGPT 모델 (기본 gpt-4.1)");
+        geminiModelInput = input("Gemini 모델 (기본 gemini-2.5-flash)");
         topicInput = input("주제 또는 시드 키워드 (예: 폰 미래 전망)");
         draftInput = multiInput("여기에 사용자가 복사한 원문(폰 미래 전망 글)을 붙여넣으세요");
         controls.addView(openAiKeyInput);
@@ -195,36 +192,56 @@ public class BlogWriterActivity extends Activity {
 
         optRealtime = check("실시간 키워드 사용", true);
         optRelated = check("연관 키워드 확장", true);
-        optImageSlots = check("문단 사이 사진 업로드 슬롯 넣기", true);
+        optImageSlots = check("문단 사이 사진 업로드 슬롯", true);
+        autoPublishCheck = check("발행 버튼까지 자동으로 누르기", true);
         controls.addView(optRealtime);
         controls.addView(optRelated);
         controls.addView(optImageSlots);
+        controls.addView(autoPublishCheck);
 
-        keywordPreview = new TextView(this);
-        keywordPreview.setTextColor(Color.rgb(71, 84, 103));
-        keywordPreview.setTextSize(12);
-        keywordPreview.setPadding(0, dp(6), 0, dp(6));
-        keywordPreview.setText("실시간 키워드가 여기에 표시됩니다.");
+        controls.addView(label("발행 방식"));
+        LinearLayout targetRow = row();
+        targetRow.addView(smallButton("초안만", v -> setTarget(AutoConfig.TARGET_DRAFT)));
+        targetRow.addView(smallButton("웹뷰 발행", v -> setTarget(AutoConfig.TARGET_WEBVIEW)));
+        targetRow.addView(smallButton("네이버앱", v -> setTarget(AutoConfig.TARGET_APP)));
+        controls.addView(targetRow);
+
+        keywordPreview = smallLabel("실시간 키워드가 여기에 표시됩니다.");
         controls.addView(keywordPreview);
 
         LinearLayout actionRow = row();
-        actionRow.addView(smallButton("실시간 키워드", v -> fetchKeywords(false)));
-        actionRow.addView(smallButton("블로그 생성", v -> generateBlog(false)));
+        actionRow.addView(smallButton("실시간 키워드", v -> fetchKeywords(null)));
+        actionRow.addView(smallButton("블로그 생성", v -> generateBlog(GenAfter.NONE)));
         actionRow.addView(smallButton("일괄 실행", v -> runBatch()));
         controls.addView(actionRow);
 
         LinearLayout action2 = row();
         action2.addView(smallButton("네이버 글쓰기 열기", v -> openNaverWriter()));
-        action2.addView(smallButton("결과 복사", v -> copyResult()));
+        action2.addView(smallButton("웹뷰 지금 발행", v -> publishNowWebView()));
         controls.addView(action2);
+
+        LinearLayout action3 = row();
+        action3.addView(smallButton("네이버앱 스플릿뷰", v -> launchNaverAppSplit()));
+        action3.addView(smallButton("접근성 설정", v -> openAccessibilitySettings()));
+        action3.addView(smallButton("결과 복사", v -> copyResult()));
+        controls.addView(action3);
+
+        controls.addView(label("완전 자동화 (화면 꺼짐/백그라운드에서도 주기 실행)"));
+        LinearLayout autoRow = row();
+        intervalInput = input("주기(분), 기본 60");
+        intervalInput.setLayoutParams(new LinearLayout.LayoutParams(0, dp(46), 1f));
+        autoRow.addView(intervalInput);
+        autoRow.addView(fullButtonWeighted("자동화 시작/중지", v -> toggleAutomation()));
+        controls.addView(autoRow);
+
+        autoStatusText = smallLabel("");
+        controls.addView(autoStatusText);
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         controls.addView(progressBar, new LinearLayout.LayoutParams(-1, dp(10)));
 
-        statusText = new TextView(this);
-        statusText.setTextColor(Color.rgb(52, 64, 84));
-        statusText.setTextSize(13);
+        statusText = smallLabel("");
         controls.addView(statusText);
 
         resultOutput = multiInput("생성된 블로그 글이 여기에 나타납니다.");
@@ -288,9 +305,15 @@ public class BlogWriterActivity extends Activity {
                     NaverAccounts.saveCurrentFor(BlogWriterActivity.this, currentBlogId);
                     updateAccountLabel(true);
                 }
-                if (view == workWeb && pendingKeywordExtract && url.contains("adsensefarm")) {
+                if (view != workWeb) {
+                    return;
+                }
+                if (pendingKeywordExtract && url.contains("adsensefarm")) {
                     pendingKeywordExtract = false;
-                    view.postDelayed(() -> extractKeywordsFromWorkWeb(), 1200);
+                    view.postDelayed(() -> extractKeywords(), 1200);
+                } else if (pendingWebPublish && url.contains("blog.naver.com")) {
+                    pendingWebPublish = false;
+                    view.postDelayed(() -> runWebPublish(), 2800);
                 }
             }
         });
@@ -350,6 +373,7 @@ public class BlogWriterActivity extends Activity {
             NaverAccounts.saveCurrentFor(this, currentBlogId);
         }
         currentBlogId = targetId;
+        AutoConfig.setString(this, "account", targetId);
         NaverAccounts.applyTo(this, targetId, had -> updateAccountLabel(had));
         setStatus(targetId + " 계정으로 전환했습니다.");
     }
@@ -365,13 +389,15 @@ public class BlogWriterActivity extends Activity {
             switchAccount(customId);
         }
         pendingKeywordExtract = false;
+        pendingWebPublish = false;
         workWeb.loadUrl(NaverAccounts.LOGIN_URL);
-        setStatus(currentBlogId + " 로그인 화면을 열었습니다. 로그인 후 글쓰기 열기를 누르세요.");
+        setStatus(currentBlogId + " 로그인 화면을 열었습니다. 로그인 후 글쓰기를 진행하세요.");
     }
 
     private void openNaverWriter() {
         String id = selectedBlogId();
         pendingKeywordExtract = false;
+        pendingWebPublish = false;
         workWeb.loadUrl("https://blog.naver.com/" + urlEncode(id) + "?Redirect=Write");
         setStatus(id + " 글쓰기 화면. 복사한 초안을 붙여넣고 사진을 업로드하세요.");
     }
@@ -388,152 +414,102 @@ public class BlogWriterActivity extends Activity {
     }
 
     // ---------------------------------------------------------------
-    //  실시간 키워드 추출 (WebView DOM)
+    //  실시간 키워드 (콜백 방식)
     // ---------------------------------------------------------------
-    private void fetchKeywords(boolean thenGenerate) {
-        generateAfterKeywords = thenGenerate;
+    private void fetchKeywords(Runnable then) {
+        afterKeywords = then;
         pendingKeywordExtract = true;
         progressBar.setProgress(15);
         setStatus("adsensefarm 실시간 검색어 페이지를 여는 중...");
         String current = workWeb.getUrl();
         if (current != null && current.contains("adsensefarm")) {
-            // 이미 실시간 페이지가 열려 있으면 바로 추출.
             pendingKeywordExtract = false;
-            extractKeywordsFromWorkWeb();
+            extractKeywords();
         } else {
             workWeb.loadUrl(REALTIME_URL);
         }
     }
 
-    private void extractKeywordsFromWorkWeb() {
-        final String js = "(function(){try{var s=[];var push=function(t){t=(t||'').replace(/\\s+/g,' ').trim();"
-                + "if(t.length>=2&&t.length<=30&&s.indexOf(t)<0)s.push(t);};"
-                + "var els=document.querySelectorAll('a,li,td,span,strong,p,div');"
-                + "for(var i=0;i<els.length;i++){var el=els[i];if(el.children&&el.children.length>0)continue;"
-                + "push(el.innerText||el.textContent);}return JSON.stringify(s.slice(0,500));}"
-                + "catch(e){return JSON.stringify([]);}})();";
-        workWeb.evaluateJavascript(js, value -> {
-            List<String> parsed = parseKeywordJson(value);
+    private void extractKeywords() {
+        workWeb.evaluateJavascript(BlogGenerator.KEYWORD_EXTRACT_JS, value -> {
             collectedKeywords.clear();
-            Set<String> dedup = new LinkedHashSet<>();
-            for (String k : parsed) {
-                if (looksLikeKeyword(k)) {
-                    dedup.add(k);
-                }
-                if (dedup.size() >= 30) {
-                    break;
-                }
-            }
-            collectedKeywords.addAll(dedup);
+            collectedKeywords.addAll(
+                    BlogGenerator.filterKeywords(BlogGenerator.parseKeywordJson(value), 30));
             if (collectedKeywords.isEmpty()) {
                 keywordPreview.setText("키워드를 찾지 못했습니다. 실시간 페이지 로그인이 필요하면 웹뷰에서 로그인 후 다시 시도하세요.");
                 setStatus("실시간 키워드 추출 실패.");
             } else {
                 keywordPreview.setText("실시간 키워드 " + collectedKeywords.size() + "개: "
-                        + join(collectedKeywords, ", "));
+                        + BlogGenerator.join(collectedKeywords, ", "));
                 setStatus("실시간 키워드 " + collectedKeywords.size() + "개 확보.");
             }
             progressBar.setProgress(35);
-            if (generateAfterKeywords) {
-                generateAfterKeywords = false;
-                generateBlog(openWriterAfterGenerate);
+            Runnable then = afterKeywords;
+            afterKeywords = null;
+            if (then != null) {
+                then.run();
             }
         });
     }
 
-    private List<String> parseKeywordJson(String rawValue) {
-        List<String> out = new ArrayList<>();
-        if (rawValue == null || rawValue.isEmpty() || "null".equals(rawValue)) {
-            return out;
-        }
-        try {
-            Object first = new JSONTokener(rawValue).nextValue();
-            String inner = (first instanceof String) ? (String) first : rawValue;
-            JSONArray arr = new JSONArray(inner);
-            for (int i = 0; i < arr.length(); i++) {
-                String s = arr.optString(i, "").trim();
-                if (!s.isEmpty()) {
-                    out.add(s);
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return out;
-    }
-
-    private boolean looksLikeKeyword(String text) {
-        if (text == null) {
-            return false;
-        }
-        int len = text.length();
-        if (len < 2 || len > 28) {
-            return false;
-        }
-        String lower = text.toLowerCase(Locale.ROOT);
-        String[] banned = {"adsense", "login", "menu", "http", "www", "copyright", "cookie",
-                "로그인", "회원가입", "광고", "실시간", "검색어", "순위", "더보기", "저작권", "바로가기",
-                "고객센터", "이용약관", "개인정보", "뉴스", "전체", "카테고리", "구독", "댓글"};
-        for (String b : banned) {
-            if (lower.contains(b)) {
-                return false;
-            }
-        }
-        if (!text.matches(".*[가-힣a-zA-Z].*")) {
-            return false;
-        }
-        // 숫자/기호만이거나 순위표시(1위 등)로만 이루어진 짧은 토큰 배제.
-        return !text.matches("^[0-9]+\\s*위?$");
-    }
-
     // ---------------------------------------------------------------
-    //  블로그 생성
+    //  생성
     // ---------------------------------------------------------------
+    private enum GenAfter { NONE, OPEN_WRITER, WEB_PUBLISH }
+
     private void runBatch() {
-        openWriterAfterGenerate = true;
         setStatus("일괄 실행: 키워드 수집 → 초안 생성 → 복사 → 글쓰기 열기");
         if (optRealtime.isChecked()) {
-            fetchKeywords(true);
+            fetchKeywords(() -> generateBlog(GenAfter.OPEN_WRITER));
         } else {
-            generateBlog(true);
+            generateBlog(GenAfter.OPEN_WRITER);
         }
     }
 
-    private void generateBlog(final boolean openWriter) {
+    private void publishNowWebView() {
+        setStatus("웹뷰 자동 발행: 초안 생성 후 발행까지 시도합니다.");
+        if (optRealtime.isChecked() && collectedKeywords.isEmpty()) {
+            fetchKeywords(() -> generateBlog(GenAfter.WEB_PUBLISH));
+        } else {
+            generateBlog(GenAfter.WEB_PUBLISH);
+        }
+    }
+
+    private void generateBlog(final GenAfter after) {
         progressBar.setProgress(45);
         setStatus("프롬프트를 준비하고 API를 호출합니다...");
+        saveSettings();
         final List<String> keywords = new ArrayList<>(collectedKeywords);
         final String openAiKey = openAiKeyInput.getText().toString().trim();
         final String geminiKey = geminiKeyInput.getText().toString().trim();
-        final String openAiModel = modelOr(openAiModelInput, DEFAULT_OPENAI_MODEL);
-        final String geminiModel = modelOr(geminiModelInput, DEFAULT_GEMINI_MODEL);
+        final String openAiModel = AutoConfig.openAiModel(this);
+        final String geminiModel = AutoConfig.geminiModel(this);
         final boolean imageSlots = optImageSlots.isChecked();
         final boolean related = optRelated.isChecked();
-        final String prompt = buildBlogPrompt(keywords, imageSlots, related);
+        final String topic = topicInput.getText().toString().trim();
+        final String base = draftInput.getText().toString().trim();
+        final String prompt = BlogGenerator.buildBlogPrompt(topic, base, keywords, imageSlots, related);
 
         executor.execute(() -> {
             try {
-                String result;
-                if (!openAiKey.isEmpty()) {
-                    result = callOpenAi(openAiKey, openAiModel, prompt);
-                } else if (!geminiKey.isEmpty()) {
-                    result = callGemini(geminiKey, geminiModel, prompt);
-                } else {
-                    // 키가 없으면 프롬프트를 그대로 넘겨 ChatGPT 스플릿뷰에 붙여넣어 쓸 수 있게 한다.
-                    result = prompt;
-                }
-                String cleaned = postProcess(result, imageSlots);
+                String raw = BlogGenerator.generate(openAiKey, openAiModel, geminiKey, geminiModel, prompt);
+                String cleaned = BlogGenerator.postProcess(raw, imageSlots);
                 runOnUiThread(() -> {
                     resultOutput.setText(cleaned);
+                    AutoConfig.setString(this, "last_result", cleaned);
                     progressBar.setProgress(100);
                     copyToClipboard(cleaned);
-                    if (openWriter) {
-                        openWriterAfterGenerate = false;
+                    boolean noKey = openAiKey.isEmpty() && geminiKey.isEmpty();
+                    if (after == GenAfter.OPEN_WRITER) {
                         setStatus("초안 생성·복사 완료. 글쓰기 화면을 엽니다.");
                         openNaverWriter();
+                    } else if (after == GenAfter.WEB_PUBLISH) {
+                        setStatus("초안 생성·복사 완료. 웹뷰 자동 발행을 시작합니다.");
+                        startWebPublish();
                     } else {
-                        setStatus(openAiKey.isEmpty() && geminiKey.isEmpty()
+                        setStatus(noKey
                                 ? "API 키가 없어 프롬프트를 복사했습니다. ChatGPT 스플릿뷰에 붙여넣으세요."
-                                : "초안 생성·복사 완료. 글쓰기 열기를 누르세요.");
+                                : "초안 생성·복사 완료.");
                     }
                 });
             } catch (Exception exception) {
@@ -545,240 +521,212 @@ public class BlogWriterActivity extends Activity {
         });
     }
 
-    private String modelOr(EditText field, String fallback) {
-        String v = field.getText().toString().trim();
-        return v.isEmpty() ? fallback : v;
+    // ---------------------------------------------------------------
+    //  웹뷰 자동 발행
+    // ---------------------------------------------------------------
+    private void startWebPublish() {
+        String id = selectedBlogId();
+        pendingWebPublish = true;
+        pendingKeywordExtract = false;
+        workWeb.loadUrl(NaverPublisher.writeUrl(id));
+        setStatus("네이버 글쓰기 화면 로딩 후 자동 입력·발행을 시도합니다.");
     }
 
-    private String buildBlogPrompt(List<String> keywords, boolean imageSlots, boolean related) {
-        String topic = topicInput.getText().toString().trim();
-        if (topic.isEmpty()) {
-            topic = "폰 미래 전망";
+    private void runWebPublish() {
+        String content = resultOutput.getText().toString();
+        if (TextUtils.isEmpty(content)) {
+            setStatus("발행할 내용이 없습니다. 먼저 초안을 생성하세요.");
+            return;
         }
-        String baseText = draftInput.getText().toString().trim();
-        StringBuilder sb = new StringBuilder();
-        sb.append("당신은 SEO에 정통한 전문 블로거입니다. 아래 지침을 100% 지켜 네이버 블로그 글을 작성하세요.\n\n");
-        sb.append("주제: ").append(topic).append('\n');
-        if (!keywords.isEmpty()) {
-            sb.append("참고 실시간 검색어(다음·구글·크리에이터 어드바이저): ")
-                    .append(join(keywords, ", ")).append('\n');
-            sb.append("이 중 잠깐 보고 마는 일회성 키워드는 버리고, 사람들이 오래 궁금해할 검색 의도가 강한 키워드를 골라 활용하세요.\n");
-        }
-        if (related) {
-            sb.append("고른 키워드에서 사람들이 함께 궁금해할 연관 검색어까지 스스로 확장해 글에 자연스럽게 녹이세요.\n");
-        }
-        if (!baseText.isEmpty()) {
-            sb.append("\n사용자가 붙여넣은 원문(이 내용을 토대로 확장·재구성):\n").append(baseText).append('\n');
-        }
-        sb.append("\n==== 형식 규칙 ====\n");
-        sb.append("소스와 출처, 링크 URL은 절대 출력하지 마세요.\n");
-        sb.append("마크다운과 HTML을 쓰지 말고 플레인 텍스트만 출력하세요.\n");
-        sb.append("별표 기호 * 와 ** 는 절대 넣지 마세요. 쌍따옴표를 강조용으로 쓰지 마세요.\n");
-        sb.append("물음표 ? 와 퍼센트 %, S&P500 같은 꼭 필요한 기호와 본문 숫자(2%, 2월 등)는 그대로 쓰세요.\n");
-        sb.append("첫 줄에 제목을 쓰세요. 제목에는 쉼표 없이 물음표를 넣어 궁금증을 유발하고 연관 검색어를 자연스럽게 포함하세요.\n");
-        sb.append("제목과 질문 문장만 반말을 써도 되고, 본문은 존댓말 문어체로 작성하세요.\n");
-        sb.append("문장은 '~어요. ~지요. 있으니까요. 무슨 말일까요? 않을까요? ~면 흥미로울 겁니다.' 같은 어미로 끝내세요.\n");
-        sb.append("소제목은 후킹 문구로 만들고, 왼쪽에 ❝ 를 붙이며, 소제목 앞줄에는 구분선 ────────────── 을 넣으세요.\n");
-        sb.append("소제목 앞뒤로 빈 줄 2줄을 넣으세요. 인덱스 숫자나 기호 없이 문자로만 소제목을 쓰세요.\n");
-        sb.append("한 문장이 끝나면 줄바꿈하고, 마침표 뒤에는 빈 줄 2줄, 물음표 뒤에는 빈 줄 1줄을 넣으세요.\n");
-        sb.append("목록이 필요하면 첫째, 둘째 식으로 쓰고 숫자 인덱스는 쓰지 마세요.\n");
-        sb.append("\n==== 내용 규칙 ====\n");
-        sb.append("제목 다음 첫 문단은 전체 글을 읽고 싶게 만드는 후킹 질문으로 시작하세요.\n");
-        sb.append("역사적 배경을 설명하고, 고전이나 베스트셀러의 오래된 구절을 인용해 현 상황에 빗대세요.\n");
-        sb.append("뜻·의미·정의, 이유·원인, 방법·팁, 시사점, 전략, 미래 전망 중 논리적으로 필요한 것만 골라 분석하세요.\n");
-        sb.append("경험 기반 후기, 전문가 시각, 사례 분석을 넣어 E-E-A-T(경험·전문성·권위·신뢰)를 강화하세요.\n");
-        sb.append("어려운 단어는 바로 뒤에 뜻과 정의를 풀어 주세요. 같은 단어 반복 대신 유사어를 쓰세요.\n");
-        sb.append("사람들이 많이 검색하는 내용을 질문과 답변 형식으로 더하되, 키워드를 직접 언급하지 말고 간접적으로 살리세요.\n");
-        sb.append("결론에는 '결론'이라는 단어를 쓰지 말고, 애매하게 양비론으로 끝내지 말고 한쪽 입장을 분명히 하세요.\n");
-        sb.append("전체 4000자 이상으로 문단 사이 공백을 넉넉히 두고 작성하세요.\n");
-        sb.append("마지막 줄에는 첫 줄 제목과 다른 유사어로 바꾼 SEO 제목을 한 줄 더 쓰고, 그 제목에는 '뜻과 의미'를 포함하세요.\n");
-        sb.append("맨 끝에는 이 글과 관련된 해시태그를 10개 이상, 각 태그 앞에 # 를 붙이고 공백으로 구분해 한 줄로 출력하세요. '태그'라는 단어는 쓰지 마세요.\n");
-        if (imageSlots) {
-            sb.append("각 소제목 위 구분선 바로 앞 줄에 [사진 업로드 위치] 라고 한 줄 표시해, 작업한 사진을 넣을 자리를 알려 주세요.\n");
-        }
-        sb.append("지침 자체나 작성 의도는 글에 언급하지 마세요. 본문만 출력하세요.\n");
-        return sb.toString();
+        String[] tb = NaverPublisher.splitTitleBody(content);
+        boolean publish = autoPublishCheck.isChecked();
+        NaverPublisher.runFill(workWeb, tb[0], tb[1], r1 -> {
+            setStatus("본문 입력 시도: " + r1);
+            if (!publish) {
+                setStatus("본문 입력 완료. 발행 버튼은 직접 눌러 주세요.");
+                return;
+            }
+            workWeb.postDelayed(() -> NaverPublisher.runPublish(workWeb, r2 ->
+                    setStatus("자동 발행 시도 완료: " + r2)), 2500);
+        });
     }
 
-    private String callOpenAi(String apiKey, String model, String prompt) throws Exception {
-        JSONObject body = new JSONObject();
-        body.put("model", model);
-        body.put("input", prompt);
-        body.put("temperature", 0.6);
-        body.put("max_output_tokens", 8000);
-        String json = httpPost("https://api.openai.com/v1/responses", body.toString(), "Bearer " + apiKey);
-        JSONObject response = new JSONObject(json);
-        if (response.has("output_text")) {
-            return response.getString("output_text");
+    // ---------------------------------------------------------------
+    //  네이버 앱 스플릿뷰 + 접근성
+    // ---------------------------------------------------------------
+    private void launchNaverAppSplit() {
+        Intent launch = getPackageManager().getLaunchIntentForPackage(AutoConfig.NAVER_APP_PACKAGE);
+        if (launch == null) {
+            toast("네이버 블로그 앱이 설치되어 있지 않습니다.");
+            openPlayStore(AutoConfig.NAVER_APP_PACKAGE);
+            return;
         }
-        StringBuilder text = new StringBuilder();
-        JSONArray output = response.optJSONArray("output");
-        if (output != null) {
-            for (int i = 0; i < output.length(); i++) {
-                JSONArray content = output.getJSONObject(i).optJSONArray("content");
-                if (content == null) {
-                    continue;
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT
+                | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+        try {
+            startActivity(launch);
+        } catch (Exception e) {
+            toast("앱 실행 실패: " + e.getMessage());
+            return;
+        }
+        if (BlogAutoAccessibilityService.isRunning()) {
+            String content = resultOutput.getText().toString();
+            boolean publish = autoPublishCheck.isChecked();
+            workWeb.postDelayed(() -> {
+                BlogAutoAccessibilityService svc = BlogAutoAccessibilityService.get();
+                if (svc != null) {
+                    svc.automateNaverPost(content, publish);
                 }
-                for (int j = 0; j < content.length(); j++) {
-                    JSONObject part = content.getJSONObject(j);
-                    String value = part.optString("text", "");
-                    if (!value.isEmpty()) {
-                        text.append(value).append('\n');
-                    }
-                }
+            }, 2200);
+            setStatus("네이버 앱 스플릿뷰 실행 + 접근성 자동 입력을 진행합니다.");
+        } else {
+            setStatus("네이버 앱을 스플릿뷰로 열었습니다. 접근성 자동 탭을 쓰려면 접근성 설정을 켜세요.");
+            openAccessibilitySettings();
+        }
+    }
+
+    private void openAccessibilitySettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+            toast("목록에서 'Picture 블로그 자동 입력'을 켜 주세요.");
+        } catch (Exception e) {
+            toast("접근성 설정을 열 수 없습니다.");
+        }
+    }
+
+    private void openPlayStore(String pkg) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + pkg)));
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ---------------------------------------------------------------
+    //  발행 방식 / 완전 자동화
+    // ---------------------------------------------------------------
+    private void setTarget(String target) {
+        AutoConfig.setString(this, "publish_target", target);
+        updateAutoStatus();
+        setStatus("발행 방식: " + targetLabel(target));
+    }
+
+    private String targetLabel(String t) {
+        if (AutoConfig.TARGET_DRAFT.equals(t)) {
+            return "초안만";
+        }
+        if (AutoConfig.TARGET_APP.equals(t)) {
+            return "네이버 앱 + 접근성";
+        }
+        return "앱 내 WebView 자동 발행";
+    }
+
+    private void toggleAutomation() {
+        saveSettings();
+        if (AutoConfig.autoEnabled(this)) {
+            AutoConfig.setBool(this, "auto_enabled", false);
+            AutoConfig.cancel(this);
+            setStatus("완전 자동화를 중지했습니다.");
+        } else {
+            int interval = parseInt(intervalInput.getText().toString(), 60);
+            if (interval < 15) {
+                interval = 15;
+            }
+            AutoConfig.setInt(this, "interval_min", interval);
+            AutoConfig.setBool(this, "auto_enabled", true);
+            ensureAutomationPermissions();
+            AutoConfig.scheduleNext(this);
+            setStatus(interval + "분마다 자동 글쓰기·발행을 시작합니다. 화면이 꺼져도 동작합니다.");
+        }
+        updateAutoStatus();
+    }
+
+    private void ensureAutomationPermissions() {
+        requestNotificationsIfNeeded();
+        // WebView 발행에는 오버레이 권한이 있으면 렌더링이 안정적이다.
+        if (AutoConfig.TARGET_WEBVIEW.equals(AutoConfig.publishTarget(this))
+                && Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) {
+            try {
+                startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:" + getPackageName())));
+                toast("백그라운드 발행을 위해 '다른 앱 위에 표시'를 허용해 주세요.");
+            } catch (Exception ignored) {
             }
         }
-        return text.length() > 0 ? text.toString() : json;
+        // 배터리 최적화 제외를 요청해 주기 실행이 끊기지 않게 한다.
+        try {
+            Intent battery = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(battery);
+        } catch (Exception ignored) {
+        }
     }
 
-    private String callGemini(String apiKey, String model, String prompt) throws Exception {
-        JSONObject part = new JSONObject().put("text", prompt);
-        JSONObject content = new JSONObject().put("parts", new JSONArray().put(part));
-        JSONObject generationConfig = new JSONObject()
-                .put("temperature", 0.7)
-                .put("maxOutputTokens", 8192);
-        JSONObject body = new JSONObject()
-                .put("contents", new JSONArray().put(content))
-                .put("generationConfig", generationConfig);
-        String endpoint = "https://generativelanguage.googleapis.com/v1beta/models/"
-                + urlEncode(model) + ":generateContent?key=" + urlEncode(apiKey);
-        String json = httpPost(endpoint, body.toString(), null);
-        JSONObject response = new JSONObject(json);
-        JSONArray candidates = response.optJSONArray("candidates");
-        if (candidates == null || candidates.length() == 0) {
-            return json;
+    private void updateAutoStatus() {
+        boolean on = AutoConfig.autoEnabled(this);
+        String target = targetLabel(AutoConfig.publishTarget(this));
+        int interval = AutoConfig.intervalMinutes(this);
+        boolean overlay = Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this);
+        String accessibility = BlogAutoAccessibilityService.isRunning() ? "접근성 켜짐" : "접근성 꺼짐";
+        autoStatusText.setText("자동화 " + (on ? "켜짐" : "꺼짐")
+                + " · " + interval + "분 · " + target
+                + " · 오버레이 " + (overlay ? "허용" : "미허용")
+                + " · " + accessibility);
+    }
+
+    private void requestNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
         }
-        JSONObject candidate = candidates.getJSONObject(0);
-        JSONObject candidateContent = candidate.optJSONObject("content");
-        if (candidateContent == null) {
-            return json;
-        }
-        JSONArray parts = candidateContent.optJSONArray("parts");
-        if (parts == null || parts.length() == 0) {
-            return json;
-        }
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < parts.length(); i++) {
-            sb.append(parts.getJSONObject(i).optString("text", ""));
-        }
-        return sb.length() > 0 ? sb.toString() : json;
     }
 
     // ---------------------------------------------------------------
-    //  후처리 정리
-    // ---------------------------------------------------------------
-    private String postProcess(String text, boolean imageSlots) {
-        if (text == null) {
-            return "";
-        }
-        String out = text.replace("**", "").replace("*", "");
-        StringBuilder sb = new StringBuilder();
-        for (String line : out.split("\n", -1)) {
-            String trimmed = line.trim();
-            String low = trimmed.toLowerCase(Locale.ROOT);
-            // 출처/소스/참고 링크 줄 제거.
-            if (low.startsWith("출처") || low.startsWith("소스") || low.startsWith("source")
-                    || low.startsWith("참고:") || low.startsWith("http")) {
-                continue;
-            }
-            sb.append(line).append('\n');
-        }
-        out = sb.toString();
-        // 3줄 이상 연속 빈 줄은 2줄로 정리.
-        out = out.replaceAll("\\n{3,}", "\n\n");
-        out = out.trim();
-        if (imageSlots && !out.contains("[사진")) {
-            out = insertImageSlots(out);
-        }
-        return out;
-    }
-
-    /** 후처리 폴백: 구분선/❝ 소제목 앞에 사진 슬롯이 없으면 삽입. */
-    private String insertImageSlots(String text) {
-        String[] lines = text.split("\n", -1);
-        StringBuilder sb = new StringBuilder();
-        for (String line : lines) {
-            String t = line.trim();
-            if (t.startsWith("──") || t.startsWith("❝")) {
-                sb.append("[사진 업로드 위치]\n\n");
-            }
-            sb.append(line).append('\n');
-        }
-        return sb.toString().trim();
-    }
-
-    // ---------------------------------------------------------------
-    //  HTTP
-    // ---------------------------------------------------------------
-    private String httpPost(String endpoint, String body, String authHeader) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
-        connection.setConnectTimeout(30000);
-        connection.setReadTimeout(120000);
-        connection.setRequestMethod("POST");
-        connection.setDoOutput(true);
-        connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        if (authHeader != null) {
-            connection.setRequestProperty("Authorization", authHeader);
-        }
-        try (OutputStream outputStream = connection.getOutputStream()) {
-            outputStream.write(body.getBytes(StandardCharsets.UTF_8));
-        }
-        return readResponse(connection);
-    }
-
-    private String readResponse(HttpURLConnection connection) throws Exception {
-        int code = connection.getResponseCode();
-        InputStream stream = (code >= 200 && code < 300) ? connection.getInputStream() : connection.getErrorStream();
-        StringBuilder builder = new StringBuilder();
-        if (stream != null) {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    builder.append(line).append('\n');
-                }
-            }
-        }
-        if (code < 200 || code >= 300) {
-            throw new IllegalStateException("HTTP " + code + " " + builder);
-        }
-        return builder.toString();
-    }
-
-    // ---------------------------------------------------------------
-    //  설정 저장/복원
+    //  설정 저장/복원 (AutoConfig)
     // ---------------------------------------------------------------
     private void loadSettings() {
-        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        openAiKeyInput.setText(p.getString("openai_key", ""));
-        geminiKeyInput.setText(p.getString("gemini_key", ""));
-        openAiModelInput.setText(p.getString("openai_model", ""));
-        geminiModelInput.setText(p.getString("gemini_model", ""));
-        topicInput.setText(p.getString("topic", ""));
-        optRealtime.setChecked(p.getBoolean("opt_realtime", true));
-        optRelated.setChecked(p.getBoolean("opt_related", true));
-        optImageSlots.setChecked(p.getBoolean("opt_image", true));
-        srcDaum.setChecked(p.getBoolean("src_daum", true));
-        srcGoogle.setChecked(p.getBoolean("src_google", true));
-        srcCreator.setChecked(p.getBoolean("src_creator", true));
-        currentBlogId = p.getString("account", NaverAccounts.IDS[0]);
+        openAiKeyInput.setText(AutoConfig.openAiKey(this));
+        geminiKeyInput.setText(AutoConfig.geminiKey(this));
+        openAiModelInput.setText(rawModel("openai_model"));
+        geminiModelInput.setText(rawModel("gemini_model"));
+        topicInput.setText(AutoConfig.topic(this));
+        draftInput.setText(AutoConfig.draftBase(this));
+        optRealtime.setChecked(AutoConfig.useRealtime(this));
+        optRelated.setChecked(AutoConfig.useRelated(this));
+        optImageSlots.setChecked(AutoConfig.useImageSlots(this));
+        autoPublishCheck.setChecked(AutoConfig.autoPublish(this));
+        srcDaum.setChecked(AutoConfig.prefs(this).getBoolean("src_daum", true));
+        srcGoogle.setChecked(AutoConfig.prefs(this).getBoolean("src_google", true));
+        srcCreator.setChecked(AutoConfig.prefs(this).getBoolean("src_creator", true));
+        intervalInput.setText(String.valueOf(AutoConfig.intervalMinutes(this)));
+        currentBlogId = AutoConfig.account(this);
         customIdInput.setText(currentBlogId);
+        String last = AutoConfig.lastResult(this);
+        if (!last.isEmpty()) {
+            resultOutput.setText(last);
+        }
+    }
+
+    private String rawModel(String key) {
+        return AutoConfig.prefs(this).getString(key, "");
     }
 
     private void saveSettings() {
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString("openai_key", openAiKeyInput.getText().toString().trim())
-                .putString("gemini_key", geminiKeyInput.getText().toString().trim())
-                .putString("openai_model", openAiModelInput.getText().toString().trim())
-                .putString("gemini_model", geminiModelInput.getText().toString().trim())
-                .putString("topic", topicInput.getText().toString().trim())
-                .putBoolean("opt_realtime", optRealtime.isChecked())
-                .putBoolean("opt_related", optRelated.isChecked())
-                .putBoolean("opt_image", optImageSlots.isChecked())
-                .putBoolean("src_daum", srcDaum.isChecked())
-                .putBoolean("src_google", srcGoogle.isChecked())
-                .putBoolean("src_creator", srcCreator.isChecked())
-                .putString("account", currentBlogId)
-                .apply();
+        AutoConfig.setString(this, "openai_key", openAiKeyInput.getText().toString().trim());
+        AutoConfig.setString(this, "gemini_key", geminiKeyInput.getText().toString().trim());
+        AutoConfig.setString(this, "openai_model", openAiModelInput.getText().toString().trim());
+        AutoConfig.setString(this, "gemini_model", geminiModelInput.getText().toString().trim());
+        AutoConfig.setString(this, "topic", topicInput.getText().toString().trim());
+        AutoConfig.setString(this, "draft_base", draftInput.getText().toString().trim());
+        AutoConfig.setBool(this, "opt_realtime", optRealtime.isChecked());
+        AutoConfig.setBool(this, "opt_related", optRelated.isChecked());
+        AutoConfig.setBool(this, "opt_image", optImageSlots.isChecked());
+        AutoConfig.setBool(this, "auto_publish", autoPublishCheck.isChecked());
+        AutoConfig.setBool(this, "src_daum", srcDaum.isChecked());
+        AutoConfig.setBool(this, "src_google", srcGoogle.isChecked());
+        AutoConfig.setBool(this, "src_creator", srcCreator.isChecked());
+        AutoConfig.setInt(this, "interval_min", parseInt(intervalInput.getText().toString(), 60));
+        AutoConfig.setString(this, "account", currentBlogId);
     }
 
     // ---------------------------------------------------------------
@@ -806,15 +754,12 @@ public class BlogWriterActivity extends Activity {
         webSplit.requestLayout();
     }
 
-    private String join(List<String> items, String sep) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < items.size(); i++) {
-            if (i > 0) {
-                sb.append(sep);
-            }
-            sb.append(items.get(i));
+    private int parseInt(String s, int def) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return def;
         }
-        return sb.toString();
     }
 
     private TextView title(String text) {
@@ -832,7 +777,17 @@ public class BlogWriterActivity extends Activity {
         view.setText(text);
         view.setTextColor(Color.rgb(52, 64, 84));
         view.setTextSize(13);
-        view.setPadding(0, dp(10), 0, dp(4));
+        view.setTypeface(null, 1);
+        view.setPadding(0, dp(12), 0, dp(4));
+        return view;
+    }
+
+    private TextView smallLabel(String text) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextColor(Color.rgb(71, 84, 103));
+        view.setTextSize(12);
+        view.setPadding(0, dp(4), 0, dp(4));
         return view;
     }
 
@@ -908,9 +863,23 @@ public class BlogWriterActivity extends Activity {
         return button;
     }
 
+    private Button fullButtonWeighted(String text, View.OnClickListener listener) {
+        Button button = new Button(this);
+        button.setAllCaps(false);
+        button.setText(text);
+        button.setTextSize(14);
+        button.setTextColor(Color.WHITE);
+        button.setBackgroundColor(Color.rgb(23, 78, 166));
+        button.setOnClickListener(listener);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(46), 1.4f);
+        params.setMargins(dp(6), 0, 0, 0);
+        button.setLayoutParams(params);
+        return button;
+    }
+
     private String urlEncode(String value) {
         try {
-            return URLEncoder.encode(value, "UTF-8");
+            return java.net.URLEncoder.encode(value, "UTF-8");
         } catch (Exception exception) {
             return value;
         }
@@ -918,6 +887,10 @@ public class BlogWriterActivity extends Activity {
 
     private void setStatus(String message) {
         statusText.setText(message);
+    }
+
+    private void toast(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
 
     private int dp(int value) {

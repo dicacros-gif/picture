@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">Picture Cleaner</string>
+    <string name="accessibility_label">Picture 블로그 자동 입력</string>
+    <string name="accessibility_desc">네이버 블로그 앱 글쓰기 화면에서 본문 입력과 발행 버튼을 대신 눌러 자동 발행을 돕습니다. 사용자가 켤 때만 동작합니다.</string>
 </resources>
