@@ -15,16 +15,18 @@ import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.MediaStore;
+import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -38,48 +40,36 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Picture Cleaner — 오늘 캡처한 스크린샷을 일괄 처리한다.
+ * Picture Cleaner — 오늘 캡처한 스크린샷을 한 버튼으로 크롭 + 해상도 개선한다.
  *
- * 버튼 1 (CROP_CONTENT): 글자/검은색/단색 여백을 제외한 실제 이미지 영역만 자동 크롭한다.
- *   캡처 메타데이터(EXIF·출처)는 비트맵을 새 JPEG로 재인코딩하면서 완전히 제거되고,
- *   결과가 작으면 해상도를 키운 뒤 새 파일로 저장하고 원본은 삭제한다.
- *
- * 버튼 2 (REMASTER): 갤럭시 '리마스터'처럼 대비/감마/채도/선명도를 보정하고 해상도를 키운다.
- *   원본은 삭제하고 개선된 사진을 새 이름으로 저장한다.
- *
- * 대용량 사진에서도 OOM 없이 동작하도록 분석은 축소본에서 수행하고,
- * 픽셀 보정은 가로 스트립 단위로 처리해 메모리 사용을 수 MB 이내로 제한한다.
+ * 버튼 ①: 글자/검정/단색 여백을 제외한 이미지 영역만 자동 크롭한 뒤 곧바로 해상도를 키우고 선명하게
+ * 개선해 새 JPEG(캡처 메타데이터 제거)로 저장하고, 원본은 자동으로 삭제한다.
+ * '모든 파일 접근' 권한이 있으면 삭제 확인창 없이 바로 지운다.
  */
 public class MainActivity extends Activity {
     private static final int REQUEST_READ_IMAGES = 1001;
     private static final int REQUEST_DELETE_IMAGES = 1002;
     private static final String OUTPUT_FOLDER = "Pictures/PictureCleaner";
+    private static final String PREFS = "picture_main";
 
-    // 분석(경계 탐지·히스토그램)은 이 정도 크기로 축소한 뒤 수행한다.
     private static final int ANALYSIS_LONG_SIDE = 900;
-    // 픽셀 보정 스트립 높이(메모리 상한 = width * STRIP_ROWS ints).
     private static final int STRIP_ROWS = 256;
-    // 디코딩 시 이 화소 수를 넘으면 절반씩 다운샘플해 OOM을 방지한다.
     private static final int MAX_DECODE_PIXELS = 32 * 1024 * 1024;
-    // 크롭 결과 목표 장변 / 리마스터 목표 장변 / 절대 상한.
-    private static final int CROP_TARGET_LONG = 1600;
-    private static final int REMASTER_TARGET_LONG = 2400;
+    private static final int TARGET_LONG = 2048;
     private static final int MAX_LONG_SIDE = 4096;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private TextView statusText;
     private ProgressBar progressBar;
     private Button cropButton;
-    private Button remasterButton;
     private Button blogWriterButton;
-    private CheckBox deleteOriginalCheck;
-    private ProcessMode pendingMode;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(createContentView());
-        updateStatus("오늘 캡처한 이미지를 처리할 준비가 됐습니다.");
+        maybeRequestAllFilesAccess();
+        updateStatus("오늘 캡처한 스크린샷을 크롭하고 해상도를 개선할 준비가 됐습니다.");
     }
 
     @Override
@@ -92,56 +82,27 @@ public class MainActivity extends Activity {
         ScrollView scrollView = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(24), dp(32), dp(24), dp(24));
+        root.setPadding(dp(24), dp(36), dp(24), dp(24));
         root.setBackgroundColor(Color.rgb(247, 248, 250));
         scrollView.addView(root);
 
-        TextView title = new TextView(this);
-        title.setText("Picture Cleaner");
-        title.setTextColor(Color.rgb(16, 24, 40));
-        title.setTextSize(28);
-        title.setGravity(Gravity.START);
-        title.setTypeface(null, 1);
-        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
-
-        TextView subtitle = new TextView(this);
-        subtitle.setText("오늘 찍은 스크린샷을 순서대로 처리합니다.");
-        subtitle.setTextColor(Color.rgb(102, 112, 133));
-        subtitle.setTextSize(15);
-        LinearLayout.LayoutParams subtitleParams = new LinearLayout.LayoutParams(-1, -2);
-        subtitleParams.setMargins(0, dp(8), 0, dp(24));
-        root.addView(subtitle, subtitleParams);
-
-        cropButton = createPrimaryButton("① 이미지만 자동 크롭 (글자·검은색 제거)");
-        cropButton.setOnClickListener(v -> startProcessing(ProcessMode.CROP_CONTENT));
+        cropButton = createPrimaryButton("이미지 자동 크롭 + 해상도 개선");
+        cropButton.setOnClickListener(v -> startProcessing());
         root.addView(cropButton);
 
-        remasterButton = createPrimaryButton("② 리마스터 + 해상도 개선");
-        remasterButton.setOnClickListener(v -> startProcessing(ProcessMode.REMASTER));
-        LinearLayout.LayoutParams remasterParams = new LinearLayout.LayoutParams(-1, dp(54));
-        remasterParams.setMargins(0, dp(12), 0, dp(6));
-        remasterButton.setLayoutParams(remasterParams);
-        root.addView(remasterButton);
-
-        deleteOriginalCheck = new CheckBox(this);
-        deleteOriginalCheck.setText("처리 후 원본 삭제");
-        deleteOriginalCheck.setChecked(true);
-        deleteOriginalCheck.setTextColor(Color.rgb(52, 64, 84));
-        LinearLayout.LayoutParams delParams = new LinearLayout.LayoutParams(-1, -2);
-        delParams.setMargins(0, 0, 0, dp(14));
-        deleteOriginalCheck.setLayoutParams(delParams);
-        root.addView(deleteOriginalCheck);
-
-        blogWriterButton = createPrimaryButton("③ 네이버 블로그 글쓰기 자동화");
+        blogWriterButton = createPrimaryButton("네이버 블로그 글쓰기 자동화");
         blogWriterButton.setBackgroundColor(Color.rgb(23, 78, 166));
         blogWriterButton.setOnClickListener(v -> startActivity(new Intent(this, BlogWriterActivity.class)));
+        LinearLayout.LayoutParams blogParams = new LinearLayout.LayoutParams(-1, dp(54));
+        blogParams.setMargins(0, dp(12), 0, dp(6));
+        blogWriterButton.setLayoutParams(blogParams);
         root.addView(blogWriterButton);
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
         LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(12));
-        progressParams.setMargins(0, dp(6), 0, 0);
+        progressParams.setMargins(0, dp(14), 0, 0);
         root.addView(progressBar, progressParams);
 
         statusText = new TextView(this);
@@ -167,17 +128,18 @@ public class MainActivity extends Activity {
         return button;
     }
 
-    private void startProcessing(ProcessMode mode) {
+    // ---------------------------------------------------------------
+    //  권한
+    // ---------------------------------------------------------------
+    private void startProcessing() {
         if (!hasImagePermission()) {
-            pendingMode = mode;
             requestImagePermission();
             return;
         }
         setControlsEnabled(false);
         progressBar.setProgress(0);
         updateStatus("오늘 스크린샷을 찾는 중입니다...");
-        boolean deleteOriginals = deleteOriginalCheck.isChecked();
-        executor.execute(() -> processTodayScreenshots(mode, deleteOriginals));
+        executor.execute(this::processTodayScreenshots);
     }
 
     private boolean hasImagePermission() {
@@ -195,24 +157,39 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** 원본을 확인창 없이 자동 삭제하려면 '모든 파일 접근'이 필요하다. 최초 1회만 안내 화면을 연다. */
+    private void maybeRequestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) {
+            return;
+        }
+        boolean asked = getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("asked_all_files", false);
+        if (asked) {
+            return;
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("asked_all_files", true).apply();
+        try {
+            Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception ignored) {
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (requestCode == REQUEST_READ_IMAGES && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            ProcessMode mode = pendingMode;
-            pendingMode = null;
-            if (mode != null) {
-                startProcessing(mode);
-            } else {
-                updateStatus("권한이 허용됐습니다. 원하는 버튼을 눌러 주세요.");
-            }
+        if (requestCode == REQUEST_READ_IMAGES && grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startProcessing();
         } else if (requestCode == REQUEST_READ_IMAGES) {
-            pendingMode = null;
             updateStatus("사진 읽기 권한이 필요합니다.");
         }
     }
 
-    private void processTodayScreenshots(ProcessMode mode, boolean deleteOriginals) {
+    // ---------------------------------------------------------------
+    //  처리
+    // ---------------------------------------------------------------
+    private void processTodayScreenshots() {
         ContentResolver resolver = getContentResolver();
         List<ImageItem> items = queryTodayScreenshots(resolver);
         if (items.isEmpty()) {
@@ -220,43 +197,39 @@ public class MainActivity extends Activity {
             return;
         }
 
-        List<Uri> originalsToDelete = new ArrayList<>();
+        List<ImageItem> processedOriginals = new ArrayList<>();
         int savedCount = 0;
         int failedCount = 0;
         for (int index = 0; index < items.size(); index++) {
             ImageItem item = items.get(index);
             updateProgress(index, items.size(), item.displayName + " 처리 중...");
             Bitmap source = null;
-            Bitmap output = null;
+            Bitmap cropped = null;
+            Bitmap upscaled = null;
+            Bitmap out = null;
             try {
                 source = decodeBitmap(resolver, item.uri);
                 if (source == null) {
                     failedCount++;
                     continue;
                 }
-                Bitmap processed;
-                int target;
-                if (mode == ProcessMode.CROP_CONTENT) {
-                    processed = cropContent(source);
-                    target = CROP_TARGET_LONG;
-                } else {
-                    processed = remaster(source);
-                    target = REMASTER_TARGET_LONG;
-                }
-                output = upscaleIfSmall(processed, target, MAX_LONG_SIDE);
-                // 크롭/리마스터 중간 비트맵이 업스케일로 대체됐으면 즉시 회수.
-                if (processed != output && processed != source) {
-                    processed.recycle();
-                }
-                String prefix = mode == ProcessMode.CROP_CONTENT ? "cropped_" : "remastered_";
-                saveBitmap(resolver, output, prefix + timestampName(index) + ".jpg");
-                originalsToDelete.add(item.uri);
+                cropped = cropContent(source);
+                upscaled = upscaleIfSmall(cropped, TARGET_LONG, MAX_LONG_SIDE);
+                out = sharpenStripwise(upscaled, 0.5f);
+                saveBitmap(resolver, out, "cropped_" + timestampName(index) + ".jpg");
                 savedCount++;
+                processedOriginals.add(item);
             } catch (Throwable throwable) {
                 failedCount++;
             } finally {
-                if (output != null && output != source) {
-                    output.recycle();
+                if (out != null) {
+                    out.recycle();
+                }
+                if (upscaled != null && upscaled != cropped && upscaled != source) {
+                    upscaled.recycle();
+                }
+                if (cropped != null && cropped != source) {
+                    cropped.recycle();
                 }
                 if (source != null) {
                     source.recycle();
@@ -264,21 +237,17 @@ public class MainActivity extends Activity {
             }
         }
 
-        int finalSavedCount = savedCount;
-        int finalFailedCount = failedCount;
+        int finalSaved = savedCount;
+        int finalFailed = failedCount;
         runOnUiThread(() -> {
             progressBar.setProgress(100);
             setControlsEnabled(true);
-            String message = finalSavedCount + "개 저장 완료";
-            if (finalFailedCount > 0) {
-                message += ", " + finalFailedCount + "개 실패";
+            String message = finalSaved + "개 크롭·개선 저장 완료";
+            if (finalFailed > 0) {
+                message += ", " + finalFailed + "개 실패";
             }
-            if (deleteOriginals && !originalsToDelete.isEmpty()) {
-                updateStatus(message + ". 원본 삭제 확인 창이 뜨면 허용해 주세요.");
-                requestDeleteOriginals(originalsToDelete);
-            } else {
-                updateStatus(message + ". 원본은 유지했습니다.");
-            }
+            updateStatus(message + ".");
+            deleteOriginals(processedOriginals);
         });
     }
 
@@ -288,6 +257,7 @@ public class MainActivity extends Activity {
         String[] projection = {
                 MediaStore.Images.Media._ID,
                 MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.DATA,
                 MediaStore.Images.Media.DATE_ADDED,
                 MediaStore.Images.Media.RELATIVE_PATH
         };
@@ -299,7 +269,6 @@ public class MainActivity extends Activity {
         start.set(Calendar.MILLISECOND, 0);
         long startSeconds = start.getTimeInMillis() / 1000L;
 
-        // 오늘 추가됐고, 파일명 또는 경로가 스크린샷인 항목만. 이미 처리한 결과 폴더는 제외.
         String selection = MediaStore.Images.Media.DATE_ADDED + ">=? AND (" +
                 MediaStore.Images.Media.DISPLAY_NAME + " LIKE ? OR " +
                 MediaStore.Images.Media.RELATIVE_PATH + " LIKE ?) AND " +
@@ -313,11 +282,13 @@ public class MainActivity extends Activity {
             }
             int idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID);
             int nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME);
+            int dataColumn = cursor.getColumnIndex(MediaStore.Images.Media.DATA);
             while (cursor.moveToNext()) {
                 long id = cursor.getLong(idColumn);
                 String displayName = cursor.getString(nameColumn);
+                String data = dataColumn >= 0 ? cursor.getString(dataColumn) : null;
                 Uri uri = ContentUris.withAppendedId(collection, id);
-                items.add(new ImageItem(uri, displayName));
+                items.add(new ImageItem(uri, displayName, data));
             }
         }
         return items;
@@ -331,7 +302,7 @@ public class MainActivity extends Activity {
         }
         int sample = 1;
         long pixels = (long) bounds.outWidth * bounds.outHeight;
-        while (pixels / (sample * sample) > MAX_DECODE_PIXELS) {
+        while (pixels > 0 && pixels / (sample * sample) > MAX_DECODE_PIXELS) {
             sample *= 2;
         }
         BitmapFactory.Options options = new BitmapFactory.Options();
@@ -343,9 +314,8 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------------
-    //  크롭: 실제 이미지 영역만 검출
+    //  크롭
     // ---------------------------------------------------------------
-
     private Bitmap cropContent(Bitmap source) {
         Rect bounds = detectContentBounds(source);
         if (bounds.width() <= 0 || bounds.height() <= 0
@@ -355,10 +325,6 @@ public class MainActivity extends Activity {
         return Bitmap.createBitmap(source, bounds.left, bounds.top, bounds.width(), bounds.height());
     }
 
-    /**
-     * 축소본에서 활동도(채도 + 국부 에지)를 계산해, 단색/검은색 여백과 얇은 글자 띠를 배제하고
-     * 가장 큰 연속 콘텐츠 밴드를 실제 좌표로 환산해 돌려준다.
-     */
     private Rect detectContentBounds(Bitmap fullBitmap) {
         int fullW = fullBitmap.getWidth();
         int fullH = fullBitmap.getHeight();
@@ -375,7 +341,6 @@ public class MainActivity extends Activity {
             small.recycle();
         }
 
-        // 픽셀별 콘텐츠 여부: 채도가 있거나(색이 있는 사진) 국부 에지가 뚜렷한 곳.
         boolean[] content = new boolean[aw * ah];
         for (int y = 0; y < ah; y++) {
             for (int x = 0; x < aw; x++) {
@@ -393,7 +358,6 @@ public class MainActivity extends Activity {
                 if (y + 1 < ah) {
                     edge += Math.abs(lum - lumOf(px[idx + aw]));
                 }
-                // 순수 검정/순수 흰색 평면은 콘텐츠에서 제외.
                 boolean flat = (lum <= 30 || lum >= 248) && sat < 14 && edge < 16;
                 content[idx] = !flat && (sat > 18 || edge > 22);
             }
@@ -410,13 +374,11 @@ public class MainActivity extends Activity {
             }
             rowScore[y] = score;
         }
-        // 얇은 글자 한 줄이 밴드를 끊지 않도록 세로로 약하게 스무딩.
         boolean[] rowActive = smoothActive(rowScore, Math.max(1, aw / 12), 1);
         int[] vBand = longestRun(rowActive);
         int top = vBand[0];
         int bottom = vBand[1];
         if (bottom - top < ah / 8) {
-            // 뚜렷한 밴드가 없으면 원본 그대로.
             return new Rect(0, 0, fullW, fullH);
         }
 
@@ -439,7 +401,6 @@ public class MainActivity extends Activity {
             right = aw;
         }
 
-        // 축소 좌표 → 실제 좌표 환산 + 약간의 여백.
         float inv = 1f / scale;
         int pad = Math.max(2, Math.min(fullW, fullH) / 300);
         int fLeft = clampInt(Math.round(left * inv) - pad, 0, fullW - 1);
@@ -453,7 +414,6 @@ public class MainActivity extends Activity {
         return (((c >> 16) & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + (c & 0xFF) * 114) / 1000;
     }
 
-    /** score[i]가 임계(최대의 threshFrac) 이상이면 활성, radius 만큼 팽창해 얇은 틈을 메운다. */
     private boolean[] smoothActive(int[] score, int threshold, int radius) {
         int n = score.length;
         boolean[] active = new boolean[n];
@@ -479,7 +439,6 @@ public class MainActivity extends Activity {
         return active;
     }
 
-    /** active 배열에서 가장 긴 true 구간 [start, end). */
     private int[] longestRun(boolean[] active) {
         int n = active.length;
         int bestStart = 0, bestLen = 0;
@@ -504,103 +463,19 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------------
-    //  리마스터: 대비/감마/채도/선명도 보정
+    //  해상도 개선 (업스케일 + 언샤프)
     // ---------------------------------------------------------------
-
-    private Bitmap remaster(Bitmap source) {
-        int[] lowHigh = percentileLuminance(source);
-        int low = lowHigh[0];
-        int range = Math.max(1, lowHigh[1] - lowHigh[0]);
-        Bitmap toned = applyToneStripwise(source, low, range);
-        Bitmap sharpened = sharpenStripwise(toned, 0.7f);
-        if (sharpened != toned) {
-            toned.recycle();
+    private Bitmap upscaleIfSmall(Bitmap source, int targetLongSide, int maxLongSide) {
+        int longSide = Math.max(source.getWidth(), source.getHeight());
+        if (longSide >= targetLongSide) {
+            return source;
         }
-        return sharpened;
+        float scale = Math.min(maxLongSide / (float) longSide, targetLongSide / (float) longSide);
+        int newW = Math.round(source.getWidth() * scale);
+        int newH = Math.round(source.getHeight() * scale);
+        return Bitmap.createScaledBitmap(source, Math.max(1, newW), Math.max(1, newH), true);
     }
 
-    /** 축소본 휘도 히스토그램에서 0.5% / 99.5% 백분위를 대비 스트레치 기준으로 잡는다. */
-    private int[] percentileLuminance(Bitmap fullBitmap) {
-        int fullW = fullBitmap.getWidth();
-        int fullH = fullBitmap.getHeight();
-        float scale = Math.min(1f, ANALYSIS_LONG_SIDE / (float) Math.max(fullW, fullH));
-        int aw = Math.max(1, Math.round(fullW * scale));
-        int ah = Math.max(1, Math.round(fullH * scale));
-        Bitmap small = (aw == fullW && ah == fullH)
-                ? fullBitmap
-                : Bitmap.createScaledBitmap(fullBitmap, aw, ah, true);
-        int[] px = new int[aw * ah];
-        small.getPixels(px, 0, aw, 0, 0, aw, ah);
-        if (small != fullBitmap) {
-            small.recycle();
-        }
-        int[] hist = new int[256];
-        for (int c : px) {
-            hist[lumOf(c)]++;
-        }
-        int total = px.length;
-        int lowCut = (int) (total * 0.005);
-        int highCut = (int) (total * 0.005);
-        int low = 0, high = 255;
-        int acc = 0;
-        for (int i = 0; i < 256; i++) {
-            acc += hist[i];
-            if (acc > lowCut) {
-                low = i;
-                break;
-            }
-        }
-        acc = 0;
-        for (int i = 255; i >= 0; i--) {
-            acc += hist[i];
-            if (acc > highCut) {
-                high = i;
-                break;
-            }
-        }
-        if (high - low < 8) {
-            low = 0;
-            high = 255;
-        }
-        return new int[]{low, high};
-    }
-
-    /** 픽셀별 대비 스트레치 + 대비 부스트 + 감마 + 채도 강화. 스트립 단위로 처리. */
-    private Bitmap applyToneStripwise(Bitmap source, int low, int range) {
-        int w = source.getWidth();
-        int h = source.getHeight();
-        Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        int[] lut = new int[256];
-        for (int v = 0; v < 256; v++) {
-            int stretched = clamp((v - low) * 255 / range);
-            int contrasted = clamp((stretched - 128) * 110 / 100 + 128);
-            lut[v] = clamp((int) (Math.pow(contrasted / 255.0, 0.90) * 255));
-        }
-        final float sat = 1.18f;
-        int y = 0;
-        while (y < h) {
-            int rows = Math.min(STRIP_ROWS, h - y);
-            int[] buf = new int[w * rows];
-            source.getPixels(buf, 0, w, 0, y, w, rows);
-            for (int i = 0; i < buf.length; i++) {
-                int c = buf[i];
-                int a = (c >>> 24) & 0xFF;
-                int r = lut[(c >> 16) & 0xFF];
-                int g = lut[(c >> 8) & 0xFF];
-                int b = lut[c & 0xFF];
-                int gray = (r * 299 + g * 587 + b * 114) / 1000;
-                r = clamp((int) (gray + (r - gray) * sat));
-                g = clamp((int) (gray + (g - gray) * sat));
-                b = clamp((int) (gray + (b - gray) * sat));
-                buf[i] = (a << 24) | (r << 16) | (g << 8) | b;
-            }
-            out.setPixels(buf, 0, w, 0, y, w, rows);
-            y += rows;
-        }
-        return out;
-    }
-
-    /** 언샤프 마스크(3x3 라플라시안). 위/아래 1행 헤일로를 포함한 스트립으로 처리. */
     private Bitmap sharpenStripwise(Bitmap source, float amount) {
         int w = source.getWidth();
         int h = source.getHeight();
@@ -648,20 +523,10 @@ public class MainActivity extends Activity {
         return clamp((int) (center + amount * lap));
     }
 
-    private Bitmap upscaleIfSmall(Bitmap source, int targetLongSide, int maxLongSide) {
-        int longSide = Math.max(source.getWidth(), source.getHeight());
-        if (longSide >= targetLongSide) {
-            return source;
-        }
-        float scale = Math.min(maxLongSide / (float) longSide, targetLongSide / (float) longSide);
-        int newW = Math.round(source.getWidth() * scale);
-        int newH = Math.round(source.getHeight() * scale);
-        Bitmap output = Bitmap.createScaledBitmap(source, Math.max(1, newW), Math.max(1, newH), true);
-        return output;
-    }
-
+    // ---------------------------------------------------------------
+    //  저장 / 삭제
+    // ---------------------------------------------------------------
     private void saveBitmap(ContentResolver resolver, Bitmap bitmap, String displayName) throws IOException {
-        // Bitmap → 새 JPEG 재인코딩이므로 원본 EXIF/캡처 출처 메타데이터는 남지 않는다.
         ContentValues values = new ContentValues();
         values.put(MediaStore.Images.Media.DISPLAY_NAME, displayName);
         values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
@@ -681,25 +546,57 @@ public class MainActivity extends Activity {
         resolver.update(uri, values, null, null);
     }
 
-    private void requestDeleteOriginals(List<Uri> originals) {
+    private void deleteOriginals(List<ImageItem> originals) {
         if (originals.isEmpty()) {
             return;
         }
+        ContentResolver resolver = getContentResolver();
+        // '모든 파일 접근'이 있으면 확인창 없이 실제 파일을 바로 삭제.
+        if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+            int deleted = 0;
+            for (ImageItem item : originals) {
+                boolean ok = false;
+                if (item.data != null) {
+                    try {
+                        ok = new File(item.data).delete();
+                    } catch (Exception ignored) {
+                    }
+                }
+                try {
+                    resolver.delete(item.uri, null, null);
+                    ok = true;
+                } catch (Exception ignored) {
+                }
+                if (ok) {
+                    deleted++;
+                }
+            }
+            updateStatus(deleted + "개 원본을 자동 삭제했습니다.");
+            return;
+        }
+        // 권한이 없으면 시스템 삭제 요청(한 번의 허용).
+        List<Uri> uris = new ArrayList<>();
+        for (ImageItem item : originals) {
+            uris.add(item.uri);
+        }
         try {
             if (Build.VERSION.SDK_INT >= 30) {
-                PendingIntent request = MediaStore.createDeleteRequest(getContentResolver(), originals);
+                PendingIntent request = MediaStore.createDeleteRequest(resolver, uris);
                 startIntentSenderForResult(request.getIntentSender(), REQUEST_DELETE_IMAGES, null, 0, 0, 0);
             } else {
-                for (Uri uri : originals) {
-                    getContentResolver().delete(uri, null, null);
+                for (Uri uri : uris) {
+                    resolver.delete(uri, null, null);
                 }
-                updateStatus("새 파일 저장과 원본 삭제가 완료됐습니다.");
+                updateStatus("원본 삭제까지 완료했습니다.");
             }
         } catch (Exception exception) {
-            updateStatus("새 파일은 저장됐지만 원본 삭제 확인을 열지 못했습니다.");
+            updateStatus("새 파일은 저장됐지만 원본 삭제에 실패했습니다.");
         }
     }
 
+    // ---------------------------------------------------------------
+    //  유틸
+    // ---------------------------------------------------------------
     private int clamp(int value) {
         return value < 0 ? 0 : (value > 255 ? 255 : value);
     }
@@ -730,7 +627,6 @@ public class MainActivity extends Activity {
 
     private void setControlsEnabled(boolean enabled) {
         cropButton.setEnabled(enabled);
-        remasterButton.setEnabled(enabled);
         blogWriterButton.setEnabled(enabled);
     }
 
@@ -742,18 +638,15 @@ public class MainActivity extends Activity {
         return (int) (value * getResources().getDisplayMetrics().density + 0.5f);
     }
 
-    private enum ProcessMode {
-        CROP_CONTENT,
-        REMASTER
-    }
-
     private static class ImageItem {
         final Uri uri;
         final String displayName;
+        final String data;
 
-        ImageItem(Uri uri, String displayName) {
+        ImageItem(Uri uri, String displayName, String data) {
             this.uri = uri;
             this.displayName = displayName;
+            this.data = data;
         }
     }
 }

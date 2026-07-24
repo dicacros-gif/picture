@@ -14,6 +14,7 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.ValueCallback;
@@ -27,7 +28,6 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
-import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -77,6 +77,7 @@ public class BlogWriterActivity extends Activity {
 
     private WebView workWeb;
     private WebView chatgptWeb;
+    private WebView keywordWeb;
     private LinearLayout webSplit;
 
     private CheckBox optImageSlots;
@@ -101,13 +102,16 @@ public class BlogWriterActivity extends Activity {
         setContentView(createContentView());
         setupWebView(workWeb, true);
         setupWebView(chatgptWeb, false);
+        setupKeywordWeb();
         loadSettings();
         requestNotificationsIfNeeded();
         NaverAccounts.applyTo(this, currentBlogId, had -> updateAccountLabel(had));
         chatgptWeb.loadUrl(CHATGPT_URL);
-        workWeb.loadUrl(REALTIME_URL);
+        workWeb.loadUrl("https://blog.naver.com/" + urlEncode(currentBlogId));
         updateAutoStatus();
         setStatus(currentBlogId + " 선택됨. 로그인하거나 초안을 생성하세요.");
+        // 앱 실행 시 화면에 보이지 않는 웹뷰로 실시간 키워드만 자동 수집.
+        keywordWeb.postDelayed(() -> fetchKeywords(null), 600);
     }
 
     @Override
@@ -134,6 +138,9 @@ public class BlogWriterActivity extends Activity {
         }
         if (chatgptWeb != null) {
             chatgptWeb.destroy();
+        }
+        if (keywordWeb != null) {
+            keywordWeb.destroy();
         }
         super.onDestroy();
     }
@@ -248,31 +255,14 @@ public class BlogWriterActivity extends Activity {
         resultOutput.setMinLines(9);
         controls.addView(resultOutput);
 
-        controls.addView(label("스플릿뷰 크기 (위: 네이버 / 아래: ChatGPT)"));
-        SeekBar seekBar = new SeekBar(this);
-        seekBar.setMax(100);
-        seekBar.setProgress(58);
-        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
-                resizeSplit(Math.max(20, Math.min(80, progress)));
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar bar) {
-            }
-
-            @Override
-            public void onStopTrackingTouch(SeekBar bar) {
-            }
-        });
-        controls.addView(seekBar);
+        controls.addView(smallLabel("아래 회색 분할선을 위아래로 끌어 화면 비율을 조절하세요. (위: 네이버 / 아래: ChatGPT)"));
 
         webSplit = new LinearLayout(this);
         webSplit.setOrientation(LinearLayout.VERTICAL);
         workWeb = new WebView(this);
         chatgptWeb = new WebView(this);
         webSplit.addView(workWeb, new LinearLayout.LayoutParams(-1, 0, 58f));
+        webSplit.addView(createSplitDivider());
         webSplit.addView(chatgptWeb, new LinearLayout.LayoutParams(-1, 0, 42f));
         root.addView(webSplit, new LinearLayout.LayoutParams(-1, 0, 5f));
 
@@ -308,10 +298,7 @@ public class BlogWriterActivity extends Activity {
                 if (view != workWeb) {
                     return;
                 }
-                if (pendingKeywordExtract && url.contains("adsensefarm")) {
-                    pendingKeywordExtract = false;
-                    view.postDelayed(() -> extractKeywords(), 1200);
-                } else if (pendingWebPublish && url.contains("blog.naver.com")) {
+                if (pendingWebPublish && url.contains("blog.naver.com")) {
                     pendingWebPublish = false;
                     view.postDelayed(() -> runWebPublish(), 2800);
                 }
@@ -414,24 +401,42 @@ public class BlogWriterActivity extends Activity {
     }
 
     // ---------------------------------------------------------------
-    //  실시간 키워드 (콜백 방식)
+    //  실시간 키워드 (화면에 보이지 않는 전용 웹뷰에서 수집)
     // ---------------------------------------------------------------
+    private void setupKeywordWeb() {
+        keywordWeb = new WebView(this);
+        WebSettings s = keywordWeb.getSettings();
+        s.setJavaScriptEnabled(true);
+        s.setDomStorageEnabled(true);
+        s.setLoadWithOverviewMode(true);
+        s.setUseWideViewPort(true);
+        keywordWeb.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                if (url != null && pendingKeywordExtract && url.contains("adsensefarm")) {
+                    pendingKeywordExtract = false;
+                    view.postDelayed(() -> extractKeywords(), 1200);
+                }
+            }
+        });
+    }
+
     private void fetchKeywords(Runnable then) {
         afterKeywords = then;
-        pendingKeywordExtract = true;
         progressBar.setProgress(15);
-        setStatus("adsensefarm 실시간 검색어 페이지를 여는 중...");
-        String current = workWeb.getUrl();
+        setStatus("실시간 검색어를 백그라운드로 가져오는 중...");
+        String current = keywordWeb.getUrl();
         if (current != null && current.contains("adsensefarm")) {
             pendingKeywordExtract = false;
             extractKeywords();
         } else {
-            workWeb.loadUrl(REALTIME_URL);
+            pendingKeywordExtract = true;
+            keywordWeb.loadUrl(REALTIME_URL);
         }
     }
 
     private void extractKeywords() {
-        workWeb.evaluateJavascript(BlogGenerator.KEYWORD_EXTRACT_JS, value -> {
+        keywordWeb.evaluateJavascript(BlogGenerator.KEYWORD_EXTRACT_JS, value -> {
             collectedKeywords.clear();
             collectedKeywords.addAll(
                     BlogGenerator.filterKeywords(BlogGenerator.parseKeywordJson(value), 30));
@@ -744,11 +749,43 @@ public class BlogWriterActivity extends Activity {
         }
     }
 
-    private void resizeSplit(int topPercent) {
+    private View createSplitDivider() {
+        View divider = new View(this);
+        divider.setBackgroundColor(Color.rgb(150, 160, 176));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(18));
+        divider.setLayoutParams(params);
+        divider.setOnTouchListener(new View.OnTouchListener() {
+            float startRawY;
+            float startTopWeight;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        startRawY = e.getRawY();
+                        startTopWeight = ((LinearLayout.LayoutParams) workWeb.getLayoutParams()).weight;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        int h = webSplit.getHeight();
+                        if (h > 0) {
+                            float delta = e.getRawY() - startRawY;
+                            float top = startTopWeight + delta / h * 100f;
+                            setSplitWeights(Math.max(15f, Math.min(85f, top)));
+                        }
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
+        return divider;
+    }
+
+    private void setSplitWeights(float topWeight) {
         LinearLayout.LayoutParams top = (LinearLayout.LayoutParams) workWeb.getLayoutParams();
         LinearLayout.LayoutParams bottom = (LinearLayout.LayoutParams) chatgptWeb.getLayoutParams();
-        top.weight = topPercent;
-        bottom.weight = 100 - topPercent;
+        top.weight = topWeight;
+        bottom.weight = 100f - topWeight;
         workWeb.setLayoutParams(top);
         chatgptWeb.setLayoutParams(bottom);
         webSplit.requestLayout();
