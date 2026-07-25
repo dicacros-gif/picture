@@ -107,7 +107,7 @@ final class BlogGenerator {
         sb.append("당신은 SEO에 정통한 전문 블로거입니다. 아래 지침을 100% 지켜 네이버 블로그 글을 작성하세요.\n\n");
         sb.append("주제: ").append(topic.trim()).append('\n');
         if (keywords != null && !keywords.isEmpty()) {
-            sb.append("참고 실시간 검색어(다음·구글·크리에이터 어드바이저): ")
+            sb.append("사용자가 선택한 실시간 검색어와 연관 검색어(네이버·다음·구글): ")
                     .append(join(keywords, ", ")).append('\n');
             sb.append("이 중 잠깐 보고 마는 일회성 키워드는 버리고, 사람들이 오래 궁금해할 검색 의도가 강한 키워드를 골라 활용하세요.\n");
         }

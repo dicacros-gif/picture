@@ -8,9 +8,15 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -32,8 +38,10 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -57,6 +65,7 @@ public class BlogWriterActivity extends Activity {
     private static final int REQUEST_NOTIFICATIONS = 2002;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final Handler keywordHandler = new Handler(Looper.getMainLooper());
 
     private String currentBlogId = NaverAccounts.IDS[0];
 
@@ -74,24 +83,43 @@ public class BlogWriterActivity extends Activity {
     private TextView keywordPreview;
     private TextView autoStatusText;
     private ProgressBar progressBar;
+    private EditText relatedKeywordOutput;
 
     private WebView workWeb;
     private WebView chatgptWeb;
     private WebView keywordWeb;
     private LinearLayout webSplit;
+    private LinearLayout keywordSelectionList;
+    private View splitDivider;
+
+    private Button accBtn0;
+    private Button accBtn1;
+    private Button targetDraftBtn;
+    private Button targetWebBtn;
+    private Button targetAppBtn;
+    private Button winNaverBtn;
+    private Button winBothBtn;
+    private Button winChatBtn;
+    private String windowMode = "both";
 
     private CheckBox optImageSlots;
     private CheckBox optRealtime;
     private CheckBox optRelated;
     private CheckBox autoPublishCheck;
+    private CheckBox srcNaver;
     private CheckBox srcDaum;
     private CheckBox srcGoogle;
-    private CheckBox srcCreator;
 
     private final List<String> collectedKeywords = new ArrayList<>();
+    private final List<String> selectedKeywords = new ArrayList<>();
+    private final List<String> relatedKeywords = new ArrayList<>();
+    private final List<CheckBox> keywordChecks = new ArrayList<>();
     private boolean pendingKeywordExtract = false;
     private boolean pendingWebPublish = false;
+    private boolean renderingKeywordChecks = false;
+    private int relatedLookupVersion = 0;
     private Runnable afterKeywords = null;
+    private final Runnable relatedLookupRunnable = this::fetchRelatedForSelectedKeywords;
 
     private ValueCallback<Uri[]> fileChooserCallback;
 
@@ -104,6 +132,8 @@ public class BlogWriterActivity extends Activity {
         setupWebView(chatgptWeb, false);
         setupKeywordWeb();
         loadSettings();
+        applyWindowMode();
+        refreshAllToggles();
         requestNotificationsIfNeeded();
         NaverAccounts.applyTo(this, currentBlogId, had -> updateAccountLabel(had));
         chatgptWeb.loadUrl(CHATGPT_URL);
@@ -133,6 +163,7 @@ public class BlogWriterActivity extends Activity {
     @Override
     protected void onDestroy() {
         executor.shutdownNow();
+        keywordHandler.removeCallbacksAndMessages(null);
         if (workWeb != null) {
             workWeb.destroy();
         }
@@ -152,6 +183,10 @@ public class BlogWriterActivity extends Activity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(247, 248, 250));
+        // 저장된 네이버 아이디가 API 키·모델 칸까지 자동으로 채워지지 않도록 자동완성 차단.
+        if (Build.VERSION.SDK_INT >= 26) {
+            root.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        }
 
         ScrollView controlsScroll = new ScrollView(this);
         LinearLayout controls = new LinearLayout(this);
@@ -163,8 +198,10 @@ public class BlogWriterActivity extends Activity {
         controls.addView(title("네이버 블로그 자동화"));
 
         LinearLayout accountRow = row();
-        accountRow.addView(smallButton(NaverAccounts.IDS[0], v -> selectAccount(NaverAccounts.IDS[0])));
-        accountRow.addView(smallButton(NaverAccounts.IDS[1], v -> selectAccount(NaverAccounts.IDS[1])));
+        accBtn0 = smallButton(NaverAccounts.IDS[0], v -> selectAccount(NaverAccounts.IDS[0]));
+        accBtn1 = smallButton(NaverAccounts.IDS[1], v -> selectAccount(NaverAccounts.IDS[1]));
+        accountRow.addView(accBtn0);
+        accountRow.addView(accBtn1);
         controls.addView(accountRow);
 
         customIdInput = input("다른 네이버 블로그 아이디 입력");
@@ -187,15 +224,18 @@ public class BlogWriterActivity extends Activity {
         controls.addView(topicInput);
         controls.addView(draftInput);
 
-        controls.addView(label("실시간 검색어 소스"));
+        controls.addView(label("연관 검색어 조회 소스"));
         LinearLayout srcRow = row();
+        srcNaver = check("네이버", true);
         srcDaum = check("다음", true);
         srcGoogle = check("구글", true);
-        srcCreator = check("크리에이터", true);
+        srcRow.addView(srcNaver);
         srcRow.addView(srcDaum);
         srcRow.addView(srcGoogle);
-        srcRow.addView(srcCreator);
         controls.addView(srcRow);
+        srcNaver.setOnCheckedChangeListener((button, checked) -> scheduleRelatedLookup());
+        srcDaum.setOnCheckedChangeListener((button, checked) -> scheduleRelatedLookup());
+        srcGoogle.setOnCheckedChangeListener((button, checked) -> scheduleRelatedLookup());
 
         optRealtime = check("실시간 키워드 사용", true);
         optRelated = check("연관 키워드 확장", true);
@@ -208,19 +248,45 @@ public class BlogWriterActivity extends Activity {
 
         controls.addView(label("발행 방식"));
         LinearLayout targetRow = row();
-        targetRow.addView(smallButton("초안만", v -> setTarget(AutoConfig.TARGET_DRAFT)));
-        targetRow.addView(smallButton("웹뷰 발행", v -> setTarget(AutoConfig.TARGET_WEBVIEW)));
-        targetRow.addView(smallButton("네이버앱", v -> setTarget(AutoConfig.TARGET_APP)));
+        targetDraftBtn = smallButton("초안만", v -> setTarget(AutoConfig.TARGET_DRAFT));
+        targetWebBtn = smallButton("웹뷰 발행", v -> setTarget(AutoConfig.TARGET_WEBVIEW));
+        targetAppBtn = smallButton("네이버앱", v -> setTarget(AutoConfig.TARGET_APP));
+        targetRow.addView(targetDraftBtn);
+        targetRow.addView(targetWebBtn);
+        targetRow.addView(targetAppBtn);
         controls.addView(targetRow);
 
-        keywordPreview = smallLabel("실시간 키워드가 여기에 표시됩니다.");
+        controls.addView(label("실시간 검색어 선택"));
+        keywordPreview = smallLabel("실시간 검색어를 불러오면 선택 목록이 표시됩니다.");
         controls.addView(keywordPreview);
 
         LinearLayout actionRow = row();
-        actionRow.addView(smallButton("실시간 키워드", v -> fetchKeywords(null)));
-        actionRow.addView(smallButton("블로그 생성", v -> generateBlog(GenAfter.NONE)));
-        actionRow.addView(smallButton("일괄 실행", v -> runBatch()));
+        actionRow.addView(smallButton("새로고침", v -> fetchKeywords(null)));
+        actionRow.addView(smallButton("전체 선택", v -> setAllKeywordChecks(true)));
+        actionRow.addView(smallButton("선택 해제", v -> setAllKeywordChecks(false)));
         controls.addView(actionRow);
+
+        keywordSelectionList = new LinearLayout(this);
+        keywordSelectionList.setOrientation(LinearLayout.VERTICAL);
+        keywordSelectionList.setPadding(0, dp(4), 0, dp(8));
+        controls.addView(keywordSelectionList);
+
+        LinearLayout relatedActionRow = row();
+        relatedActionRow.addView(smallButton("선택 연관어 찾기", v -> fetchRelatedForSelectedKeywords()));
+        relatedActionRow.addView(smallButton("선택어 복사", v -> copySelectedKeywords()));
+        relatedActionRow.addView(smallButton("연관어 전체 복사", v -> copyAllRelatedKeywords()));
+        controls.addView(relatedActionRow);
+
+        relatedKeywordOutput = multiInput("선택한 검색어의 네이버·다음·구글 연관 검색어가 여기에 표시됩니다.");
+        relatedKeywordOutput.setMinLines(6);
+        relatedKeywordOutput.setKeyListener(null);
+        relatedKeywordOutput.setTextIsSelectable(true);
+        controls.addView(relatedKeywordOutput);
+
+        LinearLayout generateRow = row();
+        generateRow.addView(smallButton("블로그 생성", v -> generateBlog(GenAfter.NONE)));
+        generateRow.addView(smallButton("일괄 실행", v -> runBatch()));
+        controls.addView(generateRow);
 
         LinearLayout action2 = row();
         action2.addView(smallButton("네이버 글쓰기 열기", v -> openNaverWriter()));
@@ -255,14 +321,25 @@ public class BlogWriterActivity extends Activity {
         resultOutput.setMinLines(9);
         controls.addView(resultOutput);
 
-        controls.addView(smallLabel("아래 회색 분할선을 위아래로 끌어 화면 비율을 조절하세요. (위: 네이버 / 아래: ChatGPT)"));
+        controls.addView(label("화면 표시 (아래 창 켜고 끄기)"));
+        LinearLayout winRow = row();
+        winNaverBtn = smallButton("네이버만", v -> setWindowMode("naver"));
+        winBothBtn = smallButton("둘 다", v -> setWindowMode("both"));
+        winChatBtn = smallButton("ChatGPT만", v -> setWindowMode("chat"));
+        winRow.addView(winNaverBtn);
+        winRow.addView(winBothBtn);
+        winRow.addView(winChatBtn);
+        controls.addView(winRow);
+
+        controls.addView(smallLabel("가운데 손잡이 막대를 위아래로 끌어 화면 비율을 조절하세요."));
 
         webSplit = new LinearLayout(this);
         webSplit.setOrientation(LinearLayout.VERTICAL);
         workWeb = new WebView(this);
         chatgptWeb = new WebView(this);
+        splitDivider = createSplitDivider();
         webSplit.addView(workWeb, new LinearLayout.LayoutParams(-1, 0, 58f));
-        webSplit.addView(createSplitDivider());
+        webSplit.addView(splitDivider);
         webSplit.addView(chatgptWeb, new LinearLayout.LayoutParams(-1, 0, 42f));
         root.addView(webSplit, new LinearLayout.LayoutParams(-1, 0, 5f));
 
@@ -349,6 +426,7 @@ public class BlogWriterActivity extends Activity {
     private void selectAccount(String id) {
         switchAccount(id);
         customIdInput.setText(id);
+        refreshAccountToggles();
     }
 
     private void switchAccount(String targetId) {
@@ -362,6 +440,7 @@ public class BlogWriterActivity extends Activity {
         currentBlogId = targetId;
         AutoConfig.setString(this, "account", targetId);
         NaverAccounts.applyTo(this, targetId, had -> updateAccountLabel(had));
+        refreshAccountToggles();
         setStatus(targetId + " 계정으로 전환했습니다.");
     }
 
@@ -442,10 +521,12 @@ public class BlogWriterActivity extends Activity {
                     BlogGenerator.filterKeywords(BlogGenerator.parseKeywordJson(value), 30));
             if (collectedKeywords.isEmpty()) {
                 keywordPreview.setText("키워드를 찾지 못했습니다. 실시간 페이지 로그인이 필요하면 웹뷰에서 로그인 후 다시 시도하세요.");
+                renderKeywordChoices();
                 setStatus("실시간 키워드 추출 실패.");
             } else {
-                keywordPreview.setText("실시간 키워드 " + collectedKeywords.size() + "개: "
-                        + BlogGenerator.join(collectedKeywords, ", "));
+                renderKeywordChoices();
+                keywordPreview.setText("실시간 검색어 " + collectedKeywords.size()
+                        + "개 중 " + selectedKeywords.size() + "개 선택");
                 setStatus("실시간 키워드 " + collectedKeywords.size() + "개 확보.");
             }
             progressBar.setProgress(35);
@@ -457,6 +538,174 @@ public class BlogWriterActivity extends Activity {
         });
     }
 
+    private void renderKeywordChoices() {
+        if (keywordSelectionList == null) {
+            return;
+        }
+        renderingKeywordChecks = true;
+        keywordSelectionList.removeAllViews();
+        keywordChecks.clear();
+
+        Set<String> available = new LinkedHashSet<>(collectedKeywords);
+        selectedKeywords.retainAll(available);
+        LinearLayout currentRow = null;
+        for (int index = 0; index < collectedKeywords.size(); index++) {
+            if (index % 2 == 0) {
+                currentRow = row();
+                keywordSelectionList.addView(currentRow);
+            }
+            String keyword = collectedKeywords.get(index);
+            CheckBox box = check(keyword, selectedKeywords.contains(keyword));
+            box.setTag(keyword);
+            box.setOnCheckedChangeListener((button, checked) -> onKeywordSelectionChanged());
+            box.setLayoutParams(new LinearLayout.LayoutParams(0, -2, 1f));
+            keywordChecks.add(box);
+            currentRow.addView(box);
+        }
+        renderingKeywordChecks = false;
+        syncSelectedKeywordsFromChecks();
+        if (!selectedKeywords.isEmpty()) {
+            scheduleRelatedLookup();
+        }
+    }
+
+    private void onKeywordSelectionChanged() {
+        if (renderingKeywordChecks) {
+            return;
+        }
+        syncSelectedKeywordsFromChecks();
+        keywordPreview.setText("실시간 검색어 " + collectedKeywords.size()
+                + "개 중 " + selectedKeywords.size() + "개 선택");
+        AutoConfig.setString(this, "selected_realtime_keywords",
+                BlogGenerator.join(selectedKeywords, "\n"));
+        scheduleRelatedLookup();
+    }
+
+    private void syncSelectedKeywordsFromChecks() {
+        selectedKeywords.clear();
+        for (CheckBox box : keywordChecks) {
+            if (box.isChecked()) {
+                selectedKeywords.add(String.valueOf(box.getTag()));
+            }
+        }
+    }
+
+    private void setAllKeywordChecks(boolean checked) {
+        renderingKeywordChecks = true;
+        for (CheckBox box : keywordChecks) {
+            box.setChecked(checked);
+        }
+        renderingKeywordChecks = false;
+        onKeywordSelectionChanged();
+    }
+
+    private void scheduleRelatedLookup() {
+        if (renderingKeywordChecks || keywordChecks.isEmpty() || selectedKeywords.isEmpty()) {
+            if (selectedKeywords.isEmpty() && relatedKeywordOutput != null) {
+                relatedLookupVersion++;
+                relatedKeywords.clear();
+                relatedKeywordOutput.setText("");
+            }
+            return;
+        }
+        keywordHandler.removeCallbacks(relatedLookupRunnable);
+        keywordHandler.postDelayed(relatedLookupRunnable, 650);
+    }
+
+    private void fetchRelatedForSelectedKeywords() {
+        fetchRelatedForSelectedKeywords(null);
+    }
+
+    private void fetchRelatedForSelectedKeywords(Runnable then) {
+        keywordHandler.removeCallbacks(relatedLookupRunnable);
+        syncSelectedKeywordsFromChecks();
+        if (selectedKeywords.isEmpty()) {
+            relatedKeywords.clear();
+            relatedKeywordOutput.setText("");
+            setStatus("먼저 실시간 검색어를 하나 이상 선택하세요.");
+            return;
+        }
+        boolean useNaver = srcNaver.isChecked();
+        boolean useDaum = srcDaum.isChecked();
+        boolean useGoogle = srcGoogle.isChecked();
+        if (!useNaver && !useDaum && !useGoogle) {
+            setStatus("연관 검색어 조회 소스를 하나 이상 선택하세요.");
+            return;
+        }
+
+        int requestVersion = ++relatedLookupVersion;
+        List<String> seeds = new ArrayList<>(selectedKeywords);
+        progressBar.setProgress(38);
+        setStatus("선택한 " + seeds.size() + "개 검색어의 연관 검색어를 찾는 중...");
+        executor.execute(() -> {
+            Set<String> all = new LinkedHashSet<>();
+            StringBuilder display = new StringBuilder();
+            int errorCount = 0;
+            for (String seed : seeds) {
+                RelatedKeywordFetcher.Result result =
+                        RelatedKeywordFetcher.fetch(seed, useNaver, useDaum, useGoogle);
+                display.append("선택 검색어: ").append(seed).append('\n');
+                appendRelatedSource(display, "네이버", result.naver);
+                appendRelatedSource(display, "다음", result.daum);
+                appendRelatedSource(display, "구글", result.google);
+                if (!result.errors.isEmpty()) {
+                    display.append("오류: ").append(BlogGenerator.join(result.errors, " / ")).append('\n');
+                    errorCount += result.errors.size();
+                }
+                display.append('\n');
+                all.addAll(result.all());
+            }
+            List<String> finalRelated = new ArrayList<>(all);
+            int finalErrorCount = errorCount;
+            runOnUiThread(() -> {
+                if (requestVersion != relatedLookupVersion) {
+                    return;
+                }
+                relatedKeywords.clear();
+                relatedKeywords.addAll(finalRelated);
+                relatedKeywordOutput.setText(display.toString().trim());
+                progressBar.setProgress(42);
+                String message = "연관 검색어 " + relatedKeywords.size() + "개를 찾았습니다.";
+                if (finalErrorCount > 0) {
+                    message += " 일부 소스 " + finalErrorCount + "건은 조회하지 못했습니다.";
+                }
+                setStatus(message);
+                if (then != null) {
+                    then.run();
+                }
+            });
+        });
+    }
+
+    private void appendRelatedSource(StringBuilder output, String source, List<String> values) {
+        output.append('[').append(source).append("] ");
+        if (values.isEmpty()) {
+            output.append("결과 없음");
+        } else {
+            output.append(BlogGenerator.join(values, ", "));
+        }
+        output.append('\n');
+    }
+
+    private void copyAllRelatedKeywords() {
+        if (relatedKeywords.isEmpty()) {
+            setStatus("복사할 연관 검색어가 없습니다. 키워드를 선택해 먼저 조회하세요.");
+            return;
+        }
+        copyToClipboard(BlogGenerator.join(relatedKeywords, "\n"));
+        setStatus("전체 연관 검색어 " + relatedKeywords.size() + "개를 복사했습니다.");
+    }
+
+    private void copySelectedKeywords() {
+        syncSelectedKeywordsFromChecks();
+        if (selectedKeywords.isEmpty()) {
+            setStatus("선택된 실시간 검색어가 없습니다.");
+            return;
+        }
+        copyToClipboard(BlogGenerator.join(selectedKeywords, "\n"));
+        setStatus("선택 검색어 " + selectedKeywords.size() + "개를 복사했습니다.");
+    }
+
     // ---------------------------------------------------------------
     //  생성
     // ---------------------------------------------------------------
@@ -465,9 +714,17 @@ public class BlogWriterActivity extends Activity {
     private void runBatch() {
         setStatus("일괄 실행: 키워드 수집 → 초안 생성 → 복사 → 글쓰기 열기");
         if (optRealtime.isChecked()) {
-            fetchKeywords(() -> generateBlog(GenAfter.OPEN_WRITER));
+            fetchKeywords(() -> continueBatch(GenAfter.OPEN_WRITER));
         } else {
-            generateBlog(GenAfter.OPEN_WRITER);
+            continueBatch(GenAfter.OPEN_WRITER);
+        }
+    }
+
+    private void continueBatch(GenAfter after) {
+        if (optRelated.isChecked() && !selectedKeywords.isEmpty()) {
+            fetchRelatedForSelectedKeywords(() -> generateBlog(after));
+        } else {
+            generateBlog(after);
         }
     }
 
@@ -484,7 +741,11 @@ public class BlogWriterActivity extends Activity {
         progressBar.setProgress(45);
         setStatus("프롬프트를 준비하고 API를 호출합니다...");
         saveSettings();
-        final List<String> keywords = new ArrayList<>(collectedKeywords);
+        final Set<String> keywordSet = new LinkedHashSet<>(selectedKeywords);
+        if (optRelated.isChecked()) {
+            keywordSet.addAll(relatedKeywords);
+        }
+        final List<String> keywords = new ArrayList<>(keywordSet);
         final String openAiKey = openAiKeyInput.getText().toString().trim();
         final String geminiKey = geminiKeyInput.getText().toString().trim();
         final String openAiModel = AutoConfig.openAiModel(this);
@@ -612,6 +873,7 @@ public class BlogWriterActivity extends Activity {
     // ---------------------------------------------------------------
     private void setTarget(String target) {
         AutoConfig.setString(this, "publish_target", target);
+        refreshTargetToggles();
         updateAutoStatus();
         setStatus("발행 방식: " + targetLabel(target));
     }
@@ -690,6 +952,15 @@ public class BlogWriterActivity extends Activity {
     //  설정 저장/복원 (AutoConfig)
     // ---------------------------------------------------------------
     private void loadSettings() {
+        selectedKeywords.clear();
+        String savedKeywords = AutoConfig.prefs(this)
+                .getString("selected_realtime_keywords", "");
+        for (String keyword : savedKeywords.split("\n")) {
+            String value = keyword.trim();
+            if (!value.isEmpty() && !selectedKeywords.contains(value)) {
+                selectedKeywords.add(value);
+            }
+        }
         openAiKeyInput.setText(AutoConfig.openAiKey(this));
         geminiKeyInput.setText(AutoConfig.geminiKey(this));
         openAiModelInput.setText(rawModel("openai_model"));
@@ -700,10 +971,11 @@ public class BlogWriterActivity extends Activity {
         optRelated.setChecked(AutoConfig.useRelated(this));
         optImageSlots.setChecked(AutoConfig.useImageSlots(this));
         autoPublishCheck.setChecked(AutoConfig.autoPublish(this));
+        srcNaver.setChecked(AutoConfig.prefs(this).getBoolean("src_naver", true));
         srcDaum.setChecked(AutoConfig.prefs(this).getBoolean("src_daum", true));
         srcGoogle.setChecked(AutoConfig.prefs(this).getBoolean("src_google", true));
-        srcCreator.setChecked(AutoConfig.prefs(this).getBoolean("src_creator", true));
         intervalInput.setText(String.valueOf(AutoConfig.intervalMinutes(this)));
+        windowMode = AutoConfig.prefs(this).getString("window_mode", "both");
         currentBlogId = AutoConfig.account(this);
         customIdInput.setText(currentBlogId);
         String last = AutoConfig.lastResult(this);
@@ -727,9 +999,11 @@ public class BlogWriterActivity extends Activity {
         AutoConfig.setBool(this, "opt_related", optRelated.isChecked());
         AutoConfig.setBool(this, "opt_image", optImageSlots.isChecked());
         AutoConfig.setBool(this, "auto_publish", autoPublishCheck.isChecked());
+        AutoConfig.setBool(this, "src_naver", srcNaver.isChecked());
         AutoConfig.setBool(this, "src_daum", srcDaum.isChecked());
         AutoConfig.setBool(this, "src_google", srcGoogle.isChecked());
-        AutoConfig.setBool(this, "src_creator", srcCreator.isChecked());
+        AutoConfig.setString(this, "selected_realtime_keywords",
+                BlogGenerator.join(selectedKeywords, "\n"));
         AutoConfig.setInt(this, "interval_min", parseInt(intervalInput.getText().toString(), 60));
         AutoConfig.setString(this, "account", currentBlogId);
     }
@@ -749,10 +1023,15 @@ public class BlogWriterActivity extends Activity {
         }
     }
 
+    @SuppressWarnings("ClickableViewAccessibility")
     private View createSplitDivider() {
-        View divider = new View(this);
-        divider.setBackgroundColor(Color.rgb(150, 160, 176));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(18));
+        TextView divider = new TextView(this);
+        divider.setText("⬍  위아래로 끌어 크기 조절");
+        divider.setGravity(Gravity.CENTER);
+        divider.setTextColor(Color.WHITE);
+        divider.setTextSize(12);
+        divider.setBackgroundColor(Color.rgb(90, 103, 122));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(30));
         divider.setLayoutParams(params);
         divider.setOnTouchListener(new View.OnTouchListener() {
             float startRawY;
@@ -764,6 +1043,7 @@ public class BlogWriterActivity extends Activity {
                     case MotionEvent.ACTION_DOWN:
                         startRawY = e.getRawY();
                         startTopWeight = ((LinearLayout.LayoutParams) workWeb.getLayoutParams()).weight;
+                        v.getParent().requestDisallowInterceptTouchEvent(true);
                         return true;
                     case MotionEvent.ACTION_MOVE:
                         int h = webSplit.getHeight();
@@ -791,6 +1071,97 @@ public class BlogWriterActivity extends Activity {
         webSplit.requestLayout();
     }
 
+    // ---------------------------------------------------------------
+    //  화면 표시 모드 + 버튼 선택 상태
+    // ---------------------------------------------------------------
+    private void setWindowMode(String mode) {
+        windowMode = mode;
+        AutoConfig.setString(this, "window_mode", mode);
+        applyWindowMode();
+        refreshWindowToggles();
+    }
+
+    private void applyWindowMode() {
+        boolean both = "both".equals(windowMode);
+        boolean naverOnly = "naver".equals(windowMode);
+        boolean chatOnly = "chat".equals(windowMode);
+        workWeb.setVisibility(chatOnly ? View.GONE : View.VISIBLE);
+        chatgptWeb.setVisibility(naverOnly ? View.GONE : View.VISIBLE);
+        if (splitDivider != null) {
+            splitDivider.setVisibility(both ? View.VISIBLE : View.GONE);
+        }
+        LinearLayout.LayoutParams tp = (LinearLayout.LayoutParams) workWeb.getLayoutParams();
+        LinearLayout.LayoutParams bp = (LinearLayout.LayoutParams) chatgptWeb.getLayoutParams();
+        if (naverOnly) {
+            tp.weight = 100f;
+            bp.weight = 0f;
+        } else if (chatOnly) {
+            tp.weight = 0f;
+            bp.weight = 100f;
+        } else {
+            tp.weight = 58f;
+            bp.weight = 42f;
+        }
+        workWeb.setLayoutParams(tp);
+        chatgptWeb.setLayoutParams(bp);
+        webSplit.requestLayout();
+    }
+
+    private void refreshAllToggles() {
+        refreshAccountToggles();
+        refreshTargetToggles();
+        refreshWindowToggles();
+    }
+
+    private void refreshAccountToggles() {
+        styleToggle(accBtn0, currentBlogId.equals(NaverAccounts.IDS[0]));
+        styleToggle(accBtn1, currentBlogId.equals(NaverAccounts.IDS[1]));
+    }
+
+    private void refreshTargetToggles() {
+        String t = AutoConfig.publishTarget(this);
+        styleToggle(targetDraftBtn, AutoConfig.TARGET_DRAFT.equals(t));
+        styleToggle(targetWebBtn, AutoConfig.TARGET_WEBVIEW.equals(t));
+        styleToggle(targetAppBtn, AutoConfig.TARGET_APP.equals(t));
+    }
+
+    private void refreshWindowToggles() {
+        styleToggle(winNaverBtn, "naver".equals(windowMode));
+        styleToggle(winBothBtn, "both".equals(windowMode));
+        styleToggle(winChatBtn, "chat".equals(windowMode));
+    }
+
+    private void styleToggle(Button b, boolean selected) {
+        if (b == null) {
+            return;
+        }
+        if (selected) {
+            b.setBackground(pressBg(Color.rgb(29, 137, 72)));
+            b.setTextColor(Color.WHITE);
+            b.setTypeface(null, Typeface.BOLD);
+        } else {
+            b.setBackground(pressBg(Color.rgb(224, 228, 235)));
+            b.setTextColor(Color.rgb(52, 64, 84));
+            b.setTypeface(null, Typeface.NORMAL);
+        }
+    }
+
+    /** 눌린 상태가 눈에 보이도록 pressed 는 어둡게, disabled 는 회색으로. */
+    private Drawable pressBg(int base) {
+        StateListDrawable sld = new StateListDrawable();
+        sld.addState(new int[]{android.R.attr.state_pressed}, new ColorDrawable(darken(base, 0.72f)));
+        sld.addState(new int[]{-android.R.attr.state_enabled}, new ColorDrawable(Color.rgb(205, 210, 217)));
+        sld.addState(new int[0], new ColorDrawable(base));
+        return sld;
+    }
+
+    private int darken(int c, float f) {
+        return Color.rgb(
+                (int) (Color.red(c) * f),
+                (int) (Color.green(c) * f),
+                (int) (Color.blue(c) * f));
+    }
+
     private int parseInt(String s, int def) {
         try {
             return Integer.parseInt(s.trim());
@@ -804,7 +1175,7 @@ public class BlogWriterActivity extends Activity {
         view.setText(text);
         view.setTextColor(Color.rgb(16, 24, 40));
         view.setTextSize(24);
-        view.setTypeface(null, 1);
+        view.setTypeface(null, Typeface.BOLD);
         view.setPadding(0, 0, 0, dp(10));
         return view;
     }
@@ -814,7 +1185,7 @@ public class BlogWriterActivity extends Activity {
         view.setText(text);
         view.setTextColor(Color.rgb(52, 64, 84));
         view.setTextSize(13);
-        view.setTypeface(null, 1);
+        view.setTypeface(null, Typeface.BOLD);
         view.setPadding(0, dp(12), 0, dp(4));
         return view;
     }
@@ -835,6 +1206,9 @@ public class BlogWriterActivity extends Activity {
         input.setTextSize(14);
         input.setPadding(dp(10), 0, dp(10), 0);
         input.setBackgroundColor(Color.WHITE);
+        if (Build.VERSION.SDK_INT >= 26) {
+            input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(46));
         params.setMargins(0, dp(4), 0, dp(4));
         input.setLayoutParams(params);
@@ -849,6 +1223,9 @@ public class BlogWriterActivity extends Activity {
         input.setGravity(Gravity.TOP | Gravity.START);
         input.setPadding(dp(10), dp(8), dp(10), dp(8));
         input.setBackgroundColor(Color.WHITE);
+        if (Build.VERSION.SDK_INT >= 26) {
+            input.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        }
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.setMargins(0, dp(6), 0, dp(6));
         input.setLayoutParams(params);
@@ -878,7 +1255,7 @@ public class BlogWriterActivity extends Activity {
         button.setText(text);
         button.setTextSize(13);
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(47, 111, 237));
+        button.setBackground(pressBg(Color.rgb(47, 111, 237)));
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(44), 1f);
         params.setMargins(dp(3), 0, dp(3), 0);
@@ -892,7 +1269,7 @@ public class BlogWriterActivity extends Activity {
         button.setText(text);
         button.setTextSize(14);
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(23, 78, 166));
+        button.setBackground(pressBg(Color.rgb(23, 78, 166)));
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(46));
         params.setMargins(0, dp(6), 0, dp(6));
@@ -906,7 +1283,7 @@ public class BlogWriterActivity extends Activity {
         button.setText(text);
         button.setTextSize(14);
         button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(23, 78, 166));
+        button.setBackground(pressBg(Color.rgb(23, 78, 166)));
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(46), 1.4f);
         params.setMargins(dp(6), 0, 0, 0);
