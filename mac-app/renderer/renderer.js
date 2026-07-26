@@ -68,6 +68,9 @@ function selectImageKeyword(keyword) {
     item.classList.toggle("selected", item.dataset.keyword === keyword));
   $("imageSearchKeyword").textContent = keyword;
   $("googleImageSearch").disabled = false;
+  $("captureGoogleImages").disabled = false;
+  $("captureEnhanceGoogleImages").disabled = false;
+  $("goGoogleImages").disabled = false;
   $("googleImageStatus").textContent = "2번 탭에서 영어 번역 후 Google 이미지 검색을 실행할 수 있습니다.";
 }
 
@@ -86,7 +89,10 @@ function isEphemeral(keyword) {
     /\b\d+\s*[:\-대]\s*\d+\b/, /\b(vs|경기\s*결과|스코어|선발\s*라인업|생중계|중계)\b/i,
     /(축구|야구|농구|배구|골프).*(결과|스코어|중계|라인업)/,
     /(결과|스코어|중계|라인업).*(축구|야구|농구|배구|골프)/,
-    /(로또|복권).*(당첨|번호|추첨)/
+    /(로또|복권).*(당첨|번호|추첨)/, /(당첨|추첨).*(결과|번호)/,
+    /로또\s*\d*회/, /오늘의\s*경기/, /몇\s*대\s*몇/, /득점\s*결과/,
+    /(속보|긴급|현재|실시간).*(사고|상황|현황)/,
+    /(경기|매치).*(오늘|내일|중계|시간)/
   ].some(pattern => pattern.test(value));
 }
 
@@ -122,6 +128,7 @@ async function loadRelated(rawSeed) {
   $("prefixStatus").textContent = "";
   $("copyRelated").disabled = true;
   $("copyPrefix").disabled = true;
+  $("copyAllRelated").disabled = true;
   try {
     const prefix = seed.split(" ").length > 1 ? seed.split(" ")[0] : "";
     const [items, prefixItems] = await Promise.all([
@@ -149,6 +156,7 @@ async function loadRelated(rawSeed) {
           : "상단 결과와 중복되지 않는 추가 검색어가 없습니다.")
       : "여러 단어를 검색하면 첫 단어 결과가 중복 없이 표시됩니다.";
     $("copyPrefix").disabled = !prefixWords.length;
+    $("copyAllRelated").disabled = !(relatedWords.length || prefixWords.length);
   } catch (error) {
     relatedWords = [];
     prefixWords = [];
@@ -206,6 +214,12 @@ $("copyPrefix").onclick = async () => {
   await navigator.clipboard.writeText(prefixWords.join("\n"));
   $("prefixStatus").textContent = `중복 없는 첫 단어 추가 결과 ${prefixWords.length}개를 복사했습니다.`;
 };
+$("copyAllRelated").onclick = async () => {
+  const all = [...relatedWords, ...prefixWords];
+  if (!all.length) return;
+  await navigator.clipboard.writeText(all.join("\n"));
+  $("relatedStatus").textContent = `중복 없는 상단·하단 결과 ${all.length}개를 복사했습니다.`;
+};
 
 const tabTitles = {
   "1": "실시간 연관 검색어",
@@ -213,6 +227,18 @@ const tabTitles = {
   "3": "네이버 블로그",
   "4": "댓글·이웃 소통"
 };
+function activateTab(tab) {
+  document.querySelectorAll(".tab-button").forEach(item => {
+    const active = item.dataset.tab === String(tab);
+    item.classList.toggle("active", active);
+    if (active) {
+      document.querySelectorAll(".tab-panel").forEach(panel =>
+        panel.classList.toggle("active", panel.dataset.panel === item.dataset.tab));
+      document.querySelector("header h1").textContent = tabTitles[item.dataset.tab];
+    }
+  });
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
 document.querySelectorAll(".tab-button").forEach(button => {
   button.onclick = () => {
     document.querySelectorAll(".tab-button").forEach(item => item.classList.toggle("active", item === button));
@@ -222,6 +248,7 @@ document.querySelectorAll(".tab-button").forEach(button => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 });
+$("goGoogleImages").onclick = () => activateTab(2);
 
 $("googleImageSearch").onclick = async () => {
   if (!selectedImageKeyword) {
@@ -234,6 +261,7 @@ $("googleImageSearch").onclick = async () => {
     const result = await window.picture.googleImageSearch(selectedImageKeyword);
     $("googleImageStatus").textContent =
       `${result.korean} → ${result.english} · 웨일에서 Google 이미지 검색 결과를 열었습니다.`;
+    $("reopenGoogleImages").disabled = false;
   } catch (error) {
     $("googleImageStatus").textContent = `검색 실패: ${error.message}`;
   } finally {
@@ -241,11 +269,56 @@ $("googleImageSearch").onclick = async () => {
   }
 };
 
+async function runGoogleImageTask(button, workingText, task) {
+  const buttons = ["googleImageSearch", "reopenGoogleImages", "captureGoogleImages",
+    "enhanceGoogleImages", "captureEnhanceGoogleImages"].map($);
+  buttons.forEach(item => { item.disabled = true; });
+  $("googleImageStatus").textContent = workingText;
+  try {
+    const result = await task();
+    if (result?.canceled) {
+      $("googleImageStatus").textContent = "폴더 선택을 취소했습니다.";
+    } else if (result?.enhancedFolder) {
+      $("googleImageStatus").textContent =
+        `15장 저장과 화질·해상도 개선 완료 · ${result.enhancedFolder}`;
+    } else {
+      $("googleImageStatus").textContent =
+        `${result.count || 15}장 완료 · ${result.folder || result.imageUrl || ""}`;
+    }
+  } catch (error) {
+    $("googleImageStatus").textContent = `작업 중단: ${error.message}`;
+  } finally {
+    $("googleImageSearch").disabled = !selectedImageKeyword;
+    $("captureGoogleImages").disabled = !selectedImageKeyword;
+    $("captureEnhanceGoogleImages").disabled = !selectedImageKeyword;
+    $("enhanceGoogleImages").disabled = false;
+    $("reopenGoogleImages").disabled = false;
+  }
+}
+
+$("reopenGoogleImages").onclick = () =>
+  runGoogleImageTask($("reopenGoogleImages"), "최근 Google 이미지 검색 결과를 다시 여는 중…",
+    () => window.picture.openLastGoogleImages());
+$("captureGoogleImages").onclick = () =>
+  runGoogleImageTask($("captureGoogleImages"), "저장 폴더를 선택한 뒤 CC 이미지 15장을 저장합니다…",
+    () => window.picture.captureGoogleImages(selectedImageKeyword));
+$("enhanceGoogleImages").onclick = () =>
+  runGoogleImageTask($("enhanceGoogleImages"), "최근 저장한 이미지 15장의 화질·해상도를 개선합니다…",
+    () => window.picture.enhanceGoogleImages());
+$("captureEnhanceGoogleImages").onclick = () =>
+  runGoogleImageTask($("captureEnhanceGoogleImages"), "CC 이미지 15장 저장 후 화질·해상도를 순서대로 개선합니다…",
+    () => window.picture.captureEnhanceGoogleImages(selectedImageKeyword));
+window.picture.onGoogleImageProgress(progress => {
+  $("googleImageStatus").textContent = progress.status;
+});
+
 function settings() {
   return {
     blogId: $("blogId").value.trim() || "dicajohn",
     phrases: $("phrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
     neighborPhrases: $("neighborPhrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+    commentDays: Number($("commentDays").value) || 10,
+    replyInterval: Math.max(0, Number($("replyInterval").value) || 0),
     intervalSeconds: Number($("intervalSeconds").value) || 30,
     maxPosts: Number($("maxPosts").value) || 20
   };
@@ -254,22 +327,14 @@ async function saveSettings() { await window.picture.setSettings(settings()); }
 $("login").onclick = async () => { await saveSettings(); await window.picture.openNaverLogin($("blogId").value.trim()); };
 $("write").onclick = () => window.picture.openBlogWrite();
 $("reply").onclick = async () => {
-  setBusy($("reply"), true); $("replyStatus").textContent = "최근 10일 글을 확인하는 중...";
+  setBusy($("reply"), true);
+  $("replyStatus").textContent = `최근 ${settings().commentDays}일 글의 댓글·하트를 확인하는 중...`;
   try {
     await saveSettings();
     const result = await window.picture.replyComments(settings());
-    $("replyStatus").textContent = `완료 · 글 ${result.posts}개 · 답글 ${result.done}개 · 건너뜀 ${result.skipped}개 · 실패 ${result.failed}개`;
+    $("replyStatus").textContent = `완료 · 글 ${result.posts}개 · 답글 ${result.done}개 · 하트 ${result.liked || 0}개 · 건너뜀 ${result.skipped}개 · 실패 ${result.failed}개`;
   } catch (error) { $("replyStatus").textContent = `중단: ${error.message}`; }
   finally { setBusy($("reply"), false); }
-};
-$("heart").onclick = async () => {
-  setBusy($("heart"), true); $("heartStatus").textContent = "최근 10일 글의 공감 상태 확인 중...";
-  try {
-    await saveSettings();
-    const result = await window.picture.heartRecentPosts(settings());
-    $("heartStatus").textContent = `완료 · 글 ${result.posts}개 · 하트 ${result.hearted}개 · 건너뜀 ${result.skipped}개 · 실패 ${result.failed}개`;
-  } catch (error) { $("heartStatus").textContent = `중단: ${error.message}`; }
-  finally { setBusy($("heart"), false); }
 };
 $("neighborStart").onclick = async () => {
   setBusy($("neighborStart"), true); $("neighborStatus").textContent = "이웃 새글을 불러오는 중...";
@@ -290,10 +355,7 @@ $("neighborStop").onclick = async () => {
   $("neighborStatus").textContent = "현재 글 처리 후 중지합니다...";
 };
 window.picture.onReplyProgress(p => {
-  $("replyStatus").textContent = `${p.status} · 답글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
-});
-window.picture.onHeartProgress(p => {
-  $("heartStatus").textContent = `${p.status} · 하트 ${p.hearted || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
+  $("replyStatus").textContent = `${p.status} · 답글 ${p.done || 0} · 하트 ${p.liked || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
 });
 window.picture.onNeighborProgress(p => {
   $("neighborStatus").textContent = `${p.status} · 댓글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
@@ -304,6 +366,8 @@ window.picture.onNeighborProgress(p => {
   if (saved.blogId) $("blogId").value = saved.blogId;
   if (saved.phrases?.length) $("phrases").value = saved.phrases.join("\n");
   if (saved.neighborPhrases?.length) $("neighborPhrases").value = saved.neighborPhrases.join("\n");
+  if (saved.commentDays) $("commentDays").value = saved.commentDays;
+  if (saved.replyInterval !== undefined) $("replyInterval").value = saved.replyInterval;
   if (saved.intervalSeconds) $("intervalSeconds").value = saved.intervalSeconds;
   if (saved.maxPosts) $("maxPosts").value = saved.maxPosts;
 })();

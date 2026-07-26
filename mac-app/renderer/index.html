@@ -62,6 +62,10 @@
           </div>
         </div>
       </div>
+      <div class="keyword-actions">
+        <button id="copyAllRelated" class="secondary" disabled>상단·하단 결과 모두 복사</button>
+        <button id="goGoogleImages" disabled>선택 검색어 → 2번 Google 이미지 검색</button>
+      </div>
     </section>
 
     <section class="card tab-panel" data-panel="2">
@@ -73,6 +77,12 @@
         <strong id="imageSearchKeyword">1번에서 연관 검색어를 하나 선택하세요.</strong>
       </div>
       <button id="googleImageSearch" class="image-search-button" disabled>영어로 번역해서 Google 이미지 검색</button>
+      <div class="image-workflow">
+        <button id="reopenGoogleImages" class="secondary" disabled>검색 결과 다시 열기</button>
+        <button id="captureGoogleImages" disabled>1. CC 이미지 15장 크롭 저장</button>
+        <button id="enhanceGoogleImages" class="secondary">2. 화질·해상도 개선</button>
+        <button id="captureEnhanceGoogleImages" disabled>3. 1→2 순차 작업 시작</button>
+      </div>
       <div id="googleImageStatus" class="status">대기 중</div>
 
       <details class="tool-card inner-tool">
@@ -107,11 +117,13 @@
 방문해 주시고 좋은 말씀까지 남겨주셔서 정말 감사합니다 :)
 정성스러운 댓글 감사드립니다. 늘 건강하고 행복하세요!
 공감해 주셔서 감사합니다. 다음 글에서도 반갑게 뵐게요!</textarea>
+      <div class="row compact">
+        <div><label>최근 글 일수</label><input id="commentDays" type="number" min="1" max="365" value="10"></div>
+        <div><label>답글 간격(초)</label><input id="replyInterval" type="number" min="0" max="3600" value="5"></div>
+      </div>
       <div class="notice">웨일에 이미 로그인되어 있으면 로그인 과정 없이 바로 시작합니다.</div>
-      <button id="reply" class="navy">최근 10일 댓글 감사 답글 시작</button>
-      <div id="replyStatus" class="status">대기 중 · 이미 답글한 댓글은 자동으로 건너뜁니다.</div>
-      <button id="heart" class="navy">최근 10일 글의 미공감 하트 누르기</button>
-      <div id="heartStatus" class="status">대기 중 · 이미 공감한 글은 건너뜁니다.</div>
+      <button id="reply" class="navy">내 글 답글·하트 시작</button>
+      <div id="replyStatus" class="status">대기 중 · 이미 답글했거나 하트를 누른 댓글은 자동으로 건너뜁니다.</div>
 
       <h2 class="subheading">이웃 새글 댓글</h2>
       <p>이웃 새글을 순서대로 열고, 이미 내 댓글이 없는 글에만 무작위 문구를 등록합니다.</p>

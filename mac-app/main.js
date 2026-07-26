@@ -1,16 +1,32 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, session } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, session, nativeImage } = require("electron");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 
 let mainWindow;
 let naverWindow;
 let neighborJobCancelled = false;
 let whaleProcess;
+let lastGoogleImageSearch = null;
+let lastGoogleCaptureFolder = "";
+let activeNaverTask = "";
 const WHALE_DEBUG_PORT = 9339;
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const userDataFile = name => path.join(app.getPath("userData"), name);
+
+async function runNaverTask(name, task) {
+  if (activeNaverTask) {
+    throw new Error(`현재 '${activeNaverTask}' 작업이 진행 중입니다. 완료 또는 중지 후 다시 실행해 주세요.`);
+  }
+  activeNaverTask = name;
+  try {
+    return await task();
+  } finally {
+    activeNaverTask = "";
+  }
+}
 
 class CdpPage {
   constructor(webSocketUrl) {
@@ -68,6 +84,23 @@ class CdpPage {
       } catch {}
     }
     return results;
+  }
+  async evaluateMain(expression) {
+    const evaluated = await this.send("Runtime.evaluate", {
+      expression, awaitPromise: true, returnByValue: true, userGesture: true
+    });
+    if (evaluated.exceptionDetails) {
+      throw new Error(evaluated.exceptionDetails.text || "웨일 페이지 실행 중 오류가 발생했습니다.");
+    }
+    return evaluated.result?.value;
+  }
+  async captureClip(clip) {
+    const result = await this.send("Page.captureScreenshot", {
+      format: "png",
+      captureBeyondViewport: true,
+      clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 }
+    });
+    return Buffer.from(result.data || "", "base64");
   }
   disconnect() {
     try { this.socket.close(); } catch {}
@@ -252,19 +285,34 @@ async function waitForPage(win, predicate, timeout = 18000) {
   return false;
 }
 
+async function collectRealtimeDirect() {
+  const definitions = [
+    ["다음", "https://adsensefarm.kr/realtime/daum.php", data => data?.data],
+    ["구글", "https://adsensefarm.kr/realtime/googletrend.php", data => data?.data],
+    ["크리에이터 어드바이저", "https://adsensefarm.kr/realtime/naver.php", data => data?.data],
+    ["네이버 시그널", "https://api.signal.bz/news/realtime", data =>
+      (data?.top10 || []).map(item => item?.keyword)]
+  ];
+  const entries = await Promise.all(definitions.map(async ([source, url, pick]) => {
+    try {
+      const data = JSON.parse(await fetchText(url));
+      return [source, unique(pick(data) || []).slice(0, 10)];
+    } catch {
+      return [source, []];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
 ipcMain.handle("collect-realtime", async () => {
+  const output = await collectRealtimeDirect();
+  if (Object.values(output).every(values => values.length >= 10)) return output;
   const collector = new BrowserWindow({
     show: false,
     width: 1400,
     height: 1100,
     webPreferences: { contextIsolation: true, sandbox: true }
   });
-  const output = {
-    "다음": [],
-    "구글": [],
-    "크리에이터 어드바이저": [],
-    "네이버 시그널": []
-  };
   try {
     await collector.loadURL("https://adsensefarm.kr/realtime");
     await waitForPage(collector, `(() => [...document.querySelectorAll('.item .kwds .keyword')]
@@ -285,7 +333,9 @@ ipcMain.handle("collect-realtime", async () => {
       }
       return result;
     })()`, true);
-    for (const [source, values] of Object.entries(adsense || {})) output[source] = unique(values).slice(0, 10);
+    for (const [source, values] of Object.entries(adsense || {})) {
+      if (!output[source]?.length) output[source] = unique(values).slice(0, 10);
+    }
 
     await collector.loadURL("https://www.signal.bz/");
     await waitForPage(collector, `document.querySelectorAll('.realtime-rank .rank-text,.rank-text').length > 0`);
@@ -293,7 +343,7 @@ ipcMain.handle("collect-realtime", async () => {
       [...document.querySelectorAll('.realtime-rank .rank-text,.rank-text')]
         .map(e => (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim())
         .filter(Boolean).slice(0,10))()`, true);
-    output["네이버 시그널"] = unique(signal).slice(0, 10);
+    if (!output["네이버 시그널"]?.length) output["네이버 시그널"] = unique(signal).slice(0, 10);
   } finally {
     if (!collector.isDestroyed()) collector.destroy();
   }
@@ -347,7 +397,7 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
   return output.slice(0, 40);
 });
 
-ipcMain.handle("google-image-search", async (_event, keyword) => {
+async function translateToEnglish(keyword) {
   const korean = unique([keyword])[0];
   if (!korean) throw new Error("1번에서 연관 검색어를 먼저 선택해 주세요.");
   const endpoint = "https://translate.googleapis.com/translate_a/single"
@@ -355,14 +405,184 @@ ipcMain.handle("google-image-search", async (_event, keyword) => {
   const translatedData = JSON.parse(await fetchText(endpoint));
   const english = (translatedData?.[0] || []).map(part => part?.[0] || "").join("").trim();
   if (!english) throw new Error("영어 번역 결과를 가져오지 못했습니다.");
-  const imageUrl = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(english)}`;
+  return { korean, english };
+}
+
+function googleImageUrl(english, creativeCommons = false) {
+  const params = new URLSearchParams({
+    tbm: "isch", hl: "en", safe: "active", q: english
+  });
+  if (creativeCommons) params.set("tbs", "il:cl");
+  return `https://www.google.com/search?${params.toString()}`;
+}
+
+async function openGoogleImages(keyword, creativeCommons = false) {
+  const translated = await translateToEnglish(keyword);
+  const imageUrl = googleImageUrl(translated.english, creativeCommons);
   if (process.platform === "darwin") {
     const page = await openWhalePage(imageUrl);
     page.disconnect();
   } else {
     await shell.openExternal(imageUrl);
   }
-  return { korean, english, imageUrl };
+  lastGoogleImageSearch = { ...translated, imageUrl };
+  return lastGoogleImageSearch;
+}
+
+ipcMain.handle("google-image-search", async (_event, keyword) => {
+  return openGoogleImages(keyword, false);
+});
+
+ipcMain.handle("open-last-google-images", async () => {
+  if (!lastGoogleImageSearch?.imageUrl) throw new Error("먼저 Google 이미지 검색을 실행해 주세요.");
+  if (process.platform === "darwin") {
+    const page = await openWhalePage(lastGoogleImageSearch.imageUrl);
+    page.disconnect();
+  } else {
+    await shell.openExternal(lastGoogleImageSearch.imageUrl);
+  }
+  return lastGoogleImageSearch;
+});
+
+function googleImageCaptureExpression() {
+  return `(async () => {
+    const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+    const visible=e=>{const r=e.getBoundingClientRect();const s=getComputedStyle(e);
+      return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none';};
+    const thumbnails=[...document.querySelectorAll('img.YQ4gaf,img.rg_i,div[data-ri] img,a img')]
+      .filter(img=>visible(img)&&img.getBoundingClientRect().width>=110&&img.getBoundingClientRect().height>=80);
+    let thumbnail=null;
+    for(const item of thumbnails){
+      if(item.dataset.pictureCleanerTried==='1')continue;
+      item.dataset.pictureCleanerTried='1';thumbnail=item;break;
+    }
+    if(!thumbnail){
+      window.scrollBy(0,Math.max(900,window.innerHeight*.85));await sleep(700);
+      return {scroll:true};
+    }
+    thumbnail.scrollIntoView({block:'center'});thumbnail.click();await sleep(850);
+    const previews=[...document.querySelectorAll(
+      'img.sFlh5c,img.iPVvYb,img.n3VNCb,div[role="dialog"] img,div[aria-live] img')]
+      .filter(img=>{const r=img.getBoundingClientRect();return visible(img)&&
+        r.left>=window.innerWidth*.45&&r.width>=240&&r.height>=160&&
+        (img.naturalWidth||0)>=300&&(img.naturalHeight||0)>=200;})
+      .sort((a,b)=>(b.naturalWidth*b.naturalHeight)-(a.naturalWidth*a.naturalHeight));
+    if(!previews.length)return {retry:true};
+    const preview=previews[0],r=preview.getBoundingClientRect();
+    const link=preview.closest('a[href]')||thumbnail.closest('a[href]');
+    return {
+      clip:{x:r.left+window.scrollX,y:r.top+window.scrollY,width:r.width,height:r.height},
+      sourceUrl:preview.currentSrc||preview.src||preview.dataset.src||'',
+      resultPageUrl:link?.href||''
+    };
+  })()`;
+}
+
+async function captureGoogleImages(event, keyword, count = 15) {
+  if (process.platform !== "darwin") {
+    throw new Error("이미지 자동 저장은 Apple Silicon 맥용 앱에서 실행해 주세요.");
+  }
+  const targetCount = Math.max(1, Math.min(20, Number(count) || 15));
+  const picked = await dialog.showOpenDialog(mainWindow, {
+    title: "Google 이미지 저장 폴더 선택",
+    properties: ["openDirectory", "createDirectory"]
+  });
+  if (picked.canceled) return { canceled: true, count: 0 };
+  const translated = await translateToEnglish(keyword);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outputFolder = path.join(picked.filePaths[0], `Google-Images-${timestamp}`);
+  fs.mkdirSync(outputFolder, { recursive: true });
+  const imageUrl = googleImageUrl(translated.english, true);
+  lastGoogleImageSearch = { ...translated, imageUrl };
+  const page = await openWhalePage(imageUrl);
+  const seenSources = new Set();
+  const seenHashes = new Set();
+  const metadata = [];
+  let saved = 0;
+  try {
+    await wait(1600);
+    for (let attempt = 0; attempt < 120 && saved < targetCount; attempt++) {
+      event.sender.send("google-image-progress", {
+        status: `Creative Commons 이미지 확인 중 · ${saved}/${targetCount}`, saved, target: targetCount
+      });
+      const candidate = await page.evaluateMain(googleImageCaptureExpression()).catch(() => null);
+      if (!candidate?.clip) continue;
+      const sourceKey = String(candidate.sourceUrl || "");
+      if (sourceKey && seenSources.has(sourceKey)) continue;
+      const png = await page.captureClip(candidate.clip).catch(() => Buffer.alloc(0));
+      if (!png.length) continue;
+      const digest = crypto.createHash("sha256").update(png).digest("hex");
+      if (seenHashes.has(digest)) continue;
+      const image = nativeImage.createFromBuffer(png);
+      const size = image.getSize();
+      if (image.isEmpty() || size.width < 240 || size.height < 160) continue;
+      const file = `google_cc_${String(saved + 1).padStart(2, "0")}.jpg`;
+      fs.writeFileSync(path.join(outputFolder, file), image.toJPEG(94));
+      seenHashes.add(digest);
+      if (sourceKey) seenSources.add(sourceKey);
+      saved++;
+      metadata.push({
+        file, query: translated.english, sourceUrl: sourceKey,
+        resultPageUrl: candidate.resultPageUrl || "",
+        licenseFilter: "Creative Commons", capturedAt: new Date().toISOString()
+      });
+    }
+  } finally {
+    page.disconnect();
+  }
+  fs.writeFileSync(path.join(outputFolder, "_image_sources.json"), JSON.stringify(metadata, null, 2));
+  lastGoogleCaptureFolder = outputFolder;
+  if (saved < targetCount) {
+    throw new Error(`Creative Commons 필터 결과에서 ${targetCount}장 중 ${saved}장만 저장했습니다. 다시 시도해 주세요.`);
+  }
+  return { canceled: false, count: saved, folder: outputFolder, ...translated };
+}
+
+async function enhanceGoogleImages(event, preferredFolder = "") {
+  let sourceFolder = preferredFolder || lastGoogleCaptureFolder;
+  if (!sourceFolder || !fs.existsSync(sourceFolder)) {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: "Google 이미지 15장이 있는 폴더 선택", properties: ["openDirectory"]
+    });
+    if (picked.canceled) return { canceled: true, count: 0 };
+    sourceFolder = picked.filePaths[0];
+  }
+  const files = fs.readdirSync(sourceFolder)
+    .filter(name => /^google_cc_\d+\.jpe?g$/i.test(name)).sort().slice(0, 15);
+  if (files.length < 15) throw new Error(`이미지 15장이 필요합니다. 현재 ${files.length}장입니다.`);
+  const outputFolder = path.join(sourceFolder, "PictureCleaner");
+  fs.mkdirSync(outputFolder, { recursive: true });
+  for (let index = 0; index < files.length; index++) {
+    event.sender.send("google-image-progress", {
+      status: `화질·해상도 개선 중 · ${index + 1}/15`, saved: index, target: 15
+    });
+    let image = nativeImage.createFromPath(path.join(sourceFolder, files[index]));
+    if (image.isEmpty()) throw new Error(`${files[index]} 파일을 읽지 못했습니다.`);
+    const size = image.getSize();
+    const longSide = Math.max(size.width, size.height);
+    if (longSide < 2048) {
+      const scale = 2048 / longSide;
+      image = image.resize({
+        width: Math.max(1, Math.round(size.width * scale)),
+        height: Math.max(1, Math.round(size.height * scale)),
+        quality: "best"
+      });
+    }
+    fs.writeFileSync(
+      path.join(outputFolder, `cleaned_${String(index + 1).padStart(2, "0")}.jpg`),
+      image.toJPEG(95)
+    );
+  }
+  return { canceled: false, count: files.length, folder: outputFolder };
+}
+
+ipcMain.handle("capture-google-images", (event, keyword) => captureGoogleImages(event, keyword, 15));
+ipcMain.handle("enhance-google-images", event => enhanceGoogleImages(event));
+ipcMain.handle("capture-enhance-google-images", async (event, keyword) => {
+  const captured = await captureGoogleImages(event, keyword, 15);
+  if (captured.canceled) return captured;
+  const enhanced = await enhanceGoogleImages(event, captured.folder);
+  return { ...captured, enhancedFolder: enhanced.folder };
 });
 
 ipcMain.handle("open-naver-login", async (_event, blogId) => {
@@ -399,10 +619,33 @@ ipcMain.handle("set-settings", (_event, settings) => {
   return true;
 });
 
-async function recentWhalePosts(page, blogId) {
+async function recentWhalePosts(page, blogId, days = 10) {
+  const safeDays = Math.max(1, Math.min(365, Number(days) || 10));
+  try {
+    const xml = await fetchText(`https://rss.blog.naver.com/${encodeURIComponent(blogId)}.xml`);
+    const nowKorea = new Date(Date.now() + 9 * 3600000);
+    const cutoffKorea = Date.UTC(
+      nowKorea.getUTCFullYear(), nowKorea.getUTCMonth(),
+      nowKorea.getUTCDate() - safeDays + 1, 0, 0, 0
+    ) - 9 * 3600000;
+    const posts = [...xml.matchAll(/<item\b[\s\S]*?<\/item>/gi)].map(match => {
+      const block = match[0];
+      const link = (block.match(/<(?:link|guid)[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/(?:link|guid)>/i)?.[1] || "").trim();
+      const published = (block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i)?.[1] || "").trim();
+      const title = (block.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i)?.[1] || "")
+        .replace(/<[^>]+>/g, "").trim();
+      const logNo = link.match(/(?:logNo=|\/)(\d{10,})/)?.[1];
+      const date = Date.parse(published);
+      return logNo && Number.isFinite(date) && date >= cutoffKorea ? { logNo, title, date } : null;
+    }).filter(Boolean);
+    if (posts.length) {
+      return posts.filter((post, index, all) => all.findIndex(x => x.logNo === post.logNo) === index)
+        .sort((a, b) => b.date - a.date);
+    }
+  } catch {}
   await page.navigate(`https://blog.naver.com/PostList.naver?blogId=${encodeURIComponent(blogId)}&from=postList`);
   const values = await page.evaluateFrames(`(() => {
-    const cutoff = Date.now() - 10 * 86400000;
+    const cutoff = Date.now() - ${safeDays} * 86400000;
     const links = [...document.querySelectorAll('a[href*="logNo="],a[href*="/${blogId}/"]')];
     const out = [];
     for (const a of links) {
@@ -423,6 +666,8 @@ async function recentWhalePosts(page, blogId) {
 async function replyCommentsInWhale(event, options) {
   const blogId = String(options.blogId || "dicajohn").trim();
   const phrases = unique(options.phrases || []);
+  const days = Math.max(1, Math.min(365, Number(options.commentDays) || 10));
+  const replyInterval = Math.max(0, Math.min(3600, Number(options.replyInterval) || 0));
   if (!phrases.length) throw new Error("감사 문구를 한 개 이상 입력해 주세요.");
   const send = payload => event.sender.send("reply-progress", payload);
   const processedPath = userDataFile("replied-comments.json");
@@ -431,10 +676,10 @@ async function replyCommentsInWhale(event, options) {
   const page = await openWhalePage("about:blank");
   try {
     await requireNaverWhaleLogin(page);
-    const posts = await recentWhalePosts(page, blogId);
-    let done = 0, skipped = 0, failed = 0;
+    const posts = await recentWhalePosts(page, blogId, days);
+    let done = 0, liked = 0, skipped = 0, failed = 0;
     for (const post of posts) {
-      send({ status: `웨일에서 글 확인: ${post.title || post.logNo}`, done, skipped, failed });
+      send({ status: `웨일에서 글 확인: ${post.title || post.logNo}`, done, liked, skipped, failed });
       await page.navigate(`https://blog.naver.com/PostView.naver?blogId=${encodeURIComponent(blogId)}&logNo=${post.logNo}`);
       await Promise.all((await page.evaluateFrames(`(() => {
         const toggle=[...document.querySelectorAll('button,a')].find(e=>(e.innerText||'').includes('댓글'));
@@ -444,39 +689,65 @@ async function replyCommentsInWhale(event, options) {
       const results = await page.evaluateFrames(`(async () => {
         const sleep=ms=>new Promise(r=>setTimeout(r,ms));
         const blogId=${JSON.stringify(blogId)}, phrases=${JSON.stringify(phrases)};
+        const replyInterval=${JSON.stringify(replyInterval)};
         const processed=${JSON.stringify(processed)}, logNo=${JSON.stringify(post.logNo)};
-        const blocks=[...document.querySelectorAll('[class*="comment_item"],[class*="u_cbox_comment_box"],li[class*="comment"]')];
-        let done=0,skipped=0,failed=0;
+        for(let page=0;page<30;page++){
+          const more=[...document.querySelectorAll('button,a')].find(e=>
+            /댓글.*더보기|더보기/.test((e.innerText||'').trim())&&e.offsetParent!==null);
+          if(!more)break;more.click();await sleep(350);
+        }
+        const candidates=[...document.querySelectorAll(
+          'ul.u_cbox_list > li.u_cbox_comment,[class*="comment_item"],[class*="u_cbox_comment_box"],li[class*="comment"]')];
+        const blocks=candidates.filter((block,index,all)=>!all.some((parent,parentIndex)=>
+          parentIndex!==index&&parent.contains(block)&&parent.matches('li.u_cbox_comment')));
+        let done=0,liked=0,skipped=0,failed=0;
         for(const block of blocks){
-          const author=(block.querySelector('[class*="name"],[class*="nick"]')?.innerText||'').trim();
-          const body=(block.querySelector('[class*="text"],[class*="contents"]')?.innerText||'').trim();
+          const author=(block.querySelector('.u_cbox_nick,[class*="name"],[class*="nick"]')?.innerText||'').trim();
+          const body=(block.querySelector('.u_cbox_contents,[class*="text"],[class*="contents"]')?.innerText||'').trim();
           const key=logNo+':'+author+':'+body.slice(0,80);
-          if(!body||author===blogId||processed[key]){skipped++;continue;}
-          const own=[...block.querySelectorAll('[class*="reply"],[class*="comment"]')]
-            .some(e=>(e.querySelector('[class*="name"],[class*="nick"]')?.innerText||'').includes(blogId));
-          if(own){skipped++;continue;}
-          const reply=[...block.querySelectorAll('button,a')].find(e=>/답글|답변/.test(e.innerText||''));
+          if(!body||author===blogId){skipped++;continue;}
+          const legacyRecord=Boolean(processed[key]);
+          const record=processed[key]&&typeof processed[key]==='object'?processed[key]:{};
+          if(legacyRecord&&!Object.prototype.hasOwnProperty.call(record,'replied'))record.replied=true;
+          const like=[...block.querySelectorAll('.u_cbox_btn_recomm,button,a')].find(e=>
+            /공감|좋아요|추천/.test((e.innerText||'')+' '+(e.getAttribute('aria-label')||'')));
+          if(like&&!record.liked){
+            const state=(like.getAttribute('aria-pressed')||'')+' '+like.className+' '+
+              (like.getAttribute('aria-label')||'')+' '+(like.title||'');
+            if(/true|_on|active|취소|해제|선택됨/.test(state))record.liked=true;
+            else{like.click();await sleep(500);record.liked=true;liked++;}
+          }
+          processed[key]=record;
+          const own=[...block.querySelectorAll('.u_cbox_reply_area li.u_cbox_comment,[class*="reply"] li')]
+            .some(e=>(e.querySelector('.u_cbox_nick,[class*="name"],[class*="nick"]')?.innerText||'').includes(blogId));
+          if(record.replied||own){record.replied=true;processed[key]=record;skipped++;continue;}
+          const reply=[...block.querySelectorAll('.u_cbox_btn_reply,button,a')].find(e=>/답글|답변/.test(e.innerText||''));
           if(!reply){failed++;continue;} reply.click(); await sleep(300);
-          const editor=block.querySelector('textarea,[contenteditable="true"]')||document.querySelector('textarea:focus,[contenteditable="true"]:focus');
+          const editor=block.querySelector('.u_cbox_write_area textarea.u_cbox_text,textarea,[contenteditable="true"]')||
+            document.querySelector('textarea:focus,[contenteditable="true"]:focus');
           if(!editor){failed++;continue;}
           const phrase=phrases[Math.floor(Math.random()*phrases.length)]; editor.focus();
           if(editor.tagName==='TEXTAREA'){
             Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(editor,phrase);
             editor.dispatchEvent(new Event('input',{bubbles:true}));
           }else{editor.textContent=phrase;editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:phrase}));}
-          const submit=[...block.querySelectorAll('button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
+          const scope=editor.closest('.u_cbox_write_wrap,form,[class*="write"]')||block;
+          const submit=[...scope.querySelectorAll('.u_cbox_btn_upload,button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
           if(!submit){failed++;continue;} submit.click(); await sleep(650);
-          processed[key]={at:new Date().toISOString(),phrase};done++;
+          record.replied=true;record.at=new Date().toISOString();record.phrase=phrase;
+          processed[key]=record;done++;
+          if(replyInterval>0)await sleep(replyInterval*1000);
         }
-        return {done,skipped,failed,processed,found:blocks.length};
+        return {done,liked,skipped,failed,processed,found:blocks.length};
       })()`);
-      const result = results.find(value => value?.found) || { done: 0, skipped: 0, failed: 0, processed };
-      done += result.done || 0; skipped += result.skipped || 0; failed += result.failed || 0;
+      const result = results.find(value => value?.found) || { done: 0, liked: 0, skipped: 0, failed: 0, processed };
+      done += result.done || 0; liked += result.liked || 0;
+      skipped += result.skipped || 0; failed += result.failed || 0;
       processed = result.processed || processed;
       fs.writeFileSync(processedPath, JSON.stringify(processed, null, 2));
     }
-    const summary = { posts: posts.length, done, skipped, failed };
-    send({ status: "웨일 댓글 답글 완료", ...summary, complete: true });
+    const summary = { posts: posts.length, done, liked, skipped, failed };
+    send({ status: "웨일 댓글 답글·하트 완료", ...summary, complete: true });
     return summary;
   } finally { page.disconnect(); }
 }
@@ -523,16 +794,48 @@ async function neighborCommentsInWhale(event, options) {
   const page = await openWhalePage("https://section.blog.naver.com/BlogHome.naver");
   try {
     await requireNaverWhaleLogin(page);
-    const values = await page.evaluateFrames(`(() => [...document.querySelectorAll('a[href*="blog.naver.com"]')]
-      .map(a=>({url:a.href,title:(a.innerText||'').trim()}))
-      .filter(x=>/(?:logNo=|blog\\.naver\\.com\\/[\\w.-]+\\/\\d+)/.test(x.url)))()`);
-    let links = values.flatMap(value => Array.isArray(value) ? value : []);
-    links = links.filter((item, index, all) => all.findIndex(x => x.url === item.url) === index).slice(0, maxPosts);
+    const candidateMax = Math.min(600, maxPosts * 3);
+    let links = await page.evaluateMain(`(async () => {
+      const output=[],seen=new Set();let total=${candidateMax},page=1;
+      while(output.length<${candidateMax}&&(page-1)*10<total){
+        const response=await fetch('/ajax/BuddyPostList.naver?page='+page+'&groupId=0',{credentials:'include'});
+        let text=await response.text(),cleaned=text.trimStart();
+        if(cleaned.startsWith(")]}',"))cleaned=cleaned.split('\\n').slice(1).join('\\n');
+        const data=JSON.parse(cleaned),result=data.result||{},posts=result.buddyPostList||[];
+        total=Number(result.buddyPostTotalCount||posts.length||0);
+        if(!posts.length)break;
+        for(const post of posts){
+          let blog=String(post.domainIdOrBlogId||'').trim();
+          let logNo=String(post.logNo||'').trim();
+          const raw=String(post.postUrl||'').trim();
+          if((!blog||!logNo)&&raw){
+            const match=raw.match(/blog\\.naver\\.com\\/([^/?#]+)\\/(\\d{10,})/);
+            if(match){blog=match[1];logNo=match[2];}
+          }
+          if(!blog||!logNo||blog.toLowerCase()===${JSON.stringify(blogId.toLowerCase())}||seen.has(logNo))continue;
+          seen.add(logNo);output.push({
+            url:'https://blog.naver.com/PostView.naver?blogId='+encodeURIComponent(blog)+'&logNo='+logNo,
+            logNo,title:String(post.title||post.postTitle||'').trim()
+          });
+          if(output.length>=${candidateMax})break;
+        }
+        page++;
+      }
+      return output;
+    })()`).catch(() => []);
+    if (!Array.isArray(links) || !links.length) {
+      const values = await page.evaluateFrames(`(() => [...document.querySelectorAll('a[href*="blog.naver.com"]')]
+        .map(a=>({url:a.href,title:(a.innerText||'').trim()}))
+        .filter(x=>/(?:logNo=|blog\\.naver\\.com\\/[\\w.-]+\\/\\d+)/.test(x.url)))()`);
+      links = values.flatMap(value => Array.isArray(value) ? value : []);
+    }
+    links = links.filter((item, index, all) => all.findIndex(x => x.url === item.url) === index)
+      .slice(0, candidateMax);
     let done = 0, skipped = 0, failed = 0;
     for (const item of links) {
-      if (neighborJobCancelled) break;
-      const key = item.url.replace(/[?#].*$/, "");
-      if (processed[key]) { skipped++; continue; }
+      if (neighborJobCancelled || done >= maxPosts) break;
+      const key = item.logNo || item.url.match(/(?:logNo=|\/)(\d{10,})/)?.[1] || item.url.replace(/[?#].*$/, "");
+      if (processed[key] || processed[item.url.replace(/[?#].*$/, "")]) { skipped++; continue; }
       send({ status: `웨일 이웃 글 확인: ${item.title || key}`, done, skipped, failed });
       await page.navigate(item.url);
       const results = await page.evaluateFrames(`(async () => {
@@ -541,16 +844,18 @@ async function neighborCommentsInWhale(event, options) {
         if(comments.some(e=>(e.innerText||'').includes(blogId)))return 'skipped';
         const toggle=[...document.querySelectorAll('button,a')].find(e=>/댓글/.test(e.innerText||''));
         if(toggle){toggle.click();await sleep(450);}
-        const editor=document.querySelector('textarea,[contenteditable="true"]');if(!editor)return 'failed';
+        const editor=document.querySelector('.u_cbox_write_area textarea.u_cbox_text,textarea,[contenteditable="true"]');if(!editor)return 'failed';
         const phrases=${JSON.stringify(phrases)},phrase=phrases[Math.floor(Math.random()*phrases.length)];
         editor.focus();
         if(editor.tagName==='TEXTAREA'){
           Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(editor,phrase);
           editor.dispatchEvent(new Event('input',{bubbles:true}));
         }else{editor.textContent=phrase;editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:phrase}));}
-        await sleep(250);const scope=editor.closest('form,[class*="comment"],[class*="write"]')||document;
-        const submit=[...scope.querySelectorAll('button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
-        if(!submit)return 'failed';submit.click();await sleep(700);return 'done';
+        await sleep(250);const scope=editor.closest('.u_cbox_write_wrap,form,[class*="comment"],[class*="write"]')||document;
+        const submit=[...scope.querySelectorAll('.u_cbox_btn_upload,button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
+        if(!submit)return 'failed';submit.click();await sleep(900);
+        const cleared=editor.tagName==='TEXTAREA'?!editor.value.trim():!editor.textContent.trim();
+        return cleared?'done':'failed';
       })()`);
       const result = results.find(value => value === "done" || value === "skipped") || "failed";
       if (result === "done") {
@@ -567,7 +872,9 @@ async function neighborCommentsInWhale(event, options) {
 }
 
 ipcMain.handle("reply-comments", async (event, options) => {
-  if (process.platform === "darwin") return replyCommentsInWhale(event, options);
+  if (process.platform === "darwin") {
+    return runNaverTask("내 글 답글·하트", () => replyCommentsInWhale(event, options));
+  }
   const blogId = String(options.blogId || "").trim();
   const phrases = unique(options.phrases || []);
   if (!blogId) throw new Error("네이버 블로그 아이디를 입력해 주세요.");
@@ -673,7 +980,9 @@ ipcMain.handle("reply-comments", async (event, options) => {
 });
 
 ipcMain.handle("heart-recent-posts", async (event, options) => {
-  if (process.platform === "darwin") return heartRecentInWhale(event, options);
+  if (process.platform === "darwin") {
+    return runNaverTask("최근 글 하트", () => heartRecentInWhale(event, options));
+  }
   const blogId = String(options.blogId || "dicajohn").trim();
   const win = getNaverWindow();
   const send = payload => event.sender.send("heart-progress", payload);
@@ -737,7 +1046,9 @@ ipcMain.handle("stop-neighbor-comments", () => {
 });
 
 ipcMain.handle("comment-neighbor-feed", async (event, options) => {
-  if (process.platform === "darwin") return neighborCommentsInWhale(event, options);
+  if (process.platform === "darwin") {
+    return runNaverTask("이웃 새글 댓글", () => neighborCommentsInWhale(event, options));
+  }
   const blogId = String(options.blogId || "dicajohn").trim();
   const phrases = unique(options.phrases || []);
   const intervalSeconds = Math.max(15, Math.min(3600, Number(options.intervalSeconds) || 30));
