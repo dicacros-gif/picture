@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Picture Cleaner</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mark">A</div>
+      <div><small>PICTURE CLEANER · APPLE SILICON</small><h1>오늘 작업</h1></div>
+      <span class="chip">M1 최적화</span>
+    </header>
+
+    <section class="card">
+      <div class="step">STEP 1</div>
+      <h2>이미지 자동 정리</h2>
+      <p>스크린샷의 불필요한 밝은 여백을 줄이고, 선명도·대비를 보정해 JPEG로 저장합니다.</p>
+      <input id="images" type="file" accept="image/*" multiple>
+      <button id="processImages">선택 이미지 정리 시작</button>
+      <div id="imageStatus" class="status">이미지를 선택해 주세요.</div>
+    </section>
+
+    <section class="card">
+      <div class="step teal">STEP 2</div>
+      <h2>실시간 연관 검색어</h2>
+      <p>네이버·다음·구글 자동완성에서 연관 검색어를 모읍니다.</p>
+      <div class="row"><input id="seed" placeholder="기준 검색어"><button id="keywords">40개 수집</button></div>
+      <div id="keywordList" class="keywords"></div>
+    </section>
+
+    <section class="card">
+      <div class="step navy">STEP 3</div>
+      <h2>네이버 블로그 자동화</h2>
+      <p>전용 창에 한 번 로그인하면 세션이 안전하게 유지됩니다. 글쓰기와 최근 10일 댓글 감사 답글을 실행할 수 있습니다.</p>
+      <label>블로그 아이디</label>
+      <input id="blogId" autocomplete="off" placeholder="예: myblogid">
+      <div class="row">
+        <button id="login" class="secondary">네이버 로그인/블로그 열기</button>
+        <button id="write" class="secondary">블로그 글쓰기 열기</button>
+      </div>
+      <label>랜덤 감사 문구 (한 줄에 하나)</label>
+      <textarea id="phrases" rows="7">소중한 댓글 감사합니다! 오늘도 행복한 하루 보내세요 😊
+따뜻한 댓글 남겨주셔서 감사합니다. 좋은 하루 되세요!
+방문해 주시고 좋은 말씀까지 남겨주셔서 정말 감사합니다 :)
+정성스러운 댓글 감사드립니다. 늘 건강하고 행복하세요!
+공감해 주셔서 감사합니다. 다음 글에서도 반갑게 뵐게요!</textarea>
+      <div class="notice">실행 전에 전용 창에서 로그인 상태를 확인하세요. 네이버 화면 구조가 바뀌거나 보안 확인이 나타나면 창에서 직접 완료한 후 다시 실행하면 됩니다.</div>
+      <button id="reply" class="navy">최근 10일 댓글 감사 답글 시작</button>
+      <div id="replyStatus" class="status">대기 중 · 이미 답글한 댓글은 자동으로 건너뜁니다.</div>
+    </section>
+  </main>
+  <script src="renderer.js"></script>
+</body>
+</html>

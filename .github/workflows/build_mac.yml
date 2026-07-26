@@ -1,0 +1,37 @@
+name: Build Mac M1 App
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'mac-app/**'
+      - '.github/workflows/build_mac.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mac-app/package-lock.json
+      - name: Install dependencies
+        working-directory: mac-app
+        run: npm ci
+      - name: Build Apple Silicon app
+        working-directory: mac-app
+        run: npm run build:mac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Picture-Cleaner-M1
+          path: mac-app/dist/Picture-Cleaner-M1-*.zip
+          if-no-files-found: error
+      - name: Publish Mac file to latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload latest mac-app/dist/Picture-Cleaner-M1-*.zip --clobber
