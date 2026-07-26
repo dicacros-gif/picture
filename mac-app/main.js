@@ -40,6 +40,7 @@ class CdpPage {
   async initialize() {
     await this.send("Page.enable");
     await this.send("Runtime.enable");
+    await this.send("Network.enable");
   }
   async navigate(url) {
     await this.send("Page.navigate", { url });
@@ -81,6 +82,49 @@ function whaleExecutable() {
   return candidates.find(candidate => fs.existsSync(candidate));
 }
 
+function whaleDefaultProfile() {
+  const root = path.join(app.getPath("home"), "Library/Application Support/Naver/Whale");
+  if (!fs.existsSync(root)) return null;
+  let profileName = "Default";
+  try {
+    const localState = JSON.parse(fs.readFileSync(path.join(root, "Local State"), "utf8"));
+    profileName = localState?.profile?.last_used || "Default";
+  } catch {}
+  const profile = path.join(root, profileName);
+  return fs.existsSync(profile) ? { root, profile } : null;
+}
+
+function copyWhaleSession(source, destination) {
+  if (!fs.existsSync(source)) return;
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  try {
+    const sourceStat = fs.statSync(source);
+    if (sourceStat.isDirectory()) {
+      fs.cpSync(source, destination, { recursive: true, force: true });
+    } else {
+      fs.copyFileSync(source, destination);
+    }
+  } catch {}
+}
+
+function syncExistingWhaleLogin(targetRoot) {
+  const source = whaleDefaultProfile();
+  if (!source) return false;
+  const targetProfile = path.join(targetRoot, "Default");
+  fs.mkdirSync(targetProfile, { recursive: true });
+  copyWhaleSession(path.join(source.root, "Local State"), path.join(targetRoot, "Local State"));
+  const items = [
+    "Cookies", "Cookies-wal", "Cookies-shm",
+    "Network/Cookies", "Network/Cookies-wal", "Network/Cookies-shm",
+    "Local Storage", "Session Storage", "IndexedDB", "WebStorage",
+    "Preferences", "Secure Preferences", "Web Data", "Login Data"
+  ];
+  for (const item of items) {
+    copyWhaleSession(path.join(source.profile, item), path.join(targetProfile, item));
+  }
+  return true;
+}
+
 async function ensureWhale() {
   if (process.platform !== "darwin") return null;
   const executable = whaleExecutable();
@@ -91,10 +135,12 @@ async function ensureWhale() {
     if (response.ok) return;
   } catch {}
   const profile = path.join(app.getPath("userData"), "naver-whale-profile");
+  syncExistingWhaleLogin(profile);
   whaleProcess = spawn(executable, [
     `--remote-debugging-port=${WHALE_DEBUG_PORT}`,
     "--remote-allow-origins=*",
     `--user-data-dir=${profile}`,
+    "--profile-directory=Default",
     "--start-maximized",
     "--no-first-run",
     "--disable-notifications",
@@ -122,6 +168,22 @@ async function openWhalePage(url) {
   await page.initialize();
   await wait(1800);
   return page;
+}
+
+async function requireNaverWhaleLogin(page) {
+  try {
+    const result = await page.send("Storage.getCookies");
+    const loggedIn = (result.cookies || []).some(cookie =>
+      /(^|\.)naver\.com$/i.test(cookie.domain || "") &&
+      (cookie.name === "NID_SES" || cookie.name === "NID_AUT") &&
+      Boolean(cookie.value)
+    );
+    if (loggedIn) return true;
+  } catch {}
+  await page.navigate("https://nid.naver.com/nidlogin.login");
+  throw new Error(
+    "네이버 로그인이 확인되지 않아 웨일 로그인 화면을 열었습니다. 로그인 후 작업 버튼을 다시 눌러 주세요."
+  );
 }
 
 function createMainWindow() {
@@ -350,6 +412,7 @@ async function replyCommentsInWhale(event, options) {
   try { processed = JSON.parse(fs.readFileSync(processedPath, "utf8")); } catch {}
   const page = await openWhalePage("about:blank");
   try {
+    await requireNaverWhaleLogin(page);
     const posts = await recentWhalePosts(page, blogId);
     let done = 0, skipped = 0, failed = 0;
     for (const post of posts) {
@@ -405,6 +468,7 @@ async function heartRecentInWhale(event, options) {
   const send = payload => event.sender.send("heart-progress", payload);
   const page = await openWhalePage("about:blank");
   try {
+    await requireNaverWhaleLogin(page);
     const posts = await recentWhalePosts(page, blogId);
     let hearted = 0, skipped = 0, failed = 0;
     for (const post of posts) {
@@ -440,6 +504,7 @@ async function neighborCommentsInWhale(event, options) {
   neighborJobCancelled = false;
   const page = await openWhalePage("https://section.blog.naver.com/BlogHome.naver");
   try {
+    await requireNaverWhaleLogin(page);
     const values = await page.evaluateFrames(`(() => [...document.querySelectorAll('a[href*="blog.naver.com"]')]
       .map(a=>({url:a.href,title:(a.innerText||'').trim()}))
       .filter(x=>/(?:logNo=|blog\\.naver\\.com\\/[\\w.-]+\\/\\d+)/.test(x.url)))()`);
