@@ -347,6 +347,24 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
   return output.slice(0, 40);
 });
 
+ipcMain.handle("google-image-search", async (_event, keyword) => {
+  const korean = unique([keyword])[0];
+  if (!korean) throw new Error("1번에서 연관 검색어를 먼저 선택해 주세요.");
+  const endpoint = "https://translate.googleapis.com/translate_a/single"
+    + `?client=gtx&sl=ko&tl=en&dt=t&q=${encodeURIComponent(korean)}`;
+  const translatedData = JSON.parse(await fetchText(endpoint));
+  const english = (translatedData?.[0] || []).map(part => part?.[0] || "").join("").trim();
+  if (!english) throw new Error("영어 번역 결과를 가져오지 못했습니다.");
+  const imageUrl = `https://www.google.com/search?tbm=isch&q=${encodeURIComponent(english)}`;
+  if (process.platform === "darwin") {
+    const page = await openWhalePage(imageUrl);
+    page.disconnect();
+  } else {
+    await shell.openExternal(imageUrl);
+  }
+  return { korean, english, imageUrl };
+});
+
 ipcMain.handle("open-naver-login", async (_event, blogId) => {
   if (process.platform === "darwin") {
     await openWhalePage(blogId

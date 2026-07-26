@@ -15,7 +15,14 @@
       <span class="chip"> M1 Native</span>
     </header>
 
-    <section class="card keyword-card">
+    <nav class="top-tabs">
+      <button class="tab-button active" data-tab="1">1&nbsp; 실시간 연관 검색어</button>
+      <button class="tab-button" data-tab="2">2&nbsp; Google 이미지 검색</button>
+      <button class="tab-button" data-tab="3">3&nbsp; 네이버 블로그</button>
+      <button class="tab-button" data-tab="4">4&nbsp; 댓글·이웃 소통</button>
+    </nav>
+
+    <section class="card keyword-card tab-panel active" data-panel="1">
       <div class="keyword-head">
         <div>
           <div class="step teal">START</div>
@@ -57,31 +64,50 @@
       </div>
     </section>
 
-    <details class="card tool-card">
-      <summary><span class="step">STEP 1</span><b>이미지 자동 정리</b><em>펼치기</em></summary>
-      <p>스크린샷의 불필요한 밝은 여백을 줄이고, 선명도·대비를 보정해 JPEG로 저장합니다.</p>
-      <input id="images" type="file" accept="image/*" multiple>
-      <button id="processImages">선택 이미지 정리 시작</button>
-      <div id="imageStatus" class="status">이미지를 선택해 주세요.</div>
-    </details>
+    <section class="card tab-panel" data-panel="2">
+      <div class="step">STEP 2</div>
+      <h2>Google 이미지 검색</h2>
+      <p>1번에서 선택한 한글 연관 검색어를 영어로 번역한 뒤 네이버 웨일에서 Google 이미지 결과를 엽니다.</p>
+      <div class="image-search-selection">
+        <small>선택된 연관 검색어</small>
+        <strong id="imageSearchKeyword">1번에서 연관 검색어를 하나 선택하세요.</strong>
+      </div>
+      <button id="googleImageSearch" class="image-search-button" disabled>영어로 번역해서 Google 이미지 검색</button>
+      <div id="googleImageStatus" class="status">대기 중</div>
 
-    <section class="card">
+      <details class="tool-card inner-tool">
+        <summary><b>선택 이미지 정리·리마스터</b><em>펼치기</em></summary>
+        <p>스크린샷의 불필요한 밝은 여백을 줄이고, 선명도·대비를 보정해 JPEG로 저장합니다.</p>
+        <input id="images" type="file" accept="image/*" multiple>
+        <button id="processImages">선택 이미지 정리 시작</button>
+        <div id="imageStatus" class="status">이미지를 선택해 주세요.</div>
+      </details>
+    </section>
+
+    <section class="card tab-panel" data-panel="3">
       <div class="step navy">STEP 3</div>
       <h2>네이버 블로그 자동화</h2>
-      <p>네이버 웨일 전용 프로필에 한 번 로그인하면 세션이 안전하게 유지됩니다. 3·4번 작업은 실제 웨일 창에서 진행됩니다.</p>
+      <p>네이버 웨일 전용 프로필에 한 번 로그인하면 세션이 유지됩니다. 이미 로그인되어 있으면 바로 글쓰기를 엽니다.</p>
       <label>블로그 아이디</label>
       <input id="blogId" autocomplete="off" value="dicajohn" placeholder="예: dicajohn">
       <div class="row">
         <button id="login" class="secondary">웨일 네이버 로그인</button>
         <button id="write" class="secondary">웨일 블로그 글쓰기</button>
       </div>
+      <div class="notice">네이버 보안 확인이 나타나면 웨일에서 직접 완료한 후 다시 실행하면 됩니다.</div>
+    </section>
+
+    <section class="card tab-panel" data-panel="4">
+      <div class="step navy">STEP 4</div>
+      <h2>댓글·이웃 소통</h2>
+      <p>내 글 답글·하트와 이웃 새글 댓글 작업은 실제 네이버 웨일 창에서 진행됩니다.</p>
       <label>랜덤 감사 문구 (한 줄에 하나)</label>
       <textarea id="phrases" rows="7">소중한 댓글 감사합니다! 오늘도 행복한 하루 보내세요 😊
 따뜻한 댓글 남겨주셔서 감사합니다. 좋은 하루 되세요!
 방문해 주시고 좋은 말씀까지 남겨주셔서 정말 감사합니다 :)
 정성스러운 댓글 감사드립니다. 늘 건강하고 행복하세요!
 공감해 주셔서 감사합니다. 다음 글에서도 반갑게 뵐게요!</textarea>
-      <div class="notice">실행 전에 웨일 창에서 로그인 상태를 확인하세요. 네이버 보안 확인이 나타나면 웨일에서 직접 완료한 후 다시 실행하면 됩니다.</div>
+      <div class="notice">웨일에 이미 로그인되어 있으면 로그인 과정 없이 바로 시작합니다.</div>
       <button id="reply" class="navy">최근 10일 댓글 감사 답글 시작</button>
       <div id="replyStatus" class="status">대기 중 · 이미 답글한 댓글은 자동으로 건너뜁니다.</div>
       <button id="heart" class="navy">최근 10일 글의 미공감 하트 누르기</button>

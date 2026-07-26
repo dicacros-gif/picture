@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld("picture", {
   saveImages: images => ipcRenderer.invoke("save-images", images),
   collectRealtime: () => ipcRenderer.invoke("collect-realtime"),
   collectKeywords: seed => ipcRenderer.invoke("collect-keywords", seed),
+  googleImageSearch: keyword => ipcRenderer.invoke("google-image-search", keyword),
   openNaverLogin: blogId => ipcRenderer.invoke("open-naver-login", blogId),
   openBlogWrite: () => ipcRenderer.invoke("open-blog-write"),
   replyComments: options => ipcRenderer.invoke("reply-comments", options),

@@ -60,6 +60,25 @@ $("processImages").onclick = async () => {
 let selectedRealtime = "";
 let relatedWords = [];
 let prefixWords = [];
+let selectedImageKeyword = "";
+
+function selectImageKeyword(keyword) {
+  selectedImageKeyword = keyword;
+  document.querySelectorAll(".related-item").forEach(item =>
+    item.classList.toggle("selected", item.dataset.keyword === keyword));
+  $("imageSearchKeyword").textContent = keyword;
+  $("googleImageSearch").disabled = false;
+  $("googleImageStatus").textContent = "2번 탭에서 영어 번역 후 Google 이미지 검색을 실행할 수 있습니다.";
+}
+
+function renderRelatedWords(targetId, words) {
+  const target = $(targetId);
+  target.innerHTML = words.length
+    ? words.map(word => `<button class="related-item" data-keyword="${escapeHtml(word)}">${escapeHtml(word)}</button>`).join("")
+    : "";
+  target.querySelectorAll(".related-item").forEach(item =>
+    item.onclick = () => selectImageKeyword(item.dataset.keyword));
+}
 
 function isEphemeral(keyword) {
   const value = String(keyword || "").toLowerCase();
@@ -115,17 +134,14 @@ async function loadRelated(rawSeed) {
     const prefixExcluded = new Set([comparisonKey(seed), comparisonKey(prefix)]);
     relatedWords.forEach(word => prefixExcluded.add(comparisonKey(word)));
     prefixWords = prefix ? mergedWords(prefixItems, prefixExcluded) : [];
-    $("keywordList").innerHTML = relatedWords.length
-      ? relatedWords.map(word => `<div class="related-item">${escapeHtml(word)}</div>`).join("")
-      : '<div class="selected-empty">표시할 연관 검색어가 없습니다.</div>';
+    renderRelatedWords("keywordList", relatedWords);
+    if (!relatedWords.length) $("keywordList").innerHTML = '<div class="selected-empty">표시할 연관 검색어가 없습니다.</div>';
     $("relatedStatus").textContent = failed.length
       ? `${relatedWords.length}개 · ${[...new Set(failed)].join(", ")} 조회 결과 없음`
       : `중복 제거된 연관 검색어 ${relatedWords.length}개`;
     $("copyRelated").disabled = !relatedWords.length;
     $("prefixKeyword").textContent = prefix ? `첫 단어 추가 검색: ${prefix}` : "첫 단어 추가 검색";
-    $("prefixList").innerHTML = prefixWords.length
-      ? prefixWords.map(word => `<div class="related-item">${escapeHtml(word)}</div>`).join("")
-      : "";
+    renderRelatedWords("prefixList", prefixWords);
     const prefixFailed = prefixItems.filter(x => x.error).map(x => x.source);
     $("prefixStatus").textContent = prefix
       ? (prefixWords.length
@@ -189,6 +205,40 @@ $("copyPrefix").onclick = async () => {
   if (!prefixWords.length) return;
   await navigator.clipboard.writeText(prefixWords.join("\n"));
   $("prefixStatus").textContent = `중복 없는 첫 단어 추가 결과 ${prefixWords.length}개를 복사했습니다.`;
+};
+
+const tabTitles = {
+  "1": "실시간 연관 검색어",
+  "2": "Google 이미지 검색",
+  "3": "네이버 블로그",
+  "4": "댓글·이웃 소통"
+};
+document.querySelectorAll(".tab-button").forEach(button => {
+  button.onclick = () => {
+    document.querySelectorAll(".tab-button").forEach(item => item.classList.toggle("active", item === button));
+    document.querySelectorAll(".tab-panel").forEach(panel =>
+      panel.classList.toggle("active", panel.dataset.panel === button.dataset.tab));
+    document.querySelector("header h1").textContent = tabTitles[button.dataset.tab];
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+});
+
+$("googleImageSearch").onclick = async () => {
+  if (!selectedImageKeyword) {
+    $("googleImageStatus").textContent = "1번에서 연관 검색어를 하나 선택해 주세요.";
+    return;
+  }
+  setBusy($("googleImageSearch"), true);
+  $("googleImageStatus").textContent = `'${selectedImageKeyword}' 영어 번역 중…`;
+  try {
+    const result = await window.picture.googleImageSearch(selectedImageKeyword);
+    $("googleImageStatus").textContent =
+      `${result.korean} → ${result.english} · 웨일에서 Google 이미지 검색 결과를 열었습니다.`;
+  } catch (error) {
+    $("googleImageStatus").textContent = `검색 실패: ${error.message}`;
+  } finally {
+    setBusy($("googleImageSearch"), false);
+  }
 };
 
 function settings() {
