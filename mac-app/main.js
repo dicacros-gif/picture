@@ -167,7 +167,10 @@ async function fetchText(url) {
     headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X 14_5) AppleWebKit/537.36 Chrome/126 Safari/537.36" }
   });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  return response.text();
+  const bytes = await response.arrayBuffer();
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  const encoding = contentType.includes("euc-kr") ? "euc-kr" : "utf-8";
+  return new TextDecoder(encoding).decode(bytes);
 }
 
 function unique(items) {
