@@ -79,11 +79,11 @@
       <button id="googleImageSearch" class="image-search-button" disabled>영어로 번역해서 Google 이미지 검색</button>
       <div class="image-workflow">
         <button id="reopenGoogleImages" class="secondary" disabled>검색 결과 다시 열기</button>
-        <button id="captureGoogleImages" disabled>1. CC 이미지 15장 크롭 저장</button>
-        <button id="enhanceGoogleImages" class="secondary">2. 화질·해상도 개선</button>
+        <button id="captureGoogleImages" disabled>1. CC 원본 미리보기 15장 저장</button>
+        <button id="enhanceGoogleImages" class="secondary">2. 비율 보존·화질·해상도 개선</button>
         <button id="captureEnhanceGoogleImages" disabled>3. 1→2 순차 작업 시작</button>
       </div>
-      <div id="googleImageStatus" class="status">대기 중</div>
+      <div id="googleImageStatus" class="status">대기 중 · 원본 주소 우선 저장, 실패 시 전체 이미지가 보이도록 캡처합니다.</div>
 
       <details class="tool-card inner-tool">
         <summary><b>선택 이미지 정리·리마스터</b><em>펼치기</em></summary>
@@ -126,7 +126,7 @@
       <div id="replyStatus" class="status">대기 중 · 이미 답글했거나 하트를 누른 댓글은 자동으로 건너뜁니다.</div>
 
       <h2 class="subheading">이웃 새글 댓글</h2>
-      <p>이웃 새글을 순서대로 열고, 이미 내 댓글이 없는 글에만 무작위 문구를 등록합니다.</p>
+      <p>이웃 새글을 순서대로 열고 입력창 활성화와 등록 완료를 확인한 뒤, 이미 내 댓글이 없는 글에만 무작위 문구를 등록합니다.</p>
       <label>이웃 댓글 문구 (한 줄에 하나)</label>
       <textarea id="neighborPhrases" rows="8">정성스러운 글 잘 읽었습니다. 오늘도 좋은 하루 보내세요 😊
 유익한 이야기 감사합니다! 덕분에 즐겁게 보고 갑니다.

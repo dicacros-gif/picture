@@ -280,7 +280,13 @@ async function runGoogleImageTask(button, workingText, task) {
       $("googleImageStatus").textContent = "폴더 선택을 취소했습니다.";
     } else if (result?.enhancedFolder) {
       $("googleImageStatus").textContent =
-        `15장 저장과 화질·해상도 개선 완료 · ${result.enhancedFolder}`;
+        `15장 저장(원본 ${result.originalDownloads || 0} · 전체 보기 캡처 ${result.fallbackCaptures || 0})과 화질·해상도 개선 완료 · ${result.enhancedFolder}`;
+    } else if (result?.originalDownloads !== undefined) {
+      $("googleImageStatus").textContent =
+        `${result.count}장 저장 완료 · 원본 ${result.originalDownloads} · 전체 보기 캡처 ${result.fallbackCaptures} · ${result.folder}`;
+    } else if (result?.imageUrl) {
+      $("googleImageStatus").textContent =
+        `${result.korean} → ${result.english} · 웨일에서 Google 이미지 검색 결과를 열었습니다.`;
     } else {
       $("googleImageStatus").textContent =
         `${result.count || 15}장 완료 · ${result.folder || result.imageUrl || ""}`;
