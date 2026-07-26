@@ -24,7 +24,9 @@ final class KeywordInterestScorer {
 
     private static final String[] EPHEMERAL_SIGNALS = {
             "경기 결과", "경기결과", "실시간 스코어", "중계 일정", "중계방송",
-            "선발 라인업", "오늘 라인업", "경기 하이라이트", "로또 당첨",
+            "중계", "스코어", "선발 라인업", "오늘 라인업", "경기 하이라이트",
+            "하이라이트", "경기 일정", "경기시간", "경기 시간", "연속골",
+            "로또 당첨",
             "당첨 번호", "당첨번호", "오늘 날씨", "현재 날씨", "시간별 날씨",
             "실시간 교통", "교통 상황"
     };
@@ -132,7 +134,16 @@ final class KeywordInterestScorer {
                 return true;
             }
         }
-        return lower.matches(".*\\b(vs|대)\\b.*\\d+\\s*[-:]\\s*\\d+.*");
+        if (lower.matches(".*\\d+\\s*(이닝|홈런|타점|안타|득점|k).*")
+                || lower.matches(".*\\d+경기\\s*연속.*")
+                || lower.matches(".*\\b(vs|대)\\b.*\\d+\\s*[-:]\\s*\\d+.*")) {
+            return true;
+        }
+        boolean matchPhrase = lower.contains(" 대 ") || lower.contains(" vs ");
+        boolean teamSignal = lower.matches(
+                ".*(\\bfc\\b|시티|유나이티드|리버풀|선덜랜드|기아|한화|두산|"
+                        + "롯데|삼성|키움|\\bnc\\b|\\bkt\\b).*");
+        return matchPhrase && teamSignal;
     }
 
     static int sourceCount(String sources) {

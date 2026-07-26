@@ -70,7 +70,6 @@ public class BlogWriterActivity extends Activity {
     private EditText openAiModelInput;
     private EditText geminiModelInput;
     private EditText draftInput;
-    private EditText intervalInput;
     private EditText resultOutput;
     private TextView statusText;
     private TextView accountStatusText;
@@ -97,6 +96,7 @@ public class BlogWriterActivity extends Activity {
     private CheckBox optImageSlots;
     private CheckBox autoPublishCheck;
     private CheckBox useChatGptWebCheck;
+    private CheckBox useChatGptAppCheck;
     private boolean pendingWebPublish = false;
     private boolean autoImageUploadRequested = false;
     private int chatGenerationToken;
@@ -212,15 +212,32 @@ public class BlogWriterActivity extends Activity {
         generationCard.addView(UiKit.badge(this, "2 · GENERATE", UiKit.PRIMARY));
         generationCard.addView(UiKit.sectionTitle(this, "글 생성 방식"));
         useChatGptWebCheck = check(
-                "API 키 없이 하단 ChatGPT의 현재 열린 GPT 사용 (화면 켜짐)", true);
+                "API 키 없이 하단 ChatGPT 웹 사용", true);
+        useChatGptAppCheck = check(
+                "API 키 없이 ChatGPT 앱 사용 (화면 켜짐·잠금 해제 필요)", false);
+        useChatGptWebCheck.setOnCheckedChangeListener((button, checked) -> {
+            if (checked && useChatGptAppCheck != null) {
+                useChatGptAppCheck.setChecked(false);
+            }
+        });
+        useChatGptAppCheck.setOnCheckedChangeListener((button, checked) -> {
+            if (checked && useChatGptWebCheck != null) {
+                useChatGptWebCheck.setChecked(false);
+            }
+        });
         generationCard.addView(useChatGptWebCheck);
+        generationCard.addView(useChatGptAppCheck);
         generationCard.addView(UiKit.caption(this,
-                "하단에서 로그인 후 'Phone 미래 전망' 등 사용할 GPT를 열고 저장하세요."));
+                "웹은 하단에서 사용할 GPT를 열고, 앱은 접근성 서비스를 켠 뒤 실행합니다."));
         LinearLayout chatGptRow = row();
         chatGptRow.addView(smallButton("현재 GPT 저장", v -> saveCurrentChatGpt()));
         chatGptRow.addView(smallButton("ChatGPT 홈", v -> openChatGptHome()));
         chatGptRow.addView(smallButton("응답 가져오기", v -> captureLatestChatResponse()));
         generationCard.addView(chatGptRow);
+        Button chatGptAppButton = smallButton(
+                "ChatGPT 앱 열기", v -> openChatGptApp());
+        chatGptAppButton.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(48)));
+        generationCard.addView(chatGptAppButton);
 
         draftInput = multiInput("글에 추가로 반영할 원문이나 지침을 붙여넣으세요");
         generationCard.addView(draftInput);
@@ -278,12 +295,12 @@ public class BlogWriterActivity extends Activity {
         automationCard.addView(geminiKeyInput);
         automationCard.addView(openAiModelInput);
         automationCard.addView(geminiModelInput);
-        LinearLayout autoRow = row();
-        intervalInput = input("주기(분), 기본 60");
-        intervalInput.setLayoutParams(new LinearLayout.LayoutParams(0, dp(48), 1f));
-        autoRow.addView(intervalInput);
-        autoRow.addView(fullButtonWeighted("자동화 시작/중지", v -> toggleAutomation()));
-        automationCard.addView(autoRow);
+        Button autoButton = fullButton(
+                "1시간 자동화 시작/중지", v -> toggleAutomation());
+        UiKit.stylePrimary(autoButton, UiKit.NAVY);
+        automationCard.addView(autoButton);
+        automationCard.addView(UiKit.caption(this,
+                "실시간 검색어 수집과 API 글쓰기는 1시간마다 실행되며 10일 지난 검색어는 정리됩니다."));
 
         autoStatusText = UiKit.status(this);
         automationCard.addView(autoStatusText);
@@ -582,6 +599,10 @@ public class BlogWriterActivity extends Activity {
         final String prompt = BlogGenerator.buildBlogPrompt(
                 bundle.focus, base, keywords, imageSlots, true);
 
+        if (useChatGptAppCheck.isChecked()) {
+            generateWithChatGptApp(prompt, after, imageSlots);
+            return;
+        }
         if (useChatGptWebCheck.isChecked()) {
             generateWithChatGptWeb(prompt, after, imageSlots);
             return;
@@ -589,7 +610,7 @@ public class BlogWriterActivity extends Activity {
         if (openAiKey.isEmpty() && geminiKey.isEmpty()) {
             progressBar.setProgress(0);
             setStatus("API 생성 방식을 선택했습니다. OpenAI 또는 Gemini API 키를 입력하거나 "
-                    + "'API 키 없이 하단 ChatGPT 사용'을 켜세요.");
+                    + "ChatGPT 웹 또는 앱 사용을 켜세요.");
             return;
         }
 
@@ -606,6 +627,40 @@ public class BlogWriterActivity extends Activity {
                 });
             }
         });
+    }
+
+    private void generateWithChatGptApp(
+            String prompt, GenAfter after, boolean imageSlots) {
+        if (!BlogAutoAccessibilityService.isRunning()) {
+            progressBar.setProgress(0);
+            setStatus("ChatGPT 앱 자동화에는 접근성 서비스가 필요합니다. 설정에서 켜 주세요.");
+            openAccessibilitySettings();
+            return;
+        }
+        if (!ChatGptAppLauncher.launch(this)) {
+            progressBar.setProgress(0);
+            setStatus("ChatGPT 앱이 설치되어 있지 않습니다.");
+            openPlayStore(AutoConfig.CHATGPT_APP_PACKAGE);
+            return;
+        }
+        BlogAutoAccessibilityService service = BlogAutoAccessibilityService.get();
+        if (service == null) {
+            progressBar.setProgress(0);
+            setStatus("접근성 서비스를 다시 켠 뒤 시도하세요.");
+            return;
+        }
+        progressBar.setProgress(25);
+        setStatus("ChatGPT 앱에 선택 검색어와 연관 검색어를 입력합니다.");
+        service.automateChatGpt(prompt, (text, error) -> runOnUiThread(() -> {
+            if (error != null && !error.isEmpty()) {
+                progressBar.setProgress(0);
+                setStatus(error);
+                return;
+            }
+            bringBlogStudioToFront();
+            resultOutput.postDelayed(() ->
+                    completeGeneration(text, after, imageSlots, "ChatGPT 앱"), 500);
+        }));
     }
 
     private void generateWithChatGptWeb(
@@ -856,6 +911,25 @@ public class BlogWriterActivity extends Activity {
         }
     }
 
+    private void openChatGptApp() {
+        if (ChatGptAppLauncher.launch(this)) {
+            setStatus("ChatGPT 앱을 열었습니다. 자동 입력은 접근성 서비스가 켜져 있어야 합니다.");
+        } else {
+            setStatus("ChatGPT 앱이 설치되어 있지 않습니다.");
+            openPlayStore(AutoConfig.CHATGPT_APP_PACKAGE);
+        }
+    }
+
+    private void bringBlogStudioToFront() {
+        try {
+            Intent intent = new Intent(this, BlogWriterActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(intent);
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void openPlayStore(String pkg) {
         try {
             startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + pkg)));
@@ -917,15 +991,10 @@ public class BlogWriterActivity extends Activity {
                 setStatus("'다른 앱 위에 표시'를 허용한 뒤 자동화 시작을 다시 누르세요.");
                 return;
             }
-            int interval = parseInt(intervalInput.getText().toString(), 60);
-            if (interval < 15) {
-                interval = 15;
-            }
-            AutoConfig.setInt(this, "interval_min", interval);
             AutoConfig.setBool(this, "auto_enabled", true);
             ensureAutomationPermissions();
             AutoConfig.scheduleNext(this);
-            setStatus(interval + "분마다 API 생성과 선택한 방식의 처리를 예약했습니다.");
+            setStatus("1시간마다 API 생성과 선택한 방식의 처리를 예약했습니다.");
         }
         updateAutoStatus();
     }
@@ -983,9 +1052,9 @@ public class BlogWriterActivity extends Activity {
         geminiModelInput.setText(rawModel("gemini_model"));
         draftInput.setText(AutoConfig.draftBase(this));
         useChatGptWebCheck.setChecked(AutoConfig.useChatGptWeb(this));
+        useChatGptAppCheck.setChecked(AutoConfig.useChatGptApp(this));
         optImageSlots.setChecked(AutoConfig.useImageSlots(this));
         autoPublishCheck.setChecked(AutoConfig.autoPublish(this));
-        intervalInput.setText(String.valueOf(AutoConfig.intervalMinutes(this)));
         windowMode = AutoConfig.prefs(this).getString("window_mode", "both");
         currentBlogId = AutoConfig.account(this);
         customIdInput.setText(currentBlogId);
@@ -1006,9 +1075,9 @@ public class BlogWriterActivity extends Activity {
         AutoConfig.setString(this, "gemini_model", geminiModelInput.getText().toString().trim());
         AutoConfig.setString(this, "draft_base", draftInput.getText().toString().trim());
         AutoConfig.setBool(this, "use_chatgpt_web", useChatGptWebCheck.isChecked());
+        AutoConfig.setBool(this, "use_chatgpt_app", useChatGptAppCheck.isChecked());
         AutoConfig.setBool(this, "opt_image", optImageSlots.isChecked());
         AutoConfig.setBool(this, "auto_publish", autoPublishCheck.isChecked());
-        AutoConfig.setInt(this, "interval_min", parseInt(intervalInput.getText().toString(), 60));
         AutoConfig.setString(this, "account", currentBlogId);
     }
 
@@ -1227,14 +1296,6 @@ public class BlogWriterActivity extends Activity {
         }
     }
 
-    private int parseInt(String s, int def) {
-        try {
-            return Integer.parseInt(s.trim());
-        } catch (Exception e) {
-            return def;
-        }
-    }
-
     private EditText input(String hint) {
         EditText input = new EditText(this);
         input.setHint(hint);
@@ -1311,15 +1372,6 @@ public class BlogWriterActivity extends Activity {
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(48));
         params.setMargins(0, dp(6), 0, dp(6));
-        button.setLayoutParams(params);
-        return button;
-    }
-
-    private Button fullButtonWeighted(String text, View.OnClickListener listener) {
-        Button button = UiKit.primaryButton(this, text, UiKit.NAVY);
-        button.setOnClickListener(listener);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(48), 1.4f);
-        params.setMargins(dp(6), 0, 0, 0);
         button.setLayoutParams(params);
         return button;
     }

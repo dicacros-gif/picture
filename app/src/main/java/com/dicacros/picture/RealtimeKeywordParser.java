@@ -5,7 +5,9 @@ import org.json.JSONObject;
 import org.json.JSONTokener;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 final class RealtimeKeywordParser {
 
@@ -55,6 +57,27 @@ final class RealtimeKeywordParser {
                 }
             }
         } catch (Exception ignored) {
+        }
+        return result;
+    }
+
+    static List<KeywordDatabase.RankedKeyword> filterContentCandidates(
+            List<KeywordDatabase.RankedKeyword> rankings) {
+        List<KeywordDatabase.RankedKeyword> result = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        if (rankings == null) {
+            return result;
+        }
+        for (KeywordDatabase.RankedKeyword ranking : rankings) {
+            String keyword = KeywordDatabase.normalizeKeyword(ranking.keyword);
+            String key = keyword.toLowerCase(java.util.Locale.ROOT);
+            if (!KeywordDatabase.isUsableKeyword(keyword)
+                    || KeywordInterestScorer.isEphemeral(keyword)
+                    || !seen.add(key)) {
+                continue;
+            }
+            result.add(new KeywordDatabase.RankedKeyword(
+                    keyword, ranking.source, ranking.rank));
         }
         return result;
     }

@@ -6,8 +6,6 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
-import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
@@ -34,7 +32,8 @@ import java.util.concurrent.Executors;
 
 public class KeywordActivity extends Activity {
 
-    private static final String REALTIME_URL = "https://adsensefarm.kr/realtime";
+    private static final String ADSENSEFARM_URL = "https://adsensefarm.kr/realtime";
+    private static final String SIGNAL_URL = "https://www.signal.bz/";
     private static final int REQUEST_NOTIFICATIONS = 3001;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -51,13 +50,16 @@ public class KeywordActivity extends Activity {
     private TextView statusText;
     private ProgressBar progressBar;
     private CheckBox autoSelectCheck;
-    private boolean pendingExtract;
+    private boolean pendingAdsenseExtract;
+    private boolean pendingSignalExtract;
+    private int rawRealtimeCount;
     private boolean rendering;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         database = new KeywordDatabase(this);
+        database.pruneOlderThanDays(10);
         setContentView(createContentView());
         setupKeywordWeb();
         KeywordScheduler.ensureScheduled(this);
@@ -86,17 +88,12 @@ public class KeywordActivity extends Activity {
         scrollView.addView(root);
 
         root.addView(UiKit.backBar(this, "Picture Cleaner · 검색어"));
-        LinearLayout header = UiKit.card(this);
-        header.addView(UiKit.eyebrow(this, "KEYWORD DISCOVERY"));
-        header.addView(UiKit.pageTitle(this, "실시간 흐름에서\n오래 갈 주제를 찾으세요"));
-        header.addView(UiKit.body(this,
-                "네이버·다음·구글 순위를 모으고 반복 노출과 연관 질문을 분석합니다."));
-        root.addView(header);
+        root.addView(UiKit.pageTitle(this, "실시간 연관 검색어"));
+        root.addView(UiKit.caption(this,
+                "저장된 최근 목록을 즉시 표시하고 4개 출처를 새로 갱신합니다."));
 
-        LinearLayout recommendCard = UiKit.tintedCard(
-                this, UiKit.SUCCESS_SOFT, Color.rgb(187, 247, 208));
-        recommendCard.addView(UiKit.badge(this, "SMART PICK", UiKit.SUCCESS));
-        recommendCard.addView(UiKit.sectionTitle(this, "롱테일 자동 추천"));
+        LinearLayout searchCard = UiKit.card(this);
+        searchCard.addView(UiKit.sectionTitle(this, "검색어 탐색"));
         autoSelectCheck = optionCheck(
                 "지속 검색 가능성이 높은 주제를 자동 선택", AutoConfig.autoKeywordSelection(this));
         autoSelectCheck.setOnCheckedChangeListener((button, checked) -> {
@@ -109,13 +106,9 @@ public class KeywordActivity extends Activity {
                 setStatus("자동 추천을 껐습니다. 직접 선택한 검색어만 사용합니다.");
             }
         });
-        recommendCard.addView(autoSelectCheck);
-        recommendCard.addView(UiKit.caption(this,
+        searchCard.addView(autoSelectCheck);
+        searchCard.addView(UiKit.caption(this,
                 "경기 결과·당첨 번호 같은 일회성 검색어는 제외하고 인물·기업·해외·전망 주제를 우선합니다."));
-        root.addView(recommendCard);
-
-        LinearLayout searchCard = UiKit.card(this);
-        searchCard.addView(UiKit.sectionTitle(this, "검색어 탐색"));
         manualKeywordInput = input("직접 검색어 입력 후 엔터");
         manualKeywordInput.setSingleLine(true);
         manualKeywordInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
@@ -138,7 +131,7 @@ public class KeywordActivity extends Activity {
         searchCard.addView(refreshRow);
 
         LinearLayout selectionRow = row();
-        selectionRow.addView(smallButton("현재 30개 선택", view -> setDisplayedSelected(true)));
+        selectionRow.addView(smallButton("현재 목록 전체 선택", view -> setDisplayedSelected(true)));
         selectionRow.addView(smallButton("현재 선택 해제", view -> setDisplayedSelected(false)));
         searchCard.addView(selectionRow);
         root.addView(searchCard);
@@ -146,14 +139,14 @@ public class KeywordActivity extends Activity {
         LinearLayout actionCard = UiKit.card(this);
         actionCard.addView(UiKit.sectionTitle(this, "선택한 주제 활용"));
         Button relatedButton = accentButton(
-                "네이버·다음·구글 연관어 조회", UiKit.PRIMARY,
+                "선택 검색어 연관어 조회", UiKit.PRIMARY,
                 view -> fetchAllSelectedRelated());
         relatedButton.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(48)));
         actionCard.addView(relatedButton);
-        LinearLayout copyRow = row();
-        copyRow.addView(smallButton("선택 검색어 복사", view -> copySelectedKeywords()));
-        copyRow.addView(smallButton("전체 연관어 복사", view -> copyAllRelated()));
-        actionCard.addView(copyRow);
+        Button copySelected = smallButton(
+                "선택 검색어 복사", view -> copySelectedKeywords());
+        copySelected.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(48)));
+        actionCard.addView(copySelected);
         root.addView(actionCard);
 
         LinearLayout statusCard = UiKit.card(this);
@@ -183,6 +176,10 @@ public class KeywordActivity extends Activity {
 
         LinearLayout outputCard = UiKit.card(this);
         outputCard.addView(UiKit.sectionTitle(this, "연관 검색어 결과"));
+        Button copyAll = accentButton(
+                "전체 내용 복사", UiKit.TEAL, view -> copyRelatedOutput());
+        copyAll.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(48)));
+        outputCard.addView(copyAll);
         relatedOutput = multiInput(
                 "검색어를 선택하거나 직접 입력하면 세 검색엔진의 연관 검색어가 표시됩니다.");
         relatedOutput.setMinLines(8);
@@ -204,9 +201,13 @@ public class KeywordActivity extends Activity {
         keywordWeb.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
-                if (pendingExtract && url != null && url.contains("adsensefarm")) {
-                    pendingExtract = false;
-                    view.postDelayed(() -> extractRealtimeKeywords(), 1200);
+                if (pendingAdsenseExtract && url != null && url.contains("adsensefarm")) {
+                    pendingAdsenseExtract = false;
+                    view.postDelayed(() -> extractAdsenseFarmKeywords(), 1200);
+                } else if (pendingSignalExtract && url != null
+                        && url.contains("signal.bz")) {
+                    pendingSignalExtract = false;
+                    view.postDelayed(() -> extractSignalKeywords(), 1200);
                 }
             }
         });
@@ -214,31 +215,51 @@ public class KeywordActivity extends Activity {
 
     private void refreshRealtimeKeywords() {
         progressBar.setProgress(15);
-        setStatus("다음·구글·네이버 실시간 순위를 가져오는 중입니다.");
+        setStatus("저장된 최근 목록을 표시했습니다. 4개 출처 40개를 갱신합니다.");
+        latestRankings.clear();
+        rawRealtimeCount = 0;
+        pendingSignalExtract = false;
         String current = keywordWeb.getUrl();
         if (current != null && current.contains("adsensefarm")) {
-            pendingExtract = true;
+            pendingAdsenseExtract = true;
             keywordWeb.reload();
         } else {
-            pendingExtract = true;
-            keywordWeb.loadUrl(REALTIME_URL);
+            pendingAdsenseExtract = true;
+            keywordWeb.loadUrl(ADSENSEFARM_URL);
         }
     }
 
-    private void extractRealtimeKeywords() {
+    private void extractAdsenseFarmKeywords() {
         keywordWeb.evaluateJavascript(RealtimeKeywordParser.EXTRACT_JS, value -> {
-            List<KeywordDatabase.RankedKeyword> rankings =
-                    RealtimeKeywordParser.parse(value);
+            List<KeywordDatabase.RankedKeyword> rankings = RealtimeKeywordParser.parse(value);
             latestRankings.clear();
             latestRankings.addAll(rankings);
-            database.upsertRankings(rankings);
+            rawRealtimeCount = rankings.size();
             progressBar.setProgress(35);
+            setStatus("애드센스팜 30개를 읽었습니다. 시그널 10개를 확인합니다.");
+            pendingSignalExtract = true;
+            keywordWeb.loadUrl(SIGNAL_URL);
+        });
+    }
+
+    private void extractSignalKeywords() {
+        keywordWeb.evaluateJavascript(SignalKeywordParser.EXTRACT_JS, value -> {
+            List<KeywordDatabase.RankedKeyword> signal = SignalKeywordParser.parse(value);
+            latestRankings.addAll(signal);
+            rawRealtimeCount += signal.size();
+            List<KeywordDatabase.RankedKeyword> filtered =
+                    RealtimeKeywordParser.filterContentCandidates(latestRankings);
+            latestRankings.clear();
+            latestRankings.addAll(filtered);
+            database.pruneOlderThanDays(10);
+            database.upsertRankings(filtered);
             renderKeywordList();
-            int daum = countSource(rankings, "다음");
-            int google = countSource(rankings, "구글");
-            int naver = countSource(rankings, "네이버");
-            setStatus("실시간 순위 저장 완료: 다음 " + daum
-                    + "개 · 구글 " + google + "개 · 네이버 " + naver + "개");
+            int excluded = Math.max(0, rawRealtimeCount - filtered.size());
+            setStatus("40개 출처 갱신: 다음 " + countSource(filtered, "다음")
+                    + " · 구글 " + countSource(filtered, "구글")
+                    + " · 크리에이터 " + countSource(filtered, "네이버")
+                    + " · 시그널 " + countSource(filtered, "시그널")
+                    + " · 일회성 " + excluded + "개 제외");
             if (autoSelectCheck.isChecked()) {
                 runAutoRecommendation();
             } else {
@@ -295,7 +316,8 @@ public class KeywordActivity extends Activity {
         List<KeywordDatabase.KeywordRecord> stored = database.loadKeywords(500);
         Set<String> selected = new LinkedHashSet<>();
         for (KeywordDatabase.KeywordRecord record : stored) {
-            if ((record.selected || record.autoSelected) && !record.excluded) {
+            if ((record.selected || record.autoSelected) && !record.excluded
+                    && !KeywordInterestScorer.isEphemeral(record.keyword)) {
                 selected.add(record.keyword);
             }
         }
@@ -304,12 +326,15 @@ public class KeywordActivity extends Activity {
         if (!latestRankings.isEmpty()) {
             addSourceSection("다음 실시간 1~10위", "다음", selected, latestValues);
             addSourceSection("구글 실시간 1~10위", "구글", selected, latestValues);
-            addSourceSection("네이버 실시간 1~10위", "네이버", selected, latestValues);
+            addSourceSection("크리에이터 어드바이저 1~10위", "네이버",
+                    selected, latestValues);
+            addSourceSection("시그널 실시간 1~10위", "시그널", selected, latestValues);
         }
 
         List<KeywordDatabase.KeywordRecord> history = new ArrayList<>();
         for (KeywordDatabase.KeywordRecord record : stored) {
-            if (!latestValues.contains(record.keyword)) {
+            if (!latestValues.contains(record.keyword)
+                    && !KeywordInterestScorer.isEphemeral(record.keyword)) {
                 history.add(record);
             }
         }
@@ -389,7 +414,7 @@ public class KeywordActivity extends Activity {
 
     private void setDisplayedSelected(boolean selected) {
         List<String> source = currentRankingKeywords.isEmpty()
-                ? displayedKeywords.subList(0, Math.min(30, displayedKeywords.size()))
+                ? displayedKeywords
                 : currentRankingKeywords;
         List<String> unique = new ArrayList<>(new LinkedHashSet<>(source));
         database.setAllSelected(unique, selected);
@@ -412,7 +437,9 @@ public class KeywordActivity extends Activity {
     private void fetchAllSelectedRelated() {
         List<String> seeds = new ArrayList<>();
         for (KeywordDatabase.KeywordRecord record : database.loadSelectedKeywords()) {
-            seeds.add(record.keyword);
+            if (!KeywordInterestScorer.isEphemeral(record.keyword)) {
+                seeds.add(record.keyword);
+            }
         }
         if (seeds.isEmpty()) {
             setStatus("먼저 검색어를 하나 이상 선택하세요.");
@@ -426,25 +453,25 @@ public class KeywordActivity extends Activity {
         progressBar.setProgress(45);
         setStatus("선택한 " + seeds.size() + "개 검색어를 세 검색엔진에서 조회합니다.");
         executor.execute(() -> {
-            StringBuilder output = new StringBuilder();
+            StringBuilder output = new StringBuilder("선택 검색어: ")
+                    .append(BlogGenerator.join(seeds, ", "))
+                    .append("\n\n");
             Set<String> all = new LinkedHashSet<>();
             int errorCount = 0;
             for (RelatedKeywordFetcher.Result result
                     : RelatedKeywordFetcher.fetchAll(seeds, 4)) {
-                String seed = result.seed;
                 database.saveRelated(result);
-                output.append("선택 검색어: ").append(seed).append('\n');
-                appendSource(output, "네이버", result.naver);
-                appendSource(output, "다음", result.daum);
-                appendSource(output, "구글", result.google);
-                if (!result.errors.isEmpty()) {
-                    output.append("오류: ")
-                            .append(BlogGenerator.join(result.errors, " / "))
-                            .append('\n');
-                    errorCount += result.errors.size();
+                for (String value : result.all()) {
+                    String keyword = KeywordDatabase.normalizeKeyword(value);
+                    if (KeywordDatabase.isUsableKeyword(keyword)
+                            && !KeywordInterestScorer.isEphemeral(keyword)) {
+                        all.add(keyword);
+                    }
                 }
-                output.append('\n');
-                all.addAll(result.all());
+                errorCount += result.errors.size();
+            }
+            for (String keyword : all) {
+                output.append(keyword).append('\n');
             }
             if (autoSelectCheck.isChecked()) {
                 database.refreshAutomaticSelections(12);
@@ -463,16 +490,12 @@ public class KeywordActivity extends Activity {
         });
     }
 
-    private void appendSource(StringBuilder output, String source, List<String> values) {
-        output.append('[').append(source).append("] ");
-        output.append(values.isEmpty() ? "결과 없음" : BlogGenerator.join(values, ", "));
-        output.append('\n');
-    }
-
     private void copySelectedKeywords() {
         List<String> values = new ArrayList<>();
         for (KeywordDatabase.KeywordRecord record : database.loadSelectedKeywords()) {
-            values.add(record.keyword);
+            if (!KeywordInterestScorer.isEphemeral(record.keyword)) {
+                values.add(record.keyword);
+            }
         }
         if (values.isEmpty()) {
             setStatus("복사할 선택 검색어가 없습니다.");
@@ -482,14 +505,14 @@ public class KeywordActivity extends Activity {
         setStatus("선택 검색어 " + values.size() + "개를 복사했습니다.");
     }
 
-    private void copyAllRelated() {
-        List<String> values = database.loadAllRelatedForSelected();
-        if (values.isEmpty()) {
-            setStatus("복사할 연관 검색어가 없습니다.");
+    private void copyRelatedOutput() {
+        String value = relatedOutput.getText().toString().trim();
+        if (value.isEmpty()) {
+            setStatus("복사할 연관 검색어 결과가 없습니다.");
             return;
         }
-        copy(BlogGenerator.join(values, "\n"), "related keywords");
-        setStatus("전체 연관 검색어 " + values.size() + "개를 복사했습니다.");
+        copy(value, "related keyword result");
+        setStatus("선택 검색어와 전체 연관 검색어를 복사했습니다.");
     }
 
     private void copy(String text, String label) {

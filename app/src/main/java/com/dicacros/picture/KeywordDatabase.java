@@ -252,9 +252,13 @@ final class KeywordDatabase extends SQLiteOpenHelper {
                 null, null, null,
                 "use_count ASC, last_used ASC, interest_score DESC, "
                         + "selected_at ASC, keyword ASC",
-                "1")) {
-            if (cursor.moveToFirst()) {
-                keyword = cursor.getString(0);
+                "100")) {
+            while (cursor.moveToNext()) {
+                String candidate = cursor.getString(0);
+                if (!KeywordInterestScorer.isEphemeral(candidate)) {
+                    keyword = candidate;
+                    break;
+                }
             }
         }
         if (keyword == null || keyword.isEmpty()) {
@@ -370,6 +374,27 @@ final class KeywordDatabase extends SQLiteOpenHelper {
 
     int relatedCount() {
         return scalarCount("SELECT COUNT(*) FROM related_keyword");
+    }
+
+    int pruneOlderThanDays(int days) {
+        long cutoff = System.currentTimeMillis()
+                - Math.max(1, days) * 24L * 60L * 60L * 1000L;
+        SQLiteDatabase database = getWritableDatabase();
+        database.beginTransaction();
+        try {
+            int relatedDeleted = database.delete(
+                    "related_keyword", "fetched_at<?",
+                    new String[]{String.valueOf(cutoff)});
+            int keywordDeleted = database.delete(
+                    "keyword_history", "last_seen<?",
+                    new String[]{String.valueOf(cutoff)});
+            database.execSQL("DELETE FROM related_keyword WHERE seed NOT IN "
+                    + "(SELECT keyword FROM keyword_history)");
+            database.setTransactionSuccessful();
+            return relatedDeleted + keywordDeleted;
+        } finally {
+            database.endTransaction();
+        }
     }
 
     static String normalizeKeyword(String value) {

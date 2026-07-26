@@ -16,6 +16,7 @@
 
     <queries>
         <package android:name="com.nhn.android.blog" />
+        <package android:name="com.openai.chatgpt" />
     </queries>
 
     <application

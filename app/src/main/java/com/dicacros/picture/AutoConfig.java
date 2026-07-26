@@ -22,6 +22,8 @@ final class AutoConfig {
     static final String TARGET_APP = "app";           // 네이버 블로그 앱 + 접근성 자동 탭
 
     static final String NAVER_APP_PACKAGE = "com.nhn.android.blog";
+    static final String CHATGPT_APP_PACKAGE = "com.openai.chatgpt";
+    static final int INTERVAL_MINUTES = 60;
 
     private AutoConfig() {
     }
@@ -84,14 +86,17 @@ final class AutoConfig {
         return prefs(c).getBoolean("use_chatgpt_web", true);
     }
 
+    static boolean useChatGptApp(Context c) {
+        return prefs(c).getBoolean("use_chatgpt_app", false);
+    }
+
     static boolean autoKeywordSelection(Context c) {
         return prefs(c).getBoolean("auto_keyword_selection", true);
     }
 
     // --- 정수 옵션 ---
     static int intervalMinutes(Context c) {
-        int v = prefs(c).getInt("interval_min", 60);
-        return v < 15 ? 15 : v;
+        return INTERVAL_MINUTES;
     }
 
     static void setString(Context c, String key, String value) {

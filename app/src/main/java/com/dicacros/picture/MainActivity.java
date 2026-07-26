@@ -10,7 +10,6 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Color;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
@@ -87,14 +86,8 @@ public class MainActivity extends Activity {
         LinearLayout root = UiKit.screen(this);
         scrollView.addView(root);
 
-        LinearLayout hero = UiKit.tintedCard(
-                this, UiKit.INFO_SOFT, Color.rgb(191, 219, 254));
-        hero.setPadding(dp(18), dp(20), dp(18), dp(20));
-        hero.addView(UiKit.eyebrow(this, "PICTURE CLEANER"));
-        hero.addView(UiKit.pageTitle(this, "오늘의 캡처를\n콘텐츠로 바꾸세요"));
-        hero.addView(UiKit.body(this,
-                "이미지 정리부터 검색어 분석, 블로그 작성까지 한 흐름으로 진행합니다."));
-        root.addView(hero);
+        root.addView(UiKit.eyebrow(this, "PICTURE CLEANER"));
+        root.addView(UiKit.pageTitle(this, "오늘 작업"));
 
         cropButton = createPrimaryButton("이미지 정리 시작", UiKit.PRIMARY);
         cropButton.setOnClickListener(v -> startProcessing());
@@ -108,7 +101,7 @@ public class MainActivity extends Activity {
                 v -> startActivity(new Intent(this, KeywordActivity.class)));
         root.addView(actionCard(
                 "STEP 2", "실시간 연관 검색어",
-                "다음·구글·네이버 실시간 순위 30개를 모아 오래 검색될 주제와 연관 질문을 추천합니다.",
+                "다음·구글·크리에이터·시그널 40개에서 일회성 이슈를 빼고 오래 검색될 주제를 추천합니다.",
                 keywordButton, UiKit.TEAL));
 
         blogWriterButton = createPrimaryButton("블로그 자동화 열기", UiKit.NAVY);
