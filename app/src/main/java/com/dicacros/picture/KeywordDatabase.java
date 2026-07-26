@@ -141,6 +141,24 @@ final class KeywordDatabase extends SQLiteOpenHelper {
         return records;
     }
 
+    List<KeywordRecord> loadRecentKeywords(int limit) {
+        List<KeywordRecord> records = new ArrayList<>();
+        int safeLimit = Math.max(1, Math.min(1000, limit));
+        try (Cursor cursor = getReadableDatabase().query(
+                "keyword_history",
+                new String[]{"keyword", "sources", "best_rank", "first_seen",
+                        "last_seen", "selected", "auto_selected", "excluded",
+                        "seen_count", "interest_score", "use_count", "last_used"},
+                null, null, null, null,
+                "last_seen DESC, best_rank ASC, keyword ASC",
+                String.valueOf(safeLimit))) {
+            while (cursor.moveToNext()) {
+                records.add(readRecord(cursor));
+            }
+        }
+        return records;
+    }
+
     List<KeywordRecord> loadSelectedKeywords() {
         List<KeywordRecord> records = new ArrayList<>();
         try (Cursor cursor = getReadableDatabase().query(
@@ -163,32 +181,47 @@ final class KeywordDatabase extends SQLiteOpenHelper {
         if (keyword.isEmpty()) {
             return;
         }
-        ContentValues values = new ContentValues();
-        values.put("selected", selected ? 1 : 0);
-        values.put("auto_selected", 0);
-        values.put("excluded", selected ? 0 : 1);
-        values.put("selected_at", selected ? System.currentTimeMillis() : 0);
-        getWritableDatabase().update(
-                "keyword_history", values, "keyword=?", new String[]{keyword});
-    }
-
-    void setAllSelected(List<String> rawKeywords, boolean selected) {
         SQLiteDatabase database = getWritableDatabase();
         database.beginTransaction();
         try {
-            for (String rawKeyword : rawKeywords) {
-                String keyword = normalizeKeyword(rawKeyword);
-                if (keyword.isEmpty()) {
-                    continue;
-                }
-                ContentValues values = new ContentValues();
-                values.put("selected", selected ? 1 : 0);
-                values.put("auto_selected", 0);
-                values.put("excluded", selected ? 0 : 1);
-                values.put("selected_at", selected ? System.currentTimeMillis() : 0);
-                database.update("keyword_history", values, "keyword=?",
-                        new String[]{keyword});
+            if (selected) {
+                database.execSQL("UPDATE keyword_history "
+                        + "SET selected=0,auto_selected=0,selected_at=0");
             }
+            ContentValues values = new ContentValues();
+            values.put("selected", selected ? 1 : 0);
+            values.put("auto_selected", 0);
+            values.put("excluded", selected ? 0 : 1);
+            values.put("selected_at", selected ? System.currentTimeMillis() : 0);
+            database.update(
+                    "keyword_history", values, "keyword=?", new String[]{keyword});
+            database.setTransactionSuccessful();
+        } finally {
+            database.endTransaction();
+        }
+    }
+
+    void retainSingleSelection() {
+        List<KeywordRecord> selected = loadSelectedKeywords();
+        if (selected.size() <= 1) {
+            return;
+        }
+        KeywordRecord keep = selected.get(0);
+        SQLiteDatabase database = getWritableDatabase();
+        database.beginTransaction();
+        try {
+            database.execSQL("UPDATE keyword_history "
+                    + "SET selected=0,auto_selected=0,selected_at=0");
+            ContentValues values = new ContentValues();
+            if (keep.selected) {
+                values.put("selected", 1);
+                values.put("selected_at", System.currentTimeMillis());
+            } else {
+                values.put("auto_selected", 1);
+            }
+            values.put("excluded", 0);
+            database.update("keyword_history", values,
+                    "keyword=?", new String[]{keep.keyword});
             database.setTransactionSuccessful();
         } finally {
             database.endTransaction();
@@ -306,6 +339,7 @@ final class KeywordDatabase extends SQLiteOpenHelper {
     }
 
     int refreshAutomaticSelections(int limit) {
+        retainSingleSelection();
         List<AutoCandidate> candidates = new ArrayList<>();
         for (KeywordRecord record : loadKeywords(1000)) {
             List<String> related = new ArrayList<>();
@@ -329,7 +363,10 @@ final class KeywordDatabase extends SQLiteOpenHelper {
         Collections.sort(candidates,
                 Comparator.comparingInt((AutoCandidate value) -> value.score).reversed()
                         .thenComparing(value -> value.keyword));
-        int selectedLimit = Math.max(1, Math.min(30, limit));
+        boolean hasManualSelection = scalarCount(
+                "SELECT COUNT(*) FROM keyword_history "
+                        + "WHERE selected=1 AND excluded=0") > 0;
+        int selectedLimit = hasManualSelection ? 0 : 1;
         SQLiteDatabase database = getWritableDatabase();
         database.beginTransaction();
         try {

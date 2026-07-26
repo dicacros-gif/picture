@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.PixelFormat;
 import android.os.Build;
@@ -16,6 +17,7 @@ import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.WindowManager;
+import android.webkit.CookieManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -27,11 +29,23 @@ import java.util.concurrent.Executors;
 
 public class KeywordCollectorService extends Service {
 
+    static final String ACTION_CHALLENGE_REQUIRED =
+            "com.dicacros.picture.KEYWORD_CHALLENGE_REQUIRED";
+    static final String ACTION_CHALLENGE_CLEARED =
+            "com.dicacros.picture.KEYWORD_CHALLENGE_CLEARED";
+    private static final String ACTION_RETRY_CHALLENGE =
+            "com.dicacros.picture.RETRY_KEYWORD_CHALLENGE";
     private static final String ADSENSEFARM_URL = "https://adsensefarm.kr/realtime";
     private static final String SIGNAL_URL = "https://www.signal.bz/";
     private static final String CHANNEL = "keyword_collection";
     private static final int NOTIFICATION_ID = 4030;
     private static final long TIMEOUT_MS = 150_000L;
+    private static final int MAX_EXTRACT_ATTEMPTS = 12;
+    private static final int MAX_CHALLENGE_ATTEMPTS = 40;
+    private static final long EXTRACT_RETRY_MS = 1000L;
+    private static final long CHALLENGE_RETRY_MS = 3000L;
+
+    private static volatile boolean challengeRequired;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -41,7 +55,25 @@ public class KeywordCollectorService extends Service {
     private boolean overlayAttached;
     private boolean extractingAdsenseFarm;
     private boolean extractingSignal;
+    private int adsensePollGeneration;
     private volatile boolean finished;
+
+    static boolean isChallengeRequired() {
+        return challengeRequired;
+    }
+
+    static void retryAfterChallenge(Context context) {
+        Intent service = new Intent(context, KeywordCollectorService.class);
+        service.setAction(ACTION_RETRY_CHALLENGE);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(service);
+            } else {
+                context.startService(service);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
 
     @Override
     public IBinder onBind(android.content.Intent intent) {
@@ -50,7 +82,17 @@ public class KeywordCollectorService extends Service {
 
     @Override
     public int onStartCommand(android.content.Intent intent, int flags, int startId) {
+        boolean retryChallenge = intent != null
+                && ACTION_RETRY_CHALLENGE.equals(intent.getAction());
         if (webView != null && !finished) {
+            if (retryChallenge) {
+                challengeRequired = false;
+                broadcastChallenge(ACTION_CHALLENGE_CLEARED);
+                updateNotification("로봇 확인 완료 · 실시간 검색어를 다시 수집합니다.");
+                int generation = ++adsensePollGeneration;
+                webView.loadUrl(ADSENSEFARM_URL);
+                main.postDelayed(() -> pollAdsenseFarm(generation, 0), 2200);
+            }
             return START_NOT_STICKY;
         }
         startForegroundSafely("실시간 검색어를 수집하고 있습니다.");
@@ -72,6 +114,9 @@ public class KeywordCollectorService extends Service {
         settings.setDomStorageEnabled(true);
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
+        CookieManager cookies = CookieManager.getInstance();
+        cookies.setAcceptCookie(true);
+        cookies.setAcceptThirdPartyCookies(view, true);
         view.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView webView, String url) {
@@ -93,13 +138,90 @@ public class KeywordCollectorService extends Service {
             return;
         }
         extractingAdsenseFarm = true;
+        int generation = ++adsensePollGeneration;
+        pollAdsenseFarm(generation, 0);
+    }
+
+    private void pollAdsenseFarm(int generation, int attempt) {
+        if (finished || webView == null || generation != adsensePollGeneration) {
+            return;
+        }
         webView.evaluateJavascript(RealtimeKeywordParser.EXTRACT_JS, value -> {
-            collected.addAll(RealtimeKeywordParser.parse(value));
-            if (!finished && webView != null) {
-                updateNotification("애드센스팜 30개 수집 · 시그널을 확인합니다.");
-                webView.loadUrl(SIGNAL_URL);
+            if (generation != adsensePollGeneration) {
+                return;
             }
+            List<KeywordDatabase.RankedKeyword> rankings =
+                    RealtimeKeywordParser.parse(value);
+            if (rankings.size() < 30) {
+                inspectChallenge(generation, rankings, attempt);
+                return;
+            }
+            continueAfterAdsense(generation, rankings);
         });
+    }
+
+    private void inspectChallenge(
+            int generation, List<KeywordDatabase.RankedKeyword> rankings, int attempt) {
+        if (finished || webView == null || generation != adsensePollGeneration) {
+            return;
+        }
+        webView.evaluateJavascript(RealtimeKeywordParser.CHALLENGE_JS, value -> {
+            if (generation != adsensePollGeneration) {
+                return;
+            }
+            boolean challenge = RealtimeKeywordParser.isChallenge(value);
+            if (challenge) {
+                if (!challengeRequired) {
+                    challengeRequired = true;
+                    broadcastChallenge(ACTION_CHALLENGE_REQUIRED);
+                }
+                updateNotification("로봇 확인 필요 · 앱 첫 화면에서 체크해 주세요.");
+                if (attempt < MAX_CHALLENGE_ATTEMPTS) {
+                    main.postDelayed(() -> {
+                        if (finished || webView == null
+                                || generation != adsensePollGeneration) {
+                            return;
+                        }
+                        webView.loadUrl(ADSENSEFARM_URL);
+                        main.postDelayed(
+                                () -> pollAdsenseFarm(generation, attempt + 1),
+                                1800L);
+                    }, CHALLENGE_RETRY_MS);
+                    return;
+                }
+            } else if (attempt < MAX_EXTRACT_ATTEMPTS) {
+                updateNotification("애드센스팜 로딩 " + rankings.size()
+                        + "/30 · 잠시 후 다시 확인합니다.");
+                main.postDelayed(
+                        () -> pollAdsenseFarm(generation, attempt + 1),
+                        EXTRACT_RETRY_MS);
+                return;
+            }
+            continueAfterAdsense(generation, rankings);
+        });
+    }
+
+    private void continueAfterAdsense(
+            int generation, List<KeywordDatabase.RankedKeyword> rankings) {
+        if (generation != adsensePollGeneration) {
+            return;
+        }
+        if (challengeRequired && rankings.size() >= 30) {
+            challengeRequired = false;
+            broadcastChallenge(ACTION_CHALLENGE_CLEARED);
+        }
+        collected.addAll(rankings);
+        if (!finished && webView != null) {
+            updateNotification("애드센스팜 " + rankings.size()
+                    + "/30 수집 · 시그널을 확인합니다.");
+            webView.loadUrl(SIGNAL_URL);
+        }
+    }
+
+    private void broadcastChallenge(String action) {
+        Intent intent = new Intent(action);
+        intent.setPackage(getPackageName());
+        sendBroadcast(intent);
     }
 
     private void extractSignal() {
@@ -107,8 +229,24 @@ public class KeywordCollectorService extends Service {
             return;
         }
         extractingSignal = true;
+        pollSignal(0);
+    }
+
+    private void pollSignal(int attempt) {
+        if (finished || webView == null) {
+            return;
+        }
         webView.evaluateJavascript(SignalKeywordParser.EXTRACT_JS, value -> {
-            collected.addAll(SignalKeywordParser.parse(value));
+            List<KeywordDatabase.RankedKeyword> rankings =
+                    SignalKeywordParser.parse(value);
+            if (rankings.size() < 10 && attempt < MAX_EXTRACT_ATTEMPTS) {
+                updateNotification("시그널 로딩 " + rankings.size()
+                        + "/10 · 잠시 후 다시 확인합니다.");
+                main.postDelayed(
+                        () -> pollSignal(attempt + 1), EXTRACT_RETRY_MS);
+                return;
+            }
+            collected.addAll(rankings);
             storeCollection();
         });
     }
@@ -124,9 +262,10 @@ public class KeywordCollectorService extends Service {
                 try (KeywordDatabase database = new KeywordDatabase(this)) {
                     database.pruneOlderThanDays(10);
                     database.upsertRankings(snapshot);
+                    database.retainSingleSelection();
                     if (AutoConfig.autoKeywordSelection(this)) {
                         recommendation = KeywordAutomationEngine.enrichAndRecommend(
-                                database, snapshot, 8, 12);
+                                database, snapshot, 8, 1);
                     }
                 }
                 KeywordAutomationEngine.Result finalRecommendation = recommendation;

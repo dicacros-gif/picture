@@ -8,7 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
-import android.graphics.Typeface;
+import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -17,6 +17,7 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.TouchDelegate;
 import android.view.View;
 import android.webkit.CookieManager;
 import android.webkit.ValueCallback;
@@ -98,7 +99,8 @@ public class BlogWriterActivity extends Activity {
     private CheckBox useChatGptWebCheck;
     private CheckBox useChatGptAppCheck;
     private boolean pendingWebPublish = false;
-    private boolean autoImageUploadRequested = false;
+    private boolean automationRunning;
+    private NaverWebPublishCoordinator webPublishCoordinator;
     private int chatGenerationToken;
     private int chatAssistantBaseline;
     private int chatStablePolls;
@@ -147,6 +149,9 @@ public class BlogWriterActivity extends Activity {
     @Override
     protected void onDestroy() {
         chatGenerationToken++;
+        if (webPublishCoordinator != null) {
+            webPublishCoordinator.cancel();
+        }
         executor.shutdownNow();
         if (workWeb != null) {
             workWeb.destroy();
@@ -179,18 +184,15 @@ public class BlogWriterActivity extends Activity {
         controlsScroll.addView(controls);
         root.addView(controlsScroll, new LinearLayout.LayoutParams(-1, 0, 7f));
 
-        controls.addView(UiKit.backBar(this, "Picture Cleaner · 블로그"));
         LinearLayout header = UiKit.tintedCard(
                 this, UiKit.INFO_SOFT, Color.rgb(191, 219, 254));
-        header.addView(UiKit.eyebrow(this, "NAVER BLOG STUDIO"));
         header.addView(UiKit.pageTitle(this, "선택한 주제를\n발행 가능한 글로 만드세요"));
         header.addView(UiKit.body(this,
                 "계정과 생성 방식을 정한 뒤 한 번의 실행으로 초안·사진·발행을 연결합니다."));
         controls.addView(header);
 
         LinearLayout accountCard = UiKit.card(this);
-        accountCard.addView(UiKit.badge(this, "1 · ACCOUNT", UiKit.NAVER));
-        accountCard.addView(UiKit.sectionTitle(this, "네이버 계정"));
+        accountCard.addView(UiKit.badge(this, "1 · ACCOUNT", UiKit.PRIMARY));
         LinearLayout accountRow = row();
         accBtn0 = smallButton(NaverAccounts.IDS[0], v -> selectAccount(NaverAccounts.IDS[0]));
         accBtn1 = smallButton(NaverAccounts.IDS[1], v -> selectAccount(NaverAccounts.IDS[1]));
@@ -201,7 +203,7 @@ public class BlogWriterActivity extends Activity {
         customIdInput = input("다른 네이버 블로그 아이디 입력");
         accountCard.addView(customIdInput);
         Button loginButton = fullButton("선택한 계정으로 로그인", v -> loginSelected());
-        UiKit.stylePrimary(loginButton, UiKit.NAVER);
+        UiKit.stylePrimary(loginButton, UiKit.PRIMARY);
         accountCard.addView(loginButton);
 
         accountStatusText = UiKit.status(this);
@@ -227,8 +229,6 @@ public class BlogWriterActivity extends Activity {
         });
         generationCard.addView(useChatGptWebCheck);
         generationCard.addView(useChatGptAppCheck);
-        generationCard.addView(UiKit.caption(this,
-                "웹은 하단에서 사용할 GPT를 열고, 앱은 접근성 서비스를 켠 뒤 실행합니다."));
         LinearLayout chatGptRow = row();
         chatGptRow.addView(smallButton("현재 GPT 저장", v -> saveCurrentChatGpt()));
         chatGptRow.addView(smallButton("ChatGPT 홈", v -> openChatGptHome()));
@@ -249,12 +249,15 @@ public class BlogWriterActivity extends Activity {
         controls.addView(generationCard);
 
         LinearLayout publishCard = UiKit.card(this);
-        publishCard.addView(UiKit.badge(this, "3 · PUBLISH", UiKit.NAVY));
+        publishCard.addView(UiKit.badge(this, "3 · PUBLISH", UiKit.PRIMARY));
         publishCard.addView(UiKit.sectionTitle(this, "발행 방식과 사진"));
         optImageSlots = check("1번에서 정리한 사진을 글 중간에 자동 삽입", true);
         autoPublishCheck = check("발행 버튼까지 자동으로 누르기", true);
         publishCard.addView(optImageSlots);
         publishCard.addView(autoPublishCheck);
+        publishCard.addView(UiKit.caption(this,
+                "편집기 준비 → 제목·본문 확인 → 사진 삽입 확인 → 발행 완료 순서로 진행하며, "
+                        + "실패한 검색어는 다음 실행에서 다시 시도합니다."));
 
         LinearLayout targetRow = row();
         targetDraftBtn = smallButton("초안만", v -> setTarget(AutoConfig.TARGET_DRAFT));
@@ -281,9 +284,9 @@ public class BlogWriterActivity extends Activity {
         controls.addView(publishCard);
 
         LinearLayout automationCard = UiKit.tintedCard(
-                this, UiKit.WARNING_SOFT, Color.rgb(253, 230, 138));
+                this, UiKit.INFO_SOFT, Color.rgb(191, 219, 254));
         automationCard.addView(UiKit.badge(
-                this, "OPTIONAL · SCHEDULE", Color.rgb(180, 83, 9)));
+                this, "OPTIONAL · SCHEDULE", UiKit.PRIMARY));
         automationCard.addView(UiKit.sectionTitle(this, "화면 꺼짐·주기 자동화"));
         automationCard.addView(UiKit.caption(this,
                 "이 기능에만 OpenAI 또는 Gemini API 키가 필요하며 초안·웹뷰 방식으로 동작합니다."));
@@ -297,7 +300,7 @@ public class BlogWriterActivity extends Activity {
         automationCard.addView(geminiModelInput);
         Button autoButton = fullButton(
                 "1시간 자동화 시작/중지", v -> toggleAutomation());
-        UiKit.stylePrimary(autoButton, UiKit.NAVY);
+        UiKit.stylePrimary(autoButton, UiKit.PRIMARY);
         automationCard.addView(autoButton);
         automationCard.addView(UiKit.caption(this,
                 "실시간 검색어 수집과 API 글쓰기는 1시간마다 실행되며 10일 지난 검색어는 정리됩니다."));
@@ -338,8 +341,6 @@ public class BlogWriterActivity extends Activity {
         ratioRow.addView(smallButton("ChatGPT 크게", v -> setSplitRatio(28f)));
         displayCard.addView(ratioRow);
 
-        displayCard.addView(UiKit.caption(this,
-                "위 버튼이나 가운데 손잡이를 위아래로 끌어 네이버·ChatGPT 높이를 조절하세요."));
         controls.addView(displayCard);
 
         webSplit = new LinearLayout(this);
@@ -392,7 +393,7 @@ public class BlogWriterActivity extends Activity {
                 }
                 if (pendingWebPublish && url.contains("blog.naver.com")) {
                     pendingWebPublish = false;
-                    view.postDelayed(() -> runWebPublish(), 2800);
+                    view.postDelayed(() -> runWebPublish(), 700);
                 }
             }
         });
@@ -403,18 +404,13 @@ public class BlogWriterActivity extends Activity {
                                              FileChooserParams fileChooserParams) {
                 if (fileChooserCallback != null) {
                     fileChooserCallback.onReceiveValue(null);
+                    fileChooserCallback = null;
                 }
-                if (autoImageUploadRequested && webView == workWeb) {
-                    autoImageUploadRequested = false;
-                    List<Uri> images = ProcessedImageStore.todayImages(
-                            BlogWriterActivity.this, 12);
-                    if (!images.isEmpty()) {
-                        filePathCallback.onReceiveValue(
-                                images.toArray(new Uri[0]));
-                        setStatus("오늘 정리한 사진 " + images.size()
-                                + "개를 네이버 에디터에 전달했습니다.");
-                        return true;
-                    }
+                if (webView == workWeb
+                        && webPublishCoordinator != null
+                        && webPublishCoordinator.onShowFileChooser(filePathCallback)) {
+                    setStatus("오늘 정리한 사진을 네이버 에디터에 전달했습니다.");
+                    return true;
                 }
                 fileChooserCallback = filePathCallback;
                 try {
@@ -576,13 +572,18 @@ public class BlogWriterActivity extends Activity {
     }
 
     private void generateBlog(final GenAfter after) {
+        if (automationRunning) {
+            setStatus("현재 자동화가 진행 중입니다. 완료 또는 실패 후 다시 실행하세요.");
+            return;
+        }
         KeywordDatabase.KeywordBundle bundle = keywordDatabase.nextKeywordBundle();
         if (bundle == null) {
             progressBar.setProgress(0);
             setStatus("2번 '실시간 연관 검색어'에서 자동화할 검색어를 먼저 선택하세요.");
             return;
         }
-        progressBar.setProgress(45);
+        automationRunning = true;
+        progressBar.setProgress(10);
         saveSettings();
         currentGenerationKeyword = bundle.seed;
         currentGenerationFocus = bundle.focus;
@@ -608,9 +609,9 @@ public class BlogWriterActivity extends Activity {
             return;
         }
         if (openAiKey.isEmpty() && geminiKey.isEmpty()) {
-            progressBar.setProgress(0);
-            setStatus("API 생성 방식을 선택했습니다. OpenAI 또는 Gemini API 키를 입력하거나 "
-                    + "ChatGPT 웹 또는 앱 사용을 켜세요.");
+            finishWorkflow(false,
+                    "API 생성 방식을 선택했습니다. OpenAI 또는 Gemini API 키를 입력하거나 "
+                            + "ChatGPT 웹 또는 앱 사용을 켜세요.");
             return;
         }
 
@@ -621,10 +622,8 @@ public class BlogWriterActivity extends Activity {
                 runOnUiThread(() ->
                         completeGeneration(raw, after, imageSlots, "API"));
             } catch (Exception exception) {
-                runOnUiThread(() -> {
-                    progressBar.setProgress(0);
-                    setStatus("생성 실패: " + exception.getMessage());
-                });
+                runOnUiThread(() -> finishWorkflow(
+                        false, "생성 실패: " + exception.getMessage()));
             }
         });
     }
@@ -632,29 +631,26 @@ public class BlogWriterActivity extends Activity {
     private void generateWithChatGptApp(
             String prompt, GenAfter after, boolean imageSlots) {
         if (!BlogAutoAccessibilityService.isRunning()) {
-            progressBar.setProgress(0);
-            setStatus("ChatGPT 앱 자동화에는 접근성 서비스가 필요합니다. 설정에서 켜 주세요.");
+            finishWorkflow(false,
+                    "ChatGPT 앱 자동화에는 접근성 서비스가 필요합니다. 설정에서 켜 주세요.");
             openAccessibilitySettings();
             return;
         }
         if (!ChatGptAppLauncher.launch(this)) {
-            progressBar.setProgress(0);
-            setStatus("ChatGPT 앱이 설치되어 있지 않습니다.");
+            finishWorkflow(false, "ChatGPT 앱이 설치되어 있지 않습니다.");
             openPlayStore(AutoConfig.CHATGPT_APP_PACKAGE);
             return;
         }
         BlogAutoAccessibilityService service = BlogAutoAccessibilityService.get();
         if (service == null) {
-            progressBar.setProgress(0);
-            setStatus("접근성 서비스를 다시 켠 뒤 시도하세요.");
+            finishWorkflow(false, "접근성 서비스를 다시 켠 뒤 시도하세요.");
             return;
         }
         progressBar.setProgress(25);
         setStatus("ChatGPT 앱에 선택 검색어와 연관 검색어를 입력합니다.");
         service.automateChatGpt(prompt, (text, error) -> runOnUiThread(() -> {
             if (error != null && !error.isEmpty()) {
-                progressBar.setProgress(0);
-                setStatus(error);
+                finishWorkflow(false, error);
                 return;
             }
             bringBlogStudioToFront();
@@ -790,20 +786,17 @@ public class BlogWriterActivity extends Activity {
             String raw, GenAfter after, boolean imageSlots, String provider) {
         String cleaned = BlogGenerator.postProcess(raw, imageSlots);
         if (cleaned.isEmpty()) {
-            progressBar.setProgress(0);
-            setStatus(provider + " 응답에서 블로그 본문을 찾지 못했습니다.");
+            finishWorkflow(
+                    false, provider + " 응답에서 블로그 본문을 찾지 못했습니다.");
             return;
         }
         resultOutput.setText(cleaned);
         AutoConfig.setString(this, "last_result", cleaned);
         progressBar.setProgress(100);
         copyToClipboard(cleaned);
-        if (!currentGenerationKeyword.isEmpty()) {
-            keywordDatabase.markUsed(
-                    currentGenerationKeyword, currentGenerationFocus);
-        }
         if (after == GenAfter.OPEN_WRITER) {
-            setStatus(provider + " 초안 생성 완료. 네이버 글쓰기 화면을 엽니다.");
+            finishWorkflow(
+                    true, provider + " 초안 생성 완료. 네이버 글쓰기 화면을 엽니다.");
             openNaverWriter();
         } else if (after == GenAfter.WEB_PUBLISH) {
             setStatus(provider + " 초안 생성 완료. 웹뷰 자동 입력을 시작합니다.");
@@ -812,14 +805,13 @@ public class BlogWriterActivity extends Activity {
             setStatus(provider + " 초안 생성 완료. 네이버 앱 자동 입력을 시작합니다.");
             launchNaverAppSplit();
         } else {
-            setStatus(provider + " 초안 생성·복사 완료.");
+            finishWorkflow(true, provider + " 초안 생성·복사 완료.");
         }
     }
 
     private void failChatGptGeneration(String message) {
         chatGenerationToken++;
-        progressBar.setProgress(0);
-        setStatus(message);
+        finishWorkflow(false, message);
     }
 
     // ---------------------------------------------------------------
@@ -836,70 +828,81 @@ public class BlogWriterActivity extends Activity {
         String content = BlogGenerator.forPublishing(
                 resultOutput.getText().toString());
         if (TextUtils.isEmpty(content)) {
-            setStatus("발행할 내용이 없습니다. 먼저 초안을 생성하세요.");
+            finishWorkflow(false, "발행할 내용이 없습니다. 먼저 초안을 생성하세요.");
             return;
         }
-        String[] tb = NaverPublisher.splitTitleBody(content);
-        boolean publish = autoPublishCheck.isChecked();
-        NaverPublisher.runFill(workWeb, tb[0], tb[1], r1 -> {
-            setStatus("본문 입력 시도: " + r1);
-            List<Uri> images = optImageSlots.isChecked()
-                    ? ProcessedImageStore.todayImages(this, 12)
-                    : java.util.Collections.emptyList();
-            if (!images.isEmpty()) {
-                autoImageUploadRequested = true;
-                NaverPublisher.runOpenImagePicker(workWeb, imageResult -> {
-                    if (imageResult == null || imageResult.contains("\"clicked\":null")
-                            || imageResult.contains("\"error\"")) {
-                        autoImageUploadRequested = false;
-                    }
-                    setStatus("본문 중간 사진 삽입 시도: " + imageResult);
-                    workWeb.postDelayed(() -> finishWebPublish(publish), 7000);
-                });
-            } else {
-                finishWebPublish(publish);
+        if (webPublishCoordinator != null) {
+            webPublishCoordinator.cancel();
+        }
+        webPublishCoordinator = new NaverWebPublishCoordinator(
+                this, workWeb, new NaverWebPublishCoordinator.Listener() {
+            @Override
+            public void onProgress(int progress, String message) {
+                progressBar.setProgress(progress);
+                setStatus(message);
+            }
+
+            @Override
+            public void onFinished(boolean success, String message) {
+                finishWorkflow(success, message);
             }
         });
-    }
-
-    private void finishWebPublish(boolean publish) {
-        if (!publish) {
-            setStatus("본문·사진 입력 완료. 발행 버튼은 직접 눌러 주세요.");
-            return;
-        }
-        workWeb.postDelayed(() -> NaverPublisher.runPublish(workWeb, result ->
-                setStatus("자동 발행 시도 완료: " + result)), 2500);
+        webPublishCoordinator.start(
+                content, optImageSlots.isChecked(), autoPublishCheck.isChecked());
     }
 
     // ---------------------------------------------------------------
     //  네이버 앱 스플릿뷰 + 접근성
     // ---------------------------------------------------------------
     private void launchNaverAppSplit() {
+        String content = BlogGenerator.forPublishing(
+                resultOutput.getText().toString());
+        if (TextUtils.isEmpty(content)) {
+            finishWorkflow(false, "네이버 앱에 입력할 내용이 없습니다.");
+            return;
+        }
         List<Uri> images = optImageSlots.isChecked()
                 ? ProcessedImageStore.todayImages(this, 12)
                 : java.util.Collections.emptyList();
         NaverAppLauncher.Result launchResult = NaverAppLauncher.launch(this, images);
         if (!launchResult.launched) {
-            toast("네이버 블로그 앱이 설치되어 있지 않습니다.");
+            finishWorkflow(false, "네이버 블로그 앱이 설치되어 있지 않습니다.");
             openPlayStore(AutoConfig.NAVER_APP_PACKAGE);
             return;
         }
         if (BlogAutoAccessibilityService.isRunning()) {
-            String content = BlogGenerator.forPublishing(
-                    resultOutput.getText().toString());
+            String[] titleBody = NaverPublisher.splitTitleBody(content);
             boolean publish = autoPublishCheck.isChecked();
             workWeb.postDelayed(() -> {
                 BlogAutoAccessibilityService svc = BlogAutoAccessibilityService.get();
                 if (svc != null) {
                     svc.automateNaverPost(
-                            content, publish, launchResult.sharedImages);
+                            titleBody[0], titleBody[1], publish,
+                            launchResult.sharedImages,
+                            (success, message) -> runOnUiThread(
+                                    () -> finishWorkflow(success, message)));
+                } else {
+                    finishWorkflow(false, "접근성 서비스 연결이 끊어졌습니다.");
                 }
             }, 2200);
             setStatus("네이버 앱 스플릿뷰 실행 + 접근성 자동 입력을 진행합니다.");
         } else {
-            setStatus("네이버 앱을 스플릿뷰로 열었습니다. 접근성 자동 탭을 쓰려면 접근성 설정을 켜세요.");
+            finishWorkflow(false,
+                    "네이버 앱을 열었지만 접근성 자동 입력이 꺼져 있습니다.");
             openAccessibilitySettings();
         }
+    }
+
+    private void finishWorkflow(boolean success, String message) {
+        if (success && automationRunning && !currentGenerationKeyword.isEmpty()) {
+            keywordDatabase.markUsed(
+                    currentGenerationKeyword, currentGenerationFocus);
+        }
+        automationRunning = false;
+        currentGenerationKeyword = "";
+        currentGenerationFocus = "";
+        progressBar.setProgress(success ? 100 : 0);
+        setStatus(message);
     }
 
     private void openAccessibilitySettings() {
@@ -1098,15 +1101,10 @@ public class BlogWriterActivity extends Activity {
 
     @SuppressWarnings("ClickableViewAccessibility")
     private View createControlsDivider() {
-        TextView divider = new TextView(this);
-        divider.setText("↕  설정 / 작업 화면 높이 조절");
-        divider.setGravity(Gravity.CENTER);
-        divider.setTextColor(Color.WHITE);
-        divider.setTextSize(12);
-        divider.setBackground(UiKit.rounded(UiKit.NAVY, 10, this));
+        View divider = createOneMillimeterDivider(
+                "설정과 작업 화면 높이 조절");
         LinearLayout.LayoutParams dividerParams =
-                new LinearLayout.LayoutParams(-1, dp(40));
-        dividerParams.setMargins(dp(12), dp(4), dp(12), dp(4));
+                new LinearLayout.LayoutParams(-1, oneMillimeterPx());
         divider.setLayoutParams(dividerParams);
         divider.setOnTouchListener(new View.OnTouchListener() {
             float startRawY;
@@ -1161,17 +1159,10 @@ public class BlogWriterActivity extends Activity {
 
     @SuppressWarnings("ClickableViewAccessibility")
     private View createSplitDivider() {
-        TextView divider = new TextView(this);
-        divider.setText("⬍⬍⬍  손잡이를 끌어 높이 조절  ⬍⬍⬍");
-        divider.setGravity(Gravity.CENTER);
-        divider.setTextColor(Color.WHITE);
-        divider.setTextSize(13);
-        divider.setTypeface(null, Typeface.BOLD);
-        divider.setClickable(true);
-        divider.setFocusable(true);
-        divider.setBackgroundColor(Color.rgb(90, 103, 122));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(52));
-        params.setMargins(0, dp(6), 0, dp(6));
+        View divider = createOneMillimeterDivider(
+                "네이버와 ChatGPT 화면 높이 조절");
+        LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(-1, oneMillimeterPx());
         divider.setLayoutParams(params);
         divider.setOnTouchListener(new View.OnTouchListener() {
             float startRawY;
@@ -1204,6 +1195,31 @@ public class BlogWriterActivity extends Activity {
             }
         });
         return divider;
+    }
+
+    private View createOneMillimeterDivider(String description) {
+        View divider = new View(this);
+        divider.setClickable(true);
+        divider.setFocusable(true);
+        divider.setContentDescription(description);
+        divider.setBackground(UiKit.rounded(UiKit.PRIMARY, 3, this));
+        divider.post(() -> {
+            if (!(divider.getParent() instanceof View)) {
+                return;
+            }
+            View parent = (View) divider.getParent();
+            Rect touchBounds = new Rect();
+            divider.getHitRect(touchBounds);
+            touchBounds.top -= dp(14);
+            touchBounds.bottom += dp(14);
+            parent.setTouchDelegate(new TouchDelegate(touchBounds, divider));
+        });
+        return divider;
+    }
+
+    private int oneMillimeterPx() {
+        return Math.max(4, Math.round(
+                getResources().getDisplayMetrics().ydpi / 25.4f));
     }
 
     private void setSplitWeights(float topWeight) {
@@ -1290,7 +1306,7 @@ public class BlogWriterActivity extends Activity {
             return;
         }
         if (selected) {
-            UiKit.stylePrimary(b, UiKit.TEAL);
+            UiKit.stylePrimary(b, UiKit.PRIMARY);
         } else {
             UiKit.styleSecondary(b);
         }
@@ -1368,7 +1384,7 @@ public class BlogWriterActivity extends Activity {
     }
 
     private Button fullButton(String text, View.OnClickListener listener) {
-        Button button = UiKit.primaryButton(this, text, UiKit.NAVY);
+        Button button = UiKit.primaryButton(this, text, UiKit.PRIMARY);
         button.setOnClickListener(listener);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(48));
         params.setMargins(0, dp(6), 0, dp(6));

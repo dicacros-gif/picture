@@ -30,9 +30,14 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
     private static BlogAutoAccessibilityService instance;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private int chatAutomationToken;
+    private int naverAutomationToken;
 
     interface ChatResultCallback {
         void onResult(String text, String error);
+    }
+
+    interface NaverPostCallback {
+        void onResult(boolean success, String message);
     }
 
     static boolean isRunning() {
@@ -61,6 +66,7 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
     @Override
     public void onDestroy() {
         chatAutomationToken++;
+        naverAutomationToken++;
         handler.removeCallbacksAndMessages(null);
         if (instance == this) {
             instance = null;
@@ -93,24 +99,169 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
 
     void automateNaverPost(final String content, final boolean publish,
                            final boolean sharedImages) {
-        if (sharedImages) {
-            handler.postDelayed(this::tapCenter, 2400);
-            handler.postDelayed(() -> setTextOnFocused(content), 3400);
-            if (publish) {
-                handler.postDelayed(
-                        () -> clickByTexts("발행", "등록", "다음", "확인"), 6200);
-                handler.postDelayed(
-                        () -> clickByTexts("발행", "등록", "확인", "완료"), 8200);
+        String[] parts = NaverPublisher.splitTitleBody(content);
+        automateNaverPost(
+                parts[0], parts[1], publish, sharedImages, null);
+    }
+
+    void automateNaverPost(
+            final String title, final String body, final boolean publish,
+            final boolean sharedImages, final NaverPostCallback callback) {
+        final int token = ++naverAutomationToken;
+        handler.postDelayed(() -> prepareNaverEditor(
+                token, title, body, publish, sharedImages, callback, 0), 900L);
+    }
+
+    private void prepareNaverEditor(
+            int token, String title, String body, boolean publish,
+            boolean sharedImages, NaverPostCallback callback, int attempt) {
+        if (token != naverAutomationToken) {
+            return;
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (!isNaverWindow(root)) {
+            if (attempt < 30) {
+                handler.postDelayed(() -> prepareNaverEditor(
+                        token, title, body, publish, sharedImages,
+                        callback, attempt + 1), 1000L);
+            } else {
+                finishNaver(token, callback, false,
+                        "네이버 블로그 앱 화면을 확인할 수 없습니다.");
             }
             return;
         }
-        handler.postDelayed(this::tapBottomCenter, 1500);
-        handler.postDelayed(() -> clickByTexts("글쓰기", "새 글", "글 작성"), 2600);
-        handler.postDelayed(this::tapCenter, 4200);
-        handler.postDelayed(() -> setTextOnFocused(content), 5200);
-        if (publish) {
-            handler.postDelayed(() -> clickByTexts("발행", "등록", "다음", "확인"), 7200);
-            handler.postDelayed(() -> clickByTexts("발행", "등록", "확인", "완료"), 9200);
+
+        EditorFields fields = findEditorFields(root);
+        if (fields.title != null && fields.body != null) {
+            boolean titleSet = setText(fields.title, title);
+            boolean bodySet = setText(fields.body, body);
+            if (titleSet && bodySet) {
+                handler.postDelayed(() -> verifyNaverEditor(
+                        token, title, body, publish, callback, 0), 800L);
+                return;
+            }
+        }
+
+        if (attempt >= 30) {
+            finishNaver(token, callback, false,
+                    "네이버 제목 또는 본문 입력란을 찾지 못했습니다.");
+            return;
+        }
+        if (sharedImages) {
+            if (attempt == 1 || attempt == 5) {
+                clickExactByTexts("다음", "완료", "확인", "첨부");
+            }
+        } else if (attempt == 1 || attempt == 5) {
+            clickExactByTexts("글쓰기", "새 글", "글 작성");
+        }
+        if (attempt == 3 || attempt == 8) {
+            tapCenter();
+        }
+        handler.postDelayed(() -> prepareNaverEditor(
+                token, title, body, publish, sharedImages,
+                callback, attempt + 1), 1000L);
+    }
+
+    private void verifyNaverEditor(
+            int token, String title, String body, boolean publish,
+            NaverPostCallback callback, int attempt) {
+        if (token != naverAutomationToken) {
+            return;
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        EditorFields fields = findEditorFields(root);
+        boolean titleReady = fields.title != null
+                && nodeContains(fields.title, title);
+        boolean bodyReady = fields.body != null
+                && nodeContains(fields.body, body);
+        if (titleReady && bodyReady) {
+            if (!publish) {
+                finishNaver(token, callback, true,
+                        "네이버 앱 제목·본문 입력을 확인했습니다. 발행 버튼은 직접 눌러 주세요.");
+            } else {
+                clickNaverPublish(token, callback, 0, 0);
+            }
+            return;
+        }
+        if (attempt >= 8) {
+            finishNaver(token, callback, false,
+                    "네이버 앱에 입력은 시도했지만 제목·본문 반영을 확인하지 못했습니다.");
+            return;
+        }
+        if (fields.title != null && !titleReady) {
+            setText(fields.title, title);
+        }
+        if (fields.body != null && !bodyReady) {
+            setText(fields.body, body);
+        }
+        handler.postDelayed(() -> verifyNaverEditor(
+                token, title, body, publish, callback, attempt + 1), 700L);
+    }
+
+    private void clickNaverPublish(
+            int token, NaverPostCallback callback, int clicks, int attempt) {
+        if (token != naverAutomationToken) {
+            return;
+        }
+        if (clickExactByTexts("발행", "등록", "게시", "완료", "확인")) {
+            handler.postDelayed(() -> verifyNaverPublished(
+                    token, callback, clicks + 1, attempt), 1300L);
+            return;
+        }
+        if (attempt >= 12) {
+            finishNaver(token, callback, false,
+                    "네이버 앱 발행 버튼을 찾지 못했습니다.");
+            return;
+        }
+        handler.postDelayed(() -> clickNaverPublish(
+                token, callback, clicks, attempt + 1), 900L);
+    }
+
+    private void verifyNaverPublished(
+            int token, NaverPostCallback callback, int clicks, int attempt) {
+        if (token != naverAutomationToken) {
+            return;
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (containsAnyText(root,
+                "발행되었습니다", "게시글이 등록", "글이 등록되었습니다")) {
+            finishNaver(token, callback, true,
+                    "네이버 앱 발행 완료를 확인했습니다.");
+            return;
+        }
+        EditorFields fields = findEditorFields(root);
+        boolean publishControl = containsAnyText(
+                root, "발행", "등록", "게시", "완료", "확인");
+        if (clicks > 0 && fields.title == null && fields.body == null
+                && !publishControl && isNaverWindow(root)) {
+            finishNaver(token, callback, true,
+                    "네이버 앱 발행 후 편집기 종료를 확인했습니다.");
+            return;
+        }
+        if (clicks < 3 && clickExactByTexts(
+                "발행", "등록", "게시", "완료", "확인")) {
+            handler.postDelayed(() -> verifyNaverPublished(
+                    token, callback, clicks + 1, attempt + 1), 1300L);
+            return;
+        }
+        if (attempt >= 12) {
+            finishNaver(token, callback, false,
+                    "발행 버튼은 눌렀지만 완료 상태를 확인하지 못했습니다.");
+            return;
+        }
+        handler.postDelayed(() -> verifyNaverPublished(
+                token, callback, clicks, attempt + 1), 1000L);
+    }
+
+    private void finishNaver(
+            int token, NaverPostCallback callback,
+            boolean success, String message) {
+        if (token != naverAutomationToken) {
+            return;
+        }
+        naverAutomationToken++;
+        if (callback != null) {
+            callback.onResult(success, message);
         }
     }
 
@@ -241,6 +392,39 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
         return false;
     }
 
+    private boolean clickExactByTexts(String... texts) {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root == null) {
+            return false;
+        }
+        for (String text : texts) {
+            List<AccessibilityNodeInfo> nodes =
+                    root.findAccessibilityNodeInfosByText(text);
+            if (nodes == null) {
+                continue;
+            }
+            for (AccessibilityNodeInfo node : nodes) {
+                String value = node.getText() == null
+                        ? "" : node.getText().toString().trim();
+                String description = node.getContentDescription() == null
+                        ? "" : node.getContentDescription().toString().trim();
+                if (!text.equals(value) && !text.equals(description)) {
+                    continue;
+                }
+                AccessibilityNodeInfo clickable = node;
+                while (clickable != null && !clickable.isClickable()) {
+                    clickable = clickable.getParent();
+                }
+                if (clickable != null
+                        && clickable.performAction(
+                        AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     private boolean clickChatGptSend() {
         return clickByDescriptions(
                 "메시지 보내기", "프롬프트 보내기", "전송", "Send message",
@@ -302,6 +486,106 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
             }
         }
         return null;
+    }
+
+    private EditorFields findEditorFields(AccessibilityNodeInfo root) {
+        List<AccessibilityNodeInfo> editable = new ArrayList<>();
+        collectEditable(root, editable);
+        AccessibilityNodeInfo title = null;
+        AccessibilityNodeInfo body = null;
+        for (AccessibilityNodeInfo node : editable) {
+            String label = nodeLabel(node).toLowerCase(Locale.ROOT);
+            if (title == null && (label.contains("제목")
+                    || label.contains("title"))) {
+                title = node;
+            } else if (body == null && (label.contains("본문")
+                    || label.contains("내용")
+                    || label.contains("content")
+                    || label.contains("글을 입력"))) {
+                body = node;
+            }
+        }
+        if (editable.size() >= 2) {
+            if (title == null) {
+                title = editable.get(0);
+            }
+            if (body == null) {
+                body = editable.get(editable.size() - 1);
+            }
+        }
+        if (title == body) {
+            body = null;
+        }
+        return new EditorFields(title, body);
+    }
+
+    private void collectEditable(
+            AccessibilityNodeInfo node, List<AccessibilityNodeInfo> output) {
+        if (node == null) {
+            return;
+        }
+        if (node.isEditable()) {
+            output.add(node);
+        }
+        for (int index = 0; index < node.getChildCount(); index++) {
+            collectEditable(node.getChild(index), output);
+        }
+    }
+
+    private String nodeLabel(AccessibilityNodeInfo node) {
+        StringBuilder label = new StringBuilder();
+        if (node.getHintText() != null) {
+            label.append(node.getHintText()).append(' ');
+        }
+        if (node.getContentDescription() != null) {
+            label.append(node.getContentDescription()).append(' ');
+        }
+        if (node.getText() != null) {
+            label.append(node.getText()).append(' ');
+        }
+        if (node.getViewIdResourceName() != null) {
+            label.append(node.getViewIdResourceName());
+        }
+        return label.toString();
+    }
+
+    private boolean nodeContains(AccessibilityNodeInfo node, String expected) {
+        if (node == null || expected == null || expected.isEmpty()) {
+            return false;
+        }
+        String actual = node.getText() == null
+                ? "" : node.getText().toString();
+        String marker = expected.length() > 40
+                ? expected.substring(0, 40) : expected;
+        return actual.equals(expected) || actual.contains(marker);
+    }
+
+    private boolean containsAnyText(
+            AccessibilityNodeInfo node, String... expectedValues) {
+        if (node == null) {
+            return false;
+        }
+        String text = node.getText() == null
+                ? "" : node.getText().toString();
+        String description = node.getContentDescription() == null
+                ? "" : node.getContentDescription().toString();
+        for (String expected : expectedValues) {
+            if (text.contains(expected) || description.contains(expected)) {
+                return true;
+            }
+        }
+        for (int index = 0; index < node.getChildCount(); index++) {
+            if (containsAnyText(node.getChild(index), expectedValues)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isNaverWindow(AccessibilityNodeInfo root) {
+        return root != null && root.getPackageName() != null
+                && AutoConfig.NAVER_APP_PACKAGE.contentEquals(
+                root.getPackageName());
     }
 
     private boolean isChatGptWindow(AccessibilityNodeInfo root) {
@@ -426,5 +710,16 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
             size.y = getResources().getDisplayMetrics().heightPixels;
         }
         return size;
+    }
+
+    private static final class EditorFields {
+        final AccessibilityNodeInfo title;
+        final AccessibilityNodeInfo body;
+
+        EditorFields(
+                AccessibilityNodeInfo title, AccessibilityNodeInfo body) {
+            this.title = title;
+            this.body = body;
+        }
     }
 }

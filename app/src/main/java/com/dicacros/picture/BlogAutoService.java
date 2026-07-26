@@ -61,8 +61,9 @@ public class BlogAutoService extends Service {
     private String currentKeyword = "";
     private String currentFocus = "";
     private String generated = "";
-    private boolean autoImageUploadRequested;
     private boolean publishStarted;
+    private boolean started;
+    private NaverWebPublishCoordinator webPublishCoordinator;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -71,6 +72,11 @@ public class BlogAutoService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (started && !finished) {
+            notifyText("이전 자동 글쓰기 작업이 아직 진행 중입니다");
+            return START_NOT_STICKY;
+        }
+        started = true;
         startForegroundSafely("자동 글쓰기를 준비하고 있어요");
         acquireWake();
         account = AutoConfig.account(this);
@@ -116,7 +122,8 @@ public class BlogAutoService extends Service {
                 if (stage == Stage.PUBLISHING && !publishStarted
                         && url.contains("blog.naver.com")) {
                     publishStarted = true;
-                    main.postDelayed(() -> fillThenPublish(), 2800);
+                    main.postDelayed(
+                            BlogAutoService.this::startWebPublisher, 700L);
                 }
             }
         });
@@ -125,15 +132,11 @@ public class BlogAutoService extends Service {
             public boolean onShowFileChooser(
                     WebView webView, ValueCallback<Uri[]> callback,
                     FileChooserParams fileChooserParams) {
-                if (!autoImageUploadRequested) {
-                    return false;
+                if (webPublishCoordinator != null
+                        && webPublishCoordinator.onShowFileChooser(callback)) {
+                    return true;
                 }
-                autoImageUploadRequested = false;
-                List<Uri> images = ProcessedImageStore.todayImages(
-                        BlogAutoService.this, 12);
-                callback.onReceiveValue(images.isEmpty()
-                        ? null : images.toArray(new Uri[0]));
-                return true;
+                return false;
             }
         });
         attachOverlay(w);
@@ -233,10 +236,8 @@ public class BlogAutoService extends Service {
             finishSelf();
             return;
         }
-        try (KeywordDatabase database = new KeywordDatabase(this)) {
-            database.markUsed(currentKeyword, currentFocus);
-        }
         if (AutoConfig.TARGET_DRAFT.equals(publishTarget)) {
+            markCurrentKeywordUsed();
             notifyText("초안 생성 완료. 앱에서 확인하세요");
             finishSelf();
         } else if (AutoConfig.TARGET_APP.equals(publishTarget)) {
@@ -249,41 +250,32 @@ public class BlogAutoService extends Service {
         }
     }
 
-    private void fillThenPublish() {
+    private void startWebPublisher() {
         if (finished) {
             return;
         }
-        String[] tb = NaverPublisher.splitTitleBody(
-                BlogGenerator.forPublishing(generated));
-        NaverPublisher.runFill(web, tb[0], tb[1], r1 -> {
-            List<Uri> images = useImageSlots
-                    ? ProcessedImageStore.todayImages(this, 12)
-                    : java.util.Collections.emptyList();
-            if (!images.isEmpty()) {
-                autoImageUploadRequested = true;
-                NaverPublisher.runOpenImagePicker(web, result -> {
-                    if (result == null || result.contains("\"clicked\":null")
-                            || result.contains("\"error\"")) {
-                        autoImageUploadRequested = false;
-                    }
-                    main.postDelayed(this::finishWebPublish, 7000);
-                });
-            } else {
-                finishWebPublish();
+        if (webPublishCoordinator != null) {
+            webPublishCoordinator.cancel();
+        }
+        webPublishCoordinator = new NaverWebPublishCoordinator(
+                this, web, new NaverWebPublishCoordinator.Listener() {
+            @Override
+            public void onProgress(int progress, String message) {
+                notifyText(message);
+            }
+
+            @Override
+            public void onFinished(boolean success, String message) {
+                notifyText(message);
+                if (success) {
+                    markCurrentKeywordUsed();
+                }
+                main.postDelayed(BlogAutoService.this::finishSelf, 1800L);
             }
         });
-    }
-
-    private void finishWebPublish() {
-        if (!autoPublish) {
-            notifyText("본문과 사진 입력 완료. 수동 발행만 남았어요");
-            main.postDelayed(this::finishSelf, 2000);
-            return;
-        }
-        main.postDelayed(() -> NaverPublisher.runPublish(web, result -> {
-            notifyText("자동 발행 시도 완료");
-            main.postDelayed(this::finishSelf, 2500);
-        }), 2500);
+        webPublishCoordinator.start(
+                BlogGenerator.forPublishing(generated),
+                useImageSlots, autoPublish);
     }
 
     private void launchNaverAppAndAutomate() {
@@ -302,13 +294,26 @@ public class BlogAutoService extends Service {
                 main.postDelayed(() -> {
                     BlogAutoAccessibilityService svc = BlogAutoAccessibilityService.get();
                     if (svc != null) {
+                        String[] titleBody = NaverPublisher.splitTitleBody(
+                                BlogGenerator.forPublishing(generated));
                         svc.automateNaverPost(
-                                BlogGenerator.forPublishing(generated),
-                                autoPublish, launchResult.sharedImages);
+                                titleBody[0], titleBody[1], autoPublish,
+                                launchResult.sharedImages,
+                                (success, message) -> main.post(() -> {
+                                    notifyText(message);
+                                    if (success) {
+                                        markCurrentKeywordUsed();
+                                    }
+                                    main.postDelayed(
+                                            BlogAutoService.this::finishSelf,
+                                            1800L);
+                                }));
+                    } else {
+                        notifyText("접근성 서비스 연결이 끊어졌어요");
+                        finishSelf();
                     }
                 }, 2000);
                 notifyText("네이버 앱에서 접근성 자동 입력을 진행해요");
-                main.postDelayed(this::finishSelf, 15_000);
             } else {
                 notifyText("접근성 서비스가 꺼져 있어 앱만 열었어요. 접근성을 켜 주세요");
                 main.postDelayed(this::finishSelf, 3000);
@@ -319,12 +324,28 @@ public class BlogAutoService extends Service {
         }
     }
 
+    private void markCurrentKeywordUsed() {
+        if (currentKeyword.isEmpty()) {
+            return;
+        }
+        try (KeywordDatabase database = new KeywordDatabase(this)) {
+            database.markUsed(currentKeyword, currentFocus);
+        }
+        currentKeyword = "";
+        currentFocus = "";
+    }
+
     private void finishSelf() {
         if (finished) {
             return;
         }
         finished = true;
+        started = false;
         main.removeCallbacksAndMessages(null);
+        if (webPublishCoordinator != null) {
+            webPublishCoordinator.cancel();
+            webPublishCoordinator = null;
+        }
         if (web != null) {
             try {
                 if (overlayAttached) {
@@ -418,8 +439,11 @@ public class BlogAutoService extends Service {
 
     @Override
     public void onDestroy() {
-        finished = true;
-        releaseWake();
+        if (!finished) {
+            finishSelf();
+        } else {
+            releaseWake();
+        }
         super.onDestroy();
     }
 }

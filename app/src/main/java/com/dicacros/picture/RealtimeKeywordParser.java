@@ -11,6 +11,25 @@ import java.util.Set;
 
 final class RealtimeKeywordParser {
 
+    static final String CHALLENGE_JS =
+            "(function(){try{"
+                    + "var text=((document.body&&document.body.innerText)||'')"
+                    + ".toLowerCase();"
+                    + "var selectors=["
+                    + "'iframe[src*=recaptcha]','.g-recaptcha',"
+                    + "'iframe[src*=hcaptcha]','.h-captcha',"
+                    + "'iframe[src*=challenges.cloudflare]','#challenge-stage',"
+                    + "'[data-sitekey]','input[type=checkbox][name*=captcha]'];"
+                    + "for(var i=0;i<selectors.length;i++){"
+                    + "if(document.querySelector(selectors[i]))return true;}"
+                    + "return text.indexOf('로봇이 아닙니다')>=0"
+                    + "||text.indexOf('로봇인지 확인')>=0"
+                    + "||text.indexOf('사람인지 확인')>=0"
+                    + "||text.indexOf('verify you are human')>=0"
+                    + "||text.indexOf('checking your browser')>=0"
+                    + "||text.indexOf('captcha')>=0;"
+                    + "}catch(e){return false;}})();";
+
     static final String EXTRACT_JS =
             "(function(){try{"
                     + "var defs=["
@@ -59,6 +78,13 @@ final class RealtimeKeywordParser {
         } catch (Exception ignored) {
         }
         return result;
+    }
+
+    static boolean isChallenge(String rawValue) {
+        if (rawValue == null) {
+            return false;
+        }
+        return "true".equalsIgnoreCase(rawValue.replace("\"", "").trim());
     }
 
     static List<KeywordDatabase.RankedKeyword> filterContentCandidates(

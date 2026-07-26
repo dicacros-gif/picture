@@ -18,6 +18,18 @@ final class KeywordScheduler {
         schedule(context, System.currentTimeMillis() + INTERVAL_MS);
     }
 
+    static void collectNow(Context context) {
+        try {
+            Intent service = new Intent(context, KeywordCollectorService.class);
+            if (Build.VERSION.SDK_INT >= 26) {
+                context.startForegroundService(service);
+            } else {
+                context.startService(service);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     static void scheduleNext(Context context) {
         schedule(context, System.currentTimeMillis() + INTERVAL_MS);
     }

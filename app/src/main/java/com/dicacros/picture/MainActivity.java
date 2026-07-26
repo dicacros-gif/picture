@@ -3,10 +3,13 @@ package com.dicacros.picture;
 import android.Manifest;
 import android.app.Activity;
 import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -24,6 +27,10 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.webkit.CookieManager;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 
 import java.io.File;
 import java.io.IOException;
@@ -48,6 +55,7 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
     private static final int REQUEST_READ_IMAGES = 1001;
     private static final int REQUEST_DELETE_IMAGES = 1002;
+    private static final String ADSENSEFARM_URL = "https://adsensefarm.kr/realtime";
     private static final String OUTPUT_FOLDER = "Pictures/PictureCleaner";
     private static final String PREFS = "picture_main";
 
@@ -63,18 +71,50 @@ public class MainActivity extends Activity {
     private Button cropButton;
     private Button keywordButton;
     private Button blogWriterButton;
+    private LinearLayout challengeCard;
+    private TextView challengeStatusText;
+    private WebView challengeWebView;
+    private BroadcastReceiver challengeReceiver;
+    private boolean challengeReceiverRegistered;
+    private int challengeCheckGeneration;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(createContentView());
+        registerChallengeReceiver();
+        updateStatus("오늘 캡처한 스크린샷을 크롭하고 해상도를 개선할 준비가 됐습니다.");
+        KeywordScheduler.collectNow(this);
         KeywordScheduler.ensureScheduled(this);
         maybeRequestAllFilesAccess();
-        updateStatus("오늘 캡처한 스크린샷을 크롭하고 해상도를 개선할 준비가 됐습니다.");
+        if (KeywordCollectorService.isChallengeRequired()) {
+            showChallengeWebView();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (KeywordCollectorService.isChallengeRequired()) {
+            showChallengeWebView();
+        }
     }
 
     @Override
     protected void onDestroy() {
+        challengeCheckGeneration++;
+        if (challengeReceiverRegistered) {
+            try {
+                unregisterReceiver(challengeReceiver);
+            } catch (Throwable ignored) {
+            }
+            challengeReceiverRegistered = false;
+        }
+        if (challengeWebView != null) {
+            challengeWebView.stopLoading();
+            challengeWebView.destroy();
+            challengeWebView = null;
+        }
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -88,6 +128,7 @@ public class MainActivity extends Activity {
 
         root.addView(UiKit.eyebrow(this, "PICTURE CLEANER"));
         root.addView(UiKit.pageTitle(this, "오늘 작업"));
+        root.addView(createChallengeCard());
 
         cropButton = createPrimaryButton("이미지 정리 시작", UiKit.PRIMARY);
         cropButton.setOnClickListener(v -> startProcessing());
@@ -101,7 +142,7 @@ public class MainActivity extends Activity {
                 v -> startActivity(new Intent(this, KeywordActivity.class)));
         root.addView(actionCard(
                 "STEP 2", "실시간 연관 검색어",
-                "다음·구글·크리에이터·시그널 40개에서 일회성 이슈를 빼고 오래 검색될 주제를 추천합니다.",
+                "앱 실행 시 4개 출처 40개를 수집하고, 일회성 이슈를 제외해 선택 가능한 주제로 보여줍니다.",
                 keywordButton, UiKit.TEAL));
 
         blogWriterButton = createPrimaryButton("블로그 자동화 열기", UiKit.NAVY);
@@ -126,6 +167,159 @@ public class MainActivity extends Activity {
         root.addView(statusCard);
 
         return scrollView;
+    }
+
+    private View createChallengeCard() {
+        challengeCard = UiKit.tintedCard(this, UiKit.WARNING_SOFT, UiKit.BORDER);
+        challengeCard.setVisibility(View.GONE);
+        challengeCard.addView(UiKit.badge(this, "사용자 확인", UiKit.TEAL));
+        challengeCard.addView(UiKit.sectionTitle(this, "애드센스팜 로봇 확인"));
+        challengeCard.addView(UiKit.body(this,
+                "자동 우회하지 않습니다. 아래 페이지에 확인 버튼이 보이면 직접 체크해 주세요. "
+                        + "확인이 끝나면 같은 쿠키로 실시간 검색어 수집을 자동 재개합니다."));
+
+        challengeStatusText = UiKit.status(this);
+        challengeStatusText.setText("확인 페이지를 불러오는 중입니다.");
+        challengeCard.addView(challengeStatusText);
+
+        challengeWebView = new WebView(this);
+        WebSettings settings = challengeWebView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
+        CookieManager cookies = CookieManager.getInstance();
+        cookies.setAcceptCookie(true);
+        cookies.setAcceptThirdPartyCookies(challengeWebView, true);
+        challengeWebView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                scheduleChallengeCheck();
+            }
+        });
+        LinearLayout.LayoutParams webParams =
+                new LinearLayout.LayoutParams(-1, dp(480));
+        webParams.setMargins(0, dp(12), 0, dp(12));
+        challengeCard.addView(challengeWebView, webParams);
+
+        Button retryButton = createPrimaryButton(
+                "확인 완료 후 다시 수집", UiKit.TEAL);
+        retryButton.setOnClickListener(view -> {
+            challengeStatusText.setText("확인 결과를 검사하고 있습니다.");
+            int generation = ++challengeCheckGeneration;
+            checkChallengeCompletion(generation, 0);
+        });
+        challengeCard.addView(retryButton);
+        return challengeCard;
+    }
+
+    private void registerChallengeReceiver() {
+        challengeReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent == null ? null : intent.getAction();
+                if (KeywordCollectorService.ACTION_CHALLENGE_REQUIRED.equals(action)) {
+                    showChallengeWebView();
+                } else if (KeywordCollectorService.ACTION_CHALLENGE_CLEARED.equals(action)) {
+                    hideChallengeWebView();
+                    updateStatus("로봇 확인 완료 · 실시간 검색어 수집을 계속합니다.");
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(KeywordCollectorService.ACTION_CHALLENGE_REQUIRED);
+        filter.addAction(KeywordCollectorService.ACTION_CHALLENGE_CLEARED);
+        registerReceiver(
+                challengeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        challengeReceiverRegistered = true;
+    }
+
+    private void showChallengeWebView() {
+        if (challengeCard == null || challengeWebView == null) {
+            return;
+        }
+        challengeCard.setVisibility(View.VISIBLE);
+        challengeStatusText.setText("로봇 확인이 필요합니다. 아래 페이지에서 직접 체크해 주세요.");
+        updateStatus("실시간 검색어 수집을 계속하려면 상단 로봇 확인을 완료해 주세요.");
+        String currentUrl = challengeWebView.getUrl();
+        if (currentUrl == null || "about:blank".equals(currentUrl)) {
+            challengeWebView.loadUrl(ADSENSEFARM_URL);
+        } else {
+            scheduleChallengeCheck();
+        }
+    }
+
+    private void hideChallengeWebView() {
+        challengeCheckGeneration++;
+        if (challengeCard != null) {
+            challengeCard.setVisibility(View.GONE);
+        }
+        if (challengeWebView != null) {
+            challengeWebView.stopLoading();
+        }
+    }
+
+    private void scheduleChallengeCheck() {
+        if (challengeCard == null || challengeCard.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        int generation = ++challengeCheckGeneration;
+        challengeWebView.postDelayed(
+                () -> checkChallengeCompletion(generation, 0), 1200L);
+    }
+
+    private void checkChallengeCompletion(int generation, int attempt) {
+        if (generation != challengeCheckGeneration
+                || challengeWebView == null
+                || challengeCard.getVisibility() != View.VISIBLE) {
+            return;
+        }
+        challengeWebView.evaluateJavascript(
+                RealtimeKeywordParser.CHALLENGE_JS, challengeValue -> {
+                    if (generation != challengeCheckGeneration
+                            || challengeWebView == null) {
+                        return;
+                    }
+                    if (RealtimeKeywordParser.isChallenge(challengeValue)) {
+                        challengeStatusText.setText(
+                                "확인 버튼을 직접 체크해 주세요. 완료 여부를 자동으로 확인합니다.");
+                        scheduleNextChallengeCheck(generation, attempt);
+                        return;
+                    }
+                    challengeWebView.evaluateJavascript(
+                            RealtimeKeywordParser.EXTRACT_JS, keywordValue -> {
+                                if (generation != challengeCheckGeneration
+                                        || challengeWebView == null) {
+                                    return;
+                                }
+                                int count = RealtimeKeywordParser.parse(keywordValue).size();
+                                if (count >= 30) {
+                                    CookieManager.getInstance().flush();
+                                    challengeStatusText.setText(
+                                            "확인이 완료됐습니다. 40개 검색어 수집을 다시 시작합니다.");
+                                    updateStatus("로봇 확인 완료 · 실시간 검색어 수집을 다시 시작합니다.");
+                                    hideChallengeWebView();
+                                    KeywordCollectorService.retryAfterChallenge(this);
+                                    return;
+                                }
+                                challengeStatusText.setText(
+                                        "확인 후 검색어 페이지를 불러오는 중입니다. "
+                                                + count + "/30");
+                                scheduleNextChallengeCheck(generation, attempt);
+                            });
+                });
+    }
+
+    private void scheduleNextChallengeCheck(int generation, int attempt) {
+        if (attempt >= 59 || challengeWebView == null) {
+            challengeStatusText.setText(
+                    "확인을 마쳤다면 아래 버튼을 눌러 다시 검사해 주세요.");
+            return;
+        }
+        challengeWebView.postDelayed(
+                () -> checkChallengeCompletion(generation, attempt + 1), 2000L);
     }
 
     private LinearLayout actionCard(String step, String title, String description,
