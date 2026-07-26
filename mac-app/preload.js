@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("picture", {
   saveImages: images => ipcRenderer.invoke("save-images", images),
+  collectRealtime: () => ipcRenderer.invoke("collect-realtime"),
   collectKeywords: seed => ipcRenderer.invoke("collect-keywords", seed),
   openNaverLogin: blogId => ipcRenderer.invoke("open-naver-login", blogId),
   openBlogWrite: () => ipcRenderer.invoke("open-blog-write"),

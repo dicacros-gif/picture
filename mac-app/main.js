@@ -56,9 +56,68 @@ async function fetchText(url) {
 
 function unique(items) {
   const seen = new Set();
-  return items.map(x => String(x || "").replace(/<[^>]+>/g, "").replace(/&[a-z]+;/gi, " ").trim())
+  return items.map(x => String(x || "").normalize("NFC")
+    .replace(/<[^>]+>/g, "").replace(/&[a-z]+;/gi, " ").trim())
     .filter(x => x.length >= 2 && x.length <= 45 && !seen.has(x) && seen.add(x));
 }
+
+async function waitForPage(win, predicate, timeout = 18000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    const ready = await win.webContents.executeJavaScript(predicate, true).catch(() => false);
+    if (ready) return true;
+    await wait(500);
+  }
+  return false;
+}
+
+ipcMain.handle("collect-realtime", async () => {
+  const collector = new BrowserWindow({
+    show: false,
+    width: 1400,
+    height: 1100,
+    webPreferences: { contextIsolation: true, sandbox: true }
+  });
+  const output = {
+    "다음": [],
+    "구글": [],
+    "크리에이터 어드바이저": [],
+    "네이버 시그널": []
+  };
+  try {
+    await collector.loadURL("https://adsensefarm.kr/realtime");
+    await waitForPage(collector, `(() => [...document.querySelectorAll('.item .kwds .keyword')]
+      .some(e => (e.innerText||'').trim() && (e.innerText||'').trim() !== '-'))()`);
+    const adsense = await collector.webContents.executeJavaScript(`(() => {
+      const defs = [
+        {source:'다음', titles:['다음 실시간 검색어']},
+        {source:'구글', titles:['구글 실시간 검색어']},
+        {source:'크리에이터 어드바이저', titles:['크리에이터 어드바이저 검색어','네이버 실시간 검색어']}
+      ];
+      const result = {};
+      const cards = [...document.querySelectorAll('.item')];
+      for (const def of defs) {
+        const card = cards.find(c => def.titles.includes((c.querySelector('h2')?.innerText||'').trim()));
+        result[def.source] = card ? [...card.querySelectorAll('.kwds .keyword')]
+          .map(e => (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim())
+          .filter(x => x && x !== '-').slice(0,10) : [];
+      }
+      return result;
+    })()`, true);
+    for (const [source, values] of Object.entries(adsense || {})) output[source] = unique(values).slice(0, 10);
+
+    await collector.loadURL("https://www.signal.bz/");
+    await waitForPage(collector, `document.querySelectorAll('.realtime-rank .rank-text,.rank-text').length > 0`);
+    const signal = await collector.webContents.executeJavaScript(`(() =>
+      [...document.querySelectorAll('.realtime-rank .rank-text,.rank-text')]
+        .map(e => (e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim())
+        .filter(Boolean).slice(0,10))()`, true);
+    output["네이버 시그널"] = unique(signal).slice(0, 10);
+  } finally {
+    if (!collector.isDestroyed()) collector.destroy();
+  }
+  return output;
+});
 
 ipcMain.handle("save-images", async (_event, images) => {
   const picked = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory", "createDirectory"] });
@@ -78,13 +137,31 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
     ["구글", `https://suggestqueries.google.com/complete/search?client=firefox&q=${q}`]
   ];
   const output = [];
+  const globallySeen = new Set([String(seed || "").trim().toLocaleLowerCase("ko-KR")]);
   for (const [source, url] of endpoints) {
     try {
       const text = await fetchText(url);
-      const matches = text.match(/"([^"\\]{2,50})"/g) || [];
-      output.push(...unique(matches.map(x => x.slice(1, -1))).map(keyword => ({ source, keyword })));
+      const data = JSON.parse(text);
+      let values = [];
+      if (source === "네이버") {
+        for (const group of data.items || []) {
+          for (const item of group || []) if (Array.isArray(item) && item[0]) values.push(String(item[0]));
+        }
+      } else if (source === "다음") {
+        const groups = data.items || {};
+        values = Array.isArray(groups) ? groups : Object.values(groups).flat();
+      } else {
+        values = Array.isArray(data?.[1]) ? data[1] : [];
+      }
+      for (const keyword of unique(values)) {
+        const key = keyword.toLocaleLowerCase("ko-KR");
+        if (!globallySeen.has(key)) {
+          globallySeen.add(key);
+          output.push({ source, keyword });
+        }
+      }
     } catch (error) {
-      output.push({ source, keyword: `수집 실패: ${error.message}`, error: true });
+      output.push({ source, error: true, message: error.message });
     }
   }
   return output.slice(0, 40);

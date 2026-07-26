@@ -57,15 +57,84 @@ $("processImages").onclick = async () => {
   finally { setBusy($("processImages"), false); }
 };
 
-$("keywords").onclick = async () => {
-  const seed = $("seed").value.trim();
-  if (!seed) return $("keywordList").textContent = "기준 검색어를 입력해 주세요.";
-  setBusy($("keywords"), true); $("keywordList").textContent = "수집 중...";
+let selectedRealtime = "";
+let relatedWords = [];
+
+function isEphemeral(keyword) {
+  const value = String(keyword || "").toLowerCase();
+  return [
+    /\b\d+\s*[:\-대]\s*\d+\b/, /\b(vs|경기\s*결과|스코어|선발\s*라인업|생중계|중계)\b/i,
+    /(축구|야구|농구|배구|골프).*(결과|스코어|중계|라인업)/,
+    /(결과|스코어|중계|라인업).*(축구|야구|농구|배구|골프)/,
+    /(로또|복권).*(당첨|번호|추첨)/
+  ].some(pattern => pattern.test(value));
+}
+
+async function loadRelated(seed) {
+  selectedRealtime = seed;
+  document.querySelectorAll(".keyword-option").forEach(row =>
+    row.classList.toggle("selected", row.dataset.keyword === seed));
+  $("selectedKeyword").textContent = `선택: ${seed}`;
+  $("keywordList").innerHTML = '<div class="loading"><span></span>연관 검색어 조회 중</div>';
+  $("relatedStatus").textContent = "";
+  $("copyRelated").disabled = true;
   try {
     const items = await window.picture.collectKeywords(seed);
-    $("keywordList").innerHTML = items.map(x => `<div class="keyword"><b>${x.source}</b>${x.keyword}</div>`).join("");
-  } catch (error) { $("keywordList").textContent = `실패: ${error.message}`; }
-  finally { setBusy($("keywords"), false); }
+    const failed = items.filter(x => x.error).map(x => x.source);
+    const seen = new Set();
+    relatedWords = items.filter(x => !x.error && x.keyword).map(x => x.keyword.trim())
+      .filter(word => word && word !== seed && !seen.has(word.toLocaleLowerCase("ko-KR")) &&
+        seen.add(word.toLocaleLowerCase("ko-KR")));
+    $("keywordList").innerHTML = relatedWords.length
+      ? relatedWords.map(word => `<div class="related-item">${escapeHtml(word)}</div>`).join("")
+      : '<div class="selected-empty">표시할 연관 검색어가 없습니다.</div>';
+    $("relatedStatus").textContent = failed.length
+      ? `${relatedWords.length}개 · ${[...new Set(failed)].join(", ")} 조회 결과 없음`
+      : `중복 제거된 연관 검색어 ${relatedWords.length}개`;
+    $("copyRelated").disabled = !relatedWords.length;
+  } catch (error) {
+    relatedWords = [];
+    $("keywordList").innerHTML = "";
+    $("relatedStatus").textContent = `조회 실패: ${error.message}`;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
+}
+
+async function loadRealtime() {
+  $("realtimeSources").innerHTML = '<div class="loading"><span></span>4개 출처 연결 중</div>';
+  $("sourceSummary").textContent = "실시간 검색어를 자동으로 불러오는 중입니다…";
+  setBusy($("refreshRealtime"), true);
+  try {
+    const result = await window.picture.collectRealtime();
+    const sources = ["다음", "구글", "크리에이터 어드바이저", "네이버 시그널"];
+    let crawled = 0, usable = 0;
+    $("realtimeSources").innerHTML = sources.map(source => {
+      const raw = [...new Set((result[source] || []).map(x => String(x).trim()).filter(Boolean))];
+      const words = raw.filter(word => !isEphemeral(word));
+      crawled += raw.length; usable += words.length;
+      const rows = words.map((word, index) =>
+        `<div class="keyword-option" data-keyword="${escapeHtml(word)}"><span class="radio"></span><span>${index + 1}. ${escapeHtml(word)}</span></div>`
+      ).join("");
+      return `<div class="source-group"><div class="source-name">${source}<span class="source-count">${raw.length}/10</span></div>${rows || '<div class="pane-status">가져온 결과 없음</div>'}</div>`;
+    }).join("");
+    $("realtimeSources").querySelectorAll(".keyword-option").forEach(row =>
+      row.onclick = () => loadRelated(row.dataset.keyword));
+    $("sourceSummary").textContent = `4개 출처 총 ${crawled}/40개 수집 · 일회성 제외 ${usable}개`;
+  } catch (error) {
+    $("realtimeSources").innerHTML = "";
+    $("sourceSummary").textContent = `실시간 검색어 수집 실패: ${error.message}`;
+  } finally { setBusy($("refreshRealtime"), false); }
+}
+
+$("refreshRealtime").onclick = loadRealtime;
+$("copyRelated").onclick = async () => {
+  if (!relatedWords.length) return;
+  await navigator.clipboard.writeText(relatedWords.join("\n"));
+  $("relatedStatus").textContent = `중복 없는 연관 검색어 ${relatedWords.length}개를 복사했습니다.`;
 };
 
 function settings() {
@@ -125,6 +194,7 @@ window.picture.onNeighborProgress(p => {
   $("neighborStatus").textContent = `${p.status} · 댓글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
 });
 (async () => {
+  loadRealtime();
   const saved = await window.picture.getSettings();
   if (saved.blogId) $("blogId").value = saved.blogId;
   if (saved.phrases?.length) $("phrases").value = saved.phrases.join("\n");
