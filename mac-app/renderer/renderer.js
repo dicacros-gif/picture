@@ -69,7 +69,13 @@ $("keywords").onclick = async () => {
 };
 
 function settings() {
-  return { blogId: $("blogId").value.trim(), phrases: $("phrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean) };
+  return {
+    blogId: $("blogId").value.trim() || "dicajohn",
+    phrases: $("phrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+    neighborPhrases: $("neighborPhrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
+    intervalSeconds: Number($("intervalSeconds").value) || 30,
+    maxPosts: Number($("maxPosts").value) || 20
+  };
 }
 async function saveSettings() { await window.picture.setSettings(settings()); }
 $("login").onclick = async () => { await saveSettings(); await window.picture.openNaverLogin($("blogId").value.trim()); };
@@ -83,11 +89,46 @@ $("reply").onclick = async () => {
   } catch (error) { $("replyStatus").textContent = `중단: ${error.message}`; }
   finally { setBusy($("reply"), false); }
 };
+$("heart").onclick = async () => {
+  setBusy($("heart"), true); $("heartStatus").textContent = "최근 10일 글의 공감 상태 확인 중...";
+  try {
+    await saveSettings();
+    const result = await window.picture.heartRecentPosts(settings());
+    $("heartStatus").textContent = `완료 · 글 ${result.posts}개 · 하트 ${result.hearted}개 · 건너뜀 ${result.skipped}개 · 실패 ${result.failed}개`;
+  } catch (error) { $("heartStatus").textContent = `중단: ${error.message}`; }
+  finally { setBusy($("heart"), false); }
+};
+$("neighborStart").onclick = async () => {
+  setBusy($("neighborStart"), true); $("neighborStatus").textContent = "이웃 새글을 불러오는 중...";
+  try {
+    await saveSettings();
+    const s = settings();
+    const result = await window.picture.commentNeighborFeed({
+      blogId: s.blogId, phrases: s.neighborPhrases,
+      intervalSeconds: s.intervalSeconds, maxPosts: s.maxPosts
+    });
+    $("neighborStatus").textContent = `${result.stopped ? "중지됨" : "완료"} · 발견 ${result.found}개 · 댓글 ${result.done}개 · 건너뜀 ${result.skipped}개 · 실패 ${result.failed}개`;
+  } catch (error) { $("neighborStatus").textContent = `중단: ${error.message}`; }
+  finally { setBusy($("neighborStart"), false); }
+};
+$("neighborStop").onclick = async () => {
+  await window.picture.stopNeighborComments();
+  $("neighborStatus").textContent = "현재 글 처리 후 중지합니다...";
+};
 window.picture.onReplyProgress(p => {
   $("replyStatus").textContent = `${p.status} · 답글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
+});
+window.picture.onHeartProgress(p => {
+  $("heartStatus").textContent = `${p.status} · 하트 ${p.hearted || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
+});
+window.picture.onNeighborProgress(p => {
+  $("neighborStatus").textContent = `${p.status} · 댓글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
 });
 (async () => {
   const saved = await window.picture.getSettings();
   if (saved.blogId) $("blogId").value = saved.blogId;
   if (saved.phrases?.length) $("phrases").value = saved.phrases.join("\n");
+  if (saved.neighborPhrases?.length) $("neighborPhrases").value = saved.neighborPhrases.join("\n");
+  if (saved.intervalSeconds) $("intervalSeconds").value = saved.intervalSeconds;
+  if (saved.maxPosts) $("maxPosts").value = saved.maxPosts;
 })();

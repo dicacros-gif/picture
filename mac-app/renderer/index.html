@@ -36,7 +36,7 @@
       <h2>네이버 블로그 자동화</h2>
       <p>전용 창에 한 번 로그인하면 세션이 안전하게 유지됩니다. 글쓰기와 최근 10일 댓글 감사 답글을 실행할 수 있습니다.</p>
       <label>블로그 아이디</label>
-      <input id="blogId" autocomplete="off" placeholder="예: myblogid">
+      <input id="blogId" autocomplete="off" value="dicajohn" placeholder="예: dicajohn">
       <div class="row">
         <button id="login" class="secondary">네이버 로그인/블로그 열기</button>
         <button id="write" class="secondary">블로그 글쓰기 열기</button>
@@ -50,6 +50,30 @@
       <div class="notice">실행 전에 전용 창에서 로그인 상태를 확인하세요. 네이버 화면 구조가 바뀌거나 보안 확인이 나타나면 창에서 직접 완료한 후 다시 실행하면 됩니다.</div>
       <button id="reply" class="navy">최근 10일 댓글 감사 답글 시작</button>
       <div id="replyStatus" class="status">대기 중 · 이미 답글한 댓글은 자동으로 건너뜁니다.</div>
+      <button id="heart" class="navy">최근 10일 글의 미공감 하트 누르기</button>
+      <div id="heartStatus" class="status">대기 중 · 이미 공감한 글은 건너뜁니다.</div>
+
+      <h2 class="subheading">이웃 새글 댓글</h2>
+      <p>이웃 새글을 순서대로 열고, 이미 내 댓글이 없는 글에만 무작위 문구를 등록합니다.</p>
+      <label>이웃 댓글 문구 (한 줄에 하나)</label>
+      <textarea id="neighborPhrases" rows="8">정성스러운 글 잘 읽었습니다. 오늘도 좋은 하루 보내세요 😊
+유익한 이야기 감사합니다! 덕분에 즐겁게 보고 갑니다.
+좋은 정보 잘 보고 갑니다. 행복한 하루 보내세요 :)
+흥미로운 내용이라 끝까지 잘 읽었습니다. 다음 글도 기대할게요!
+따뜻한 글 감사합니다. 오늘 하루도 좋은 일 가득하세요.
+공감하며 잘 읽었습니다. 소중한 이야기 나눠주셔서 감사해요!
+알찬 내용 덕분에 많이 배우고 갑니다. 늘 응원하겠습니다.
+사진과 글 모두 인상 깊게 보고 갑니다. 편안한 하루 되세요!</textarea>
+      <div class="row compact">
+        <div><label>글 사이 간격(초)</label><input id="intervalSeconds" type="number" min="15" max="3600" value="30"></div>
+        <div><label>한 번에 확인할 글 수</label><input id="maxPosts" type="number" min="1" max="100" value="20"></div>
+      </div>
+      <div class="notice">과도한 반복 등록을 막기 위해 최소 간격은 15초입니다. 네이버 운영정책과 상대 블로그의 의사를 존중해 사용하세요.</div>
+      <div class="row">
+        <button id="neighborStart" class="navy">이웃 새글 댓글 시작</button>
+        <button id="neighborStop" class="danger">중지</button>
+      </div>
+      <div id="neighborStatus" class="status">대기 중 · 이미 댓글을 남긴 글은 건너뜁니다.</div>
     </section>
   </main>
   <script src="renderer.js"></script>

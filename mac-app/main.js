@@ -4,6 +4,7 @@ const path = require("path");
 
 let mainWindow;
 let naverWindow;
+let neighborJobCancelled = false;
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const userDataFile = name => path.join(app.getPath("userData"), name);
@@ -215,6 +216,147 @@ ipcMain.handle("reply-comments", async (event, options) => {
   }
   const summary = { posts: posts.length, done, skipped, failed };
   send({ status: "작업 완료", ...summary, complete: true });
+  return summary;
+});
+
+ipcMain.handle("heart-recent-posts", async (event, options) => {
+  const blogId = String(options.blogId || "dicajohn").trim();
+  const win = getNaverWindow();
+  const send = payload => event.sender.send("heart-progress", payload);
+  win.show();
+  await win.loadURL(`https://blog.naver.com/PostList.naver?blogId=${encodeURIComponent(blogId)}&from=postList`);
+  await wait(2200);
+
+  let posts = [];
+  for (const frame of win.webContents.mainFrame.framesInSubtree) {
+    const found = await frame.executeJavaScript(`(() => {
+      const cutoff = Date.now() - 10 * 86400000;
+      const links = [...document.querySelectorAll('a[href*="logNo="],a[href*="/${blogId}/"]')];
+      const out = [];
+      for (const a of links) {
+        const m = (a.href || '').match(/(?:logNo=|\\/${blogId}\\/)(\\d+)/);
+        if (!m || out.some(x => x.logNo === m[1])) continue;
+        const box = a.closest('li,article,.post') || a.parentElement;
+        const dm = (box?.innerText || '').match(/(20\\d{2})[.\\/-]\\s*(\\d{1,2})[.\\/-]\\s*(\\d{1,2})/);
+        const date = dm ? new Date(+dm[1], +dm[2] - 1, +dm[3]).getTime() : Date.now();
+        if (date >= cutoff) out.push({logNo:m[1], title:(a.innerText||'').trim(), date});
+      }
+      return out;
+    })()`, true).catch(() => []);
+    posts.push(...found);
+  }
+  posts = posts.filter((p, i, all) => all.findIndex(x => x.logNo === p.logNo) === i);
+
+  let hearted = 0, skipped = 0, failed = 0;
+  for (const post of posts) {
+    send({ status: `공감 확인: ${post.title || post.logNo}`, hearted, skipped, failed });
+    await win.loadURL(`https://blog.naver.com/PostView.naver?blogId=${encodeURIComponent(blogId)}&logNo=${post.logNo}`);
+    await wait(1800);
+    let result = "failed";
+    for (const frame of win.webContents.mainFrame.framesInSubtree) {
+      result = await frame.executeJavaScript(`(async () => {
+        const candidates = [...document.querySelectorAll('button,a')].filter(e =>
+          /공감|좋아요/.test((e.innerText||'') + ' ' + (e.getAttribute('aria-label')||'')));
+        const button = candidates.find(e => {
+          const state = (e.getAttribute('aria-pressed')||'') + ' ' + e.className + ' ' +
+            (e.getAttribute('aria-label')||'') + ' ' + (e.title||'');
+          return !/true|on|active|취소|해제|선택됨/.test(state);
+        });
+        if (!button) return candidates.length ? 'skipped' : 'failed';
+        button.click();
+        await new Promise(r => setTimeout(r, 650));
+        return 'hearted';
+      })()`, true).catch(() => "failed");
+      if (result !== "failed") break;
+    }
+    if (result === "hearted") hearted++; else if (result === "skipped") skipped++; else failed++;
+    await wait(500);
+  }
+  const summary = { posts: posts.length, hearted, skipped, failed };
+  send({ status: "최근 10일 공감 확인 완료", ...summary, complete: true });
+  return summary;
+});
+
+ipcMain.handle("stop-neighbor-comments", () => {
+  neighborJobCancelled = true;
+  return true;
+});
+
+ipcMain.handle("comment-neighbor-feed", async (event, options) => {
+  const blogId = String(options.blogId || "dicajohn").trim();
+  const phrases = unique(options.phrases || []);
+  const intervalSeconds = Math.max(15, Math.min(3600, Number(options.intervalSeconds) || 30));
+  const maxPosts = Math.max(1, Math.min(100, Number(options.maxPosts) || 20));
+  if (!phrases.length) throw new Error("이웃 새글 댓글 문구를 한 개 이상 입력해 주세요.");
+
+  neighborJobCancelled = false;
+  const win = getNaverWindow();
+  const send = payload => event.sender.send("neighbor-progress", payload);
+  const processedPath = userDataFile("neighbor-comments.json");
+  let processed = {};
+  try { processed = JSON.parse(fs.readFileSync(processedPath, "utf8")); } catch {}
+  win.show();
+  await win.loadURL("https://section.blog.naver.com/BlogHome.naver");
+  await wait(2500);
+
+  let links = [];
+  for (const frame of win.webContents.mainFrame.framesInSubtree) {
+    const found = await frame.executeJavaScript(`(() => [...document.querySelectorAll('a[href*="blog.naver.com"]')]
+      .map(a => ({url:a.href, title:(a.innerText||'').trim()}))
+      .filter(x => /(?:logNo=|blog\\.naver\\.com\\/[\\w.-]+\\/\\d+)/.test(x.url)))()`, true).catch(() => []);
+    links.push(...found);
+  }
+  links = links.filter((x, i, all) => all.findIndex(y => y.url === x.url) === i).slice(0, maxPosts);
+
+  let done = 0, skipped = 0, failed = 0;
+  for (const item of links) {
+    if (neighborJobCancelled) break;
+    const key = item.url.replace(/[?#].*$/, "");
+    if (processed[key]) { skipped++; continue; }
+    send({ status: `이웃 글 확인: ${item.title || key}`, done, skipped, failed });
+    await win.loadURL(item.url);
+    await wait(1900);
+    let result = "failed";
+    for (const frame of win.webContents.mainFrame.framesInSubtree) {
+      result = await frame.executeJavaScript(`(async () => {
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        const blogId = ${JSON.stringify(blogId)};
+        const pageText = document.body?.innerText || '';
+        const comments = [...document.querySelectorAll('[class*="comment"],[class*="u_cbox"]')];
+        if (comments.some(e => (e.innerText||'').includes(blogId))) return 'skipped';
+        const toggle = [...document.querySelectorAll('button,a')].find(e => /댓글/.test(e.innerText||''));
+        if (toggle) { toggle.click(); await sleep(450); }
+        const editor = document.querySelector('textarea,[contenteditable="true"]');
+        if (!editor) return 'failed';
+        const phrases = ${JSON.stringify(phrases)};
+        const phrase = phrases[Math.floor(Math.random() * phrases.length)];
+        editor.focus();
+        if (editor.tagName === 'TEXTAREA') {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(editor, phrase);
+          editor.dispatchEvent(new Event('input',{bubbles:true}));
+        } else {
+          editor.textContent = phrase;
+          editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:phrase}));
+        }
+        await sleep(250);
+        const scope = editor.closest('form,[class*="comment"],[class*="write"]') || document;
+        const submit = [...scope.querySelectorAll('button,a')].find(e => /등록|확인/.test(e.innerText||'') && !e.disabled);
+        if (!submit) return 'failed';
+        submit.click(); await sleep(700);
+        return 'done';
+      })()`, true).catch(() => "failed");
+      if (result !== "failed") break;
+    }
+    if (result === "done") {
+      done++;
+      processed[key] = { at: new Date().toISOString() };
+      fs.writeFileSync(processedPath, JSON.stringify(processed, null, 2));
+    } else if (result === "skipped") skipped++; else failed++;
+    send({ status: `${intervalSeconds}초 후 다음 이웃 글로 이동`, done, skipped, failed });
+    for (let second = 0; second < intervalSeconds && !neighborJobCancelled; second++) await wait(1000);
+  }
+  const summary = { found: links.length, done, skipped, failed, stopped: neighborJobCancelled };
+  send({ status: neighborJobCancelled ? "사용자가 작업을 중지했습니다." : "이웃 새글 작업 완료", ...summary, complete: true });
   return summary;
 });
 
