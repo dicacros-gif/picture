@@ -249,7 +249,7 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
   const q = encodeURIComponent((seed || "").trim());
   const endpoints = [
     ["네이버", `https://ac.search.naver.com/nx/ac?q=${q}&con=0&frm=nv&ans=2&r_format=json&r_enc=UTF-8&r_unicode=0&t_koreng=1&run=2&rev=4`],
-    ["다음", `https://suggest.search.daum.net/sushi/pc/get?q=${q}`],
+    ["다음", `https://suggest.search.daum.net/sushi/opensearch/pc?q=${q}&DA=JU2`],
     ["구글", `https://suggestqueries.google.com/complete/search?client=firefox&q=${q}`]
   ];
   const output = [];
@@ -264,8 +264,7 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
           for (const item of group || []) if (Array.isArray(item) && item[0]) values.push(String(item[0]));
         }
       } else if (source === "다음") {
-        const groups = data.items || {};
-        values = Array.isArray(groups) ? groups : Object.values(groups).flat();
+        values = Array.isArray(data?.[1]) ? data[1] : [];
       } else {
         values = Array.isArray(data?.[1]) ? data[1] : [];
       }
