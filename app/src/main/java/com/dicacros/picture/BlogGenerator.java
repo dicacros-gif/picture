@@ -2,7 +2,6 @@ package com.dicacros.picture;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.json.JSONTokener;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -13,10 +12,8 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
 
 /**
  * 블로그 초안 생성의 순수 로직(프롬프트 구성 · OpenAI/Gemini 호출 · 후처리 · 키워드 필터).
@@ -24,75 +21,7 @@ import java.util.Set;
  */
 final class BlogGenerator {
 
-    /** adsensefarm 실시간 검색어 페이지 DOM 에서 후보 키워드를 뽑는 JS. Activity/서비스 공용. */
-    static final String KEYWORD_EXTRACT_JS =
-            "(function(){try{var s=[];var push=function(t){t=(t||'').replace(/\\s+/g,' ').trim();"
-                    + "if(t.length>=2&&t.length<=30&&s.indexOf(t)<0)s.push(t);};"
-                    + "var els=document.querySelectorAll('a,li,td,span,strong,p,div');"
-                    + "for(var i=0;i<els.length;i++){var el=els[i];if(el.children&&el.children.length>0)continue;"
-                    + "push(el.innerText||el.textContent);}return JSON.stringify(s.slice(0,500));}"
-                    + "catch(e){return JSON.stringify([]);}})();";
-
     private BlogGenerator() {
-    }
-
-    // ---------------------------------------------------------------
-    //  키워드
-    // ---------------------------------------------------------------
-    static List<String> parseKeywordJson(String rawValue) {
-        List<String> out = new ArrayList<>();
-        if (rawValue == null || rawValue.isEmpty() || "null".equals(rawValue)) {
-            return out;
-        }
-        try {
-            Object first = new JSONTokener(rawValue).nextValue();
-            String inner = (first instanceof String) ? (String) first : rawValue;
-            JSONArray arr = new JSONArray(inner);
-            for (int i = 0; i < arr.length(); i++) {
-                String s = arr.optString(i, "").trim();
-                if (!s.isEmpty()) {
-                    out.add(s);
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return out;
-    }
-
-    static List<String> filterKeywords(List<String> raw, int max) {
-        Set<String> dedup = new LinkedHashSet<>();
-        for (String k : raw) {
-            if (looksLikeKeyword(k)) {
-                dedup.add(k);
-            }
-            if (dedup.size() >= max) {
-                break;
-            }
-        }
-        return new ArrayList<>(dedup);
-    }
-
-    static boolean looksLikeKeyword(String text) {
-        if (text == null) {
-            return false;
-        }
-        int len = text.length();
-        if (len < 2 || len > 28) {
-            return false;
-        }
-        String lower = text.toLowerCase(Locale.ROOT);
-        String[] banned = {"adsense", "login", "menu", "http", "www", "copyright", "cookie",
-                "로그인", "회원가입", "광고", "실시간", "검색어", "순위", "더보기", "저작권", "바로가기",
-                "고객센터", "이용약관", "개인정보", "뉴스", "전체", "카테고리", "구독", "댓글"};
-        for (String b : banned) {
-            if (lower.contains(b)) {
-                return false;
-            }
-        }
-        if (!text.matches(".*[가-힣a-zA-Z].*")) {
-            return false;
-        }
-        return !text.matches("^[0-9]+\\s*위?$");
     }
 
     // ---------------------------------------------------------------
@@ -109,7 +38,8 @@ final class BlogGenerator {
         if (keywords != null && !keywords.isEmpty()) {
             sb.append("사용자가 선택한 실시간 검색어와 연관 검색어(네이버·다음·구글): ")
                     .append(join(keywords, ", ")).append('\n');
-            sb.append("이 중 잠깐 보고 마는 일회성 키워드는 버리고, 사람들이 오래 궁금해할 검색 의도가 강한 키워드를 골라 활용하세요.\n");
+            sb.append("경기 결과·당첨 번호처럼 잠깐 보고 마는 내용은 버리고, 사람들이 반복해서 궁금해할 질문·비교·이유·전망 중심으로 활용하세요.\n");
+            sb.append("인물·외국인·해외·기업 주제라면 프로필, 배경, 관계, 사업, 영향, 전망처럼 장기적으로 검색되는 서로 다른 궁금증을 균형 있게 다루세요.\n");
         }
         if (related) {
             sb.append("고른 키워드에서 사람들이 함께 궁금해할 연관 검색어까지 스스로 확장해 글에 자연스럽게 녹이세요.\n");
@@ -133,7 +63,9 @@ final class BlogGenerator {
         sb.append("제목 다음 첫 문단은 전체 글을 읽고 싶게 만드는 후킹 질문으로 시작하세요.\n");
         sb.append("역사적 배경을 설명하고, 고전이나 베스트셀러의 오래된 구절을 인용해 현 상황에 빗대세요.\n");
         sb.append("뜻·의미·정의, 이유·원인, 방법·팁, 시사점, 전략, 미래 전망 중 논리적으로 필요한 것만 골라 분석하세요.\n");
-        sb.append("경험 기반 후기, 전문가 시각, 사례 분석을 넣어 E-E-A-T(경험·전문성·권위·신뢰)를 강화하세요.\n");
+        sb.append("검색어만 보고 최신 사실이나 사건을 만들어 내지 마세요. 확인할 수 없는 루머, 범죄, 사생활, 국적·집단에 대한 단정은 쓰지 말고 불확실하면 확인이 필요한 항목으로 설명하세요.\n");
+        sb.append("인물이나 기업을 다룰 때는 비방이나 홍보가 아니라 공개적으로 확인 가능한 배경과 독자가 궁금해할 맥락 중심으로 쓰세요.\n");
+        sb.append("사용자가 제공한 원문에 실제 경험이 있을 때만 후기처럼 쓰고, 없는 경험이나 인터뷰를 지어내지 마세요. 그 외에는 전문가 관점의 설명과 일반 사례로 신뢰를 높이세요.\n");
         sb.append("어려운 단어는 바로 뒤에 뜻과 정의를 풀어 주세요. 같은 단어 반복 대신 유사어를 쓰세요.\n");
         sb.append("사람들이 많이 검색하는 내용을 질문과 답변 형식으로 더하되, 키워드를 직접 언급하지 말고 간접적으로 살리세요.\n");
         sb.append("결론에는 '결론'이라는 단어를 쓰지 말고, 애매하게 양비론으로 끝내지 말고 한쪽 입장을 분명히 하세요.\n");
@@ -158,7 +90,7 @@ final class BlogGenerator {
         if (geminiKey != null && !geminiKey.trim().isEmpty()) {
             return callGemini(geminiKey.trim(), geminiModel, prompt);
         }
-        return prompt;
+        throw new IllegalStateException("OpenAI 또는 Gemini API 키가 필요합니다");
     }
 
     static String callOpenAi(String apiKey, String model, String prompt) throws Exception {
@@ -247,6 +179,15 @@ final class BlogGenerator {
             out = insertImageSlots(out);
         }
         return out;
+    }
+
+    static String forPublishing(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replaceAll("(?m)^\\s*\\[사진 업로드 위치\\]\\s*$", "")
+                .replaceAll("\\n{3,}", "\n\n")
+                .trim();
     }
 
     private static String insertImageSlots(String text) {

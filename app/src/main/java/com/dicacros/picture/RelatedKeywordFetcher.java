@@ -14,6 +14,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 final class RelatedKeywordFetcher {
 
@@ -48,6 +51,44 @@ final class RelatedKeywordFetcher {
             }
         }
         return result;
+    }
+
+    static List<Result> fetchAll(List<String> rawSeeds, int maxConcurrent) {
+        Set<String> unique = new LinkedHashSet<>();
+        if (rawSeeds != null) {
+            for (String rawSeed : rawSeeds) {
+                String seed = KeywordDatabase.normalizeKeyword(rawSeed);
+                if (KeywordDatabase.isUsableKeyword(seed)) {
+                    unique.add(seed);
+                }
+            }
+        }
+        if (unique.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        int threadCount = Math.max(1, Math.min(maxConcurrent, unique.size()));
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        List<Future<Result>> futures = new ArrayList<>();
+        for (String seed : unique) {
+            futures.add(executor.submit(() -> fetch(seed, true, true, true)));
+        }
+
+        List<Result> output = new ArrayList<>();
+        try {
+            for (Future<Result> future : futures) {
+                try {
+                    output.add(future.get());
+                } catch (Exception exception) {
+                    Result failed = new Result("");
+                    failed.errors.add(shortMessage(exception));
+                    output.add(failed);
+                }
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+        return output;
     }
 
     private static List<String> fetchNaver(String seed) throws Exception {

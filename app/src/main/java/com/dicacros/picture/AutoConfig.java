@@ -51,10 +51,6 @@ final class AutoConfig {
         return orDefault(prefs(c).getString("gemini_model", ""), "gemini-2.5-flash");
     }
 
-    static String topic(Context c) {
-        return prefs(c).getString("topic", "");
-    }
-
     static String draftBase(Context c) {
         return prefs(c).getString("draft_base", "");
     }
@@ -67,15 +63,11 @@ final class AutoConfig {
         return prefs(c).getString("last_result", "");
     }
 
+    static String chatGptUrl(Context c) {
+        return orDefault(prefs(c).getString("chatgpt_url", ""), "https://chatgpt.com/");
+    }
+
     // --- 불리언 옵션 ---
-    static boolean useRealtime(Context c) {
-        return prefs(c).getBoolean("opt_realtime", true);
-    }
-
-    static boolean useRelated(Context c) {
-        return prefs(c).getBoolean("opt_related", true);
-    }
-
     static boolean useImageSlots(Context c) {
         return prefs(c).getBoolean("opt_image", true);
     }
@@ -86,6 +78,14 @@ final class AutoConfig {
 
     static boolean autoPublish(Context c) {
         return prefs(c).getBoolean("auto_publish", true);
+    }
+
+    static boolean useChatGptWeb(Context c) {
+        return prefs(c).getBoolean("use_chatgpt_web", true);
+    }
+
+    static boolean autoKeywordSelection(Context c) {
+        return prefs(c).getBoolean("auto_keyword_selection", true);
     }
 
     // --- 정수 옵션 ---

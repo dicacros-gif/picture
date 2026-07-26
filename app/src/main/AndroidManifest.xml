@@ -43,9 +43,18 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:windowSoftInputMode="adjustResize"
             android:exported="false" />
+        <activity
+            android:name=".KeywordActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:exported="false" />
 
         <service
             android:name=".BlogAutoService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".KeywordCollectorService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
@@ -64,6 +73,9 @@
 
         <receiver
             android:name=".AlarmReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".KeywordAlarmReceiver"
             android:exported="false" />
 
         <receiver

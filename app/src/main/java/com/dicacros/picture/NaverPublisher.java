@@ -25,20 +25,33 @@ final class NaverPublisher {
         String b = JSONObject.quote(body == null ? "" : body);
         return "(function(){try{"
                 + "var title=" + t + ";var body=" + b + ";"
+                + "var docs=[document];var frames=document.querySelectorAll('iframe');"
+                + "for(var f=0;f<frames.length;f++){try{if(frames[f].contentDocument)"
+                + "docs.push(frames[f].contentDocument);}catch(ignore){}}"
                 + "function fire(el){['input','keyup','change','blur'].forEach(function(ev){"
                 + "el.dispatchEvent(new Event(ev,{bubbles:true}));});}"
                 + "function setInput(el,v){if(!el)return false;"
                 + "if(el.isContentEditable){el.focus();el.innerText=v;fire(el);return true;}"
-                + "if('value' in el){el.focus();el.value=v;fire(el);return true;}return false;}"
+                + "if('value' in el){el.focus();"
+                + "var win=el.ownerDocument.defaultView;"
+                + "var proto=el.tagName==='TEXTAREA'?win.HTMLTextAreaElement.prototype:win.HTMLInputElement.prototype;"
+                + "var setter=Object.getOwnPropertyDescriptor(proto,'value');"
+                + "if(setter&&setter.set)setter.set.call(el,v);else el.value=v;"
+                + "fire(el);return true;}return false;}"
                 + "var tSel=['textarea[placeholder*=\"제목\"]','input[placeholder*=\"제목\"]',"
                 + "'.se-title-text','[contenteditable][class*=title]','.htitle'];"
-                + "var bSel=['[contenteditable=\"true\"]','.se-text-paragraph','textarea',"
-                + "'.se-component-content','#editorArea','.editor'];"
-                + "var okT=false;for(var i=0;i<tSel.length&&!okT;i++){okT=setInput(document.querySelector(tSel[i]),title);}"
-                + "var okB=false;for(var j=0;j<bSel.length&&!okB;j++){var el=document.querySelector(bSel[j]);"
-                + "if(el&&el.offsetHeight>40){okB=setInput(el,body);}}"
-                + "if(!okB){var eds=document.querySelectorAll('[contenteditable=\"true\"]');"
-                + "if(eds.length){okB=setInput(eds[eds.length-1],body);}}"
+                + "var okT=false;var titleEl=null;"
+                + "for(var d=0;d<docs.length&&!okT;d++){for(var i=0;i<tSel.length&&!okT;i++){"
+                + "titleEl=docs[d].querySelector(tSel[i]);okT=setInput(titleEl,title);}}"
+                + "var candidates=[];for(var j=0;j<docs.length;j++){"
+                + "var values=docs[j].querySelectorAll('[contenteditable=\"true\"],textarea,"
+                + ".se-text-paragraph,.se-component-content,#editorArea,.editor');"
+                + "for(var k=0;k<values.length;k++){var value=values[k];"
+                + "if(value!==titleEl&&value.getClientRects().length&&value.offsetHeight>40)"
+                + "candidates.push(value);}}"
+                + "candidates.sort(function(a,b){return (b.offsetWidth*b.offsetHeight)"
+                + "-(a.offsetWidth*a.offsetHeight);});"
+                + "var okB=candidates.length?setInput(candidates[0],body):false;"
                 + "return JSON.stringify({title:okT,body:okB});}catch(e){return JSON.stringify({error:String(e)});}})();";
     }
 
@@ -52,6 +65,31 @@ final class NaverPublisher {
                     + "var a=clickByText(['발행']);"
                     + "if(!a){a=clickByText(['등록','확인','완료','게시']);}"
                     + "return JSON.stringify({clicked:a});}catch(e){return JSON.stringify({error:String(e)});}})();";
+
+    static final String OPEN_IMAGE_PICKER_JS =
+            "(function(){try{"
+                    + "var docs=[document];var frames=document.querySelectorAll('iframe');"
+                    + "for(var f=0;f<frames.length;f++){try{if(frames[f].contentDocument)"
+                    + "docs.push(frames[f].contentDocument);}catch(ignore){}}"
+                    + "var editor=null;for(var d=0;d<docs.length&&!editor;d++){"
+                    + "var values=docs[d].querySelectorAll('[contenteditable=\"true\"]');"
+                    + "if(values.length)editor=values[values.length-1];}"
+                    + "if(editor){editor.focus();var owner=editor.ownerDocument;"
+                    + "var range=owner.createRange();"
+                    + "var selection=owner.defaultView.getSelection();var children=editor.childNodes;"
+                    + "var middle=Math.floor(children.length/2);"
+                    + "range.setStart(editor,middle);range.collapse(true);"
+                    + "selection.removeAllRanges();selection.addRange(range);}"
+                    + "for(var j=0;j<docs.length;j++){"
+                    + "var buttons=docs[j].querySelectorAll('button,a,[role=button],label');"
+                    + "for(var i=0;i<buttons.length;i++){var b=buttons[i];"
+                    + "var text=((b.getAttribute('aria-label')||'')+' '+"
+                    + "(b.getAttribute('title')||'')+' '+(b.innerText||'')).trim();"
+                    + "if((text.indexOf('사진')>=0||text.indexOf('이미지')>=0)"
+                    + "&&text.indexOf('삭제')<0&&b.offsetHeight>0){b.click();"
+                    + "return JSON.stringify({clicked:text});}}}"
+                    + "return JSON.stringify({clicked:null});"
+                    + "}catch(e){return JSON.stringify({error:String(e)});}})();";
 
     interface StepResult {
         void onResult(String json);
@@ -67,6 +105,14 @@ final class NaverPublisher {
 
     static void runPublish(WebView web, StepResult cb) {
         web.evaluateJavascript(PUBLISH_JS, value -> {
+            if (cb != null) {
+                cb.onResult(value);
+            }
+        });
+    }
+
+    static void runOpenImagePicker(WebView web, StepResult cb) {
+        web.evaluateJavascript(OPEN_IMAGE_PICKER_JS, value -> {
             if (cb != null) {
                 cb.onResult(value);
             }

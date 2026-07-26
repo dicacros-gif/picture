@@ -62,12 +62,14 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private ProgressBar progressBar;
     private Button cropButton;
+    private Button keywordButton;
     private Button blogWriterButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(createContentView());
+        KeywordScheduler.ensureScheduled(this);
         maybeRequestAllFilesAccess();
         updateStatus("오늘 캡처한 스크린샷을 크롭하고 해상도를 개선할 준비가 됐습니다.");
     }
@@ -80,50 +82,76 @@ public class MainActivity extends Activity {
 
     private View createContentView() {
         ScrollView scrollView = new ScrollView(this);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(24), dp(36), dp(24), dp(24));
-        root.setBackgroundColor(Color.rgb(247, 248, 250));
+        scrollView.setFillViewport(true);
+        scrollView.setBackgroundColor(UiKit.BACKGROUND);
+        LinearLayout root = UiKit.screen(this);
         scrollView.addView(root);
 
-        cropButton = createPrimaryButton("이미지 자동 크롭 + 해상도 개선");
+        LinearLayout hero = UiKit.tintedCard(
+                this, UiKit.INFO_SOFT, Color.rgb(191, 219, 254));
+        hero.setPadding(dp(18), dp(20), dp(18), dp(20));
+        hero.addView(UiKit.eyebrow(this, "PICTURE CLEANER"));
+        hero.addView(UiKit.pageTitle(this, "오늘의 캡처를\n콘텐츠로 바꾸세요"));
+        hero.addView(UiKit.body(this,
+                "이미지 정리부터 검색어 분석, 블로그 작성까지 한 흐름으로 진행합니다."));
+        root.addView(hero);
+
+        cropButton = createPrimaryButton("이미지 정리 시작", UiKit.PRIMARY);
         cropButton.setOnClickListener(v -> startProcessing());
-        root.addView(cropButton);
+        root.addView(actionCard(
+                "STEP 1", "이미지 자동 정리",
+                "오늘 캡처한 사진에서 불필요한 글자와 여백을 제거하고 해상도를 개선합니다.",
+                cropButton, UiKit.PRIMARY));
 
-        blogWriterButton = createPrimaryButton("네이버 블로그 글쓰기 자동화");
-        blogWriterButton.setBackgroundColor(Color.rgb(23, 78, 166));
+        keywordButton = createPrimaryButton("실시간 연관 검색어", UiKit.TEAL);
+        keywordButton.setOnClickListener(
+                v -> startActivity(new Intent(this, KeywordActivity.class)));
+        root.addView(actionCard(
+                "STEP 2", "실시간 연관 검색어",
+                "다음·구글·네이버 실시간 순위 30개를 모아 오래 검색될 주제와 연관 질문을 추천합니다.",
+                keywordButton, UiKit.TEAL));
+
+        blogWriterButton = createPrimaryButton("블로그 자동화 열기", UiKit.NAVY);
         blogWriterButton.setOnClickListener(v -> startActivity(new Intent(this, BlogWriterActivity.class)));
-        LinearLayout.LayoutParams blogParams = new LinearLayout.LayoutParams(-1, dp(54));
-        blogParams.setMargins(0, dp(12), 0, dp(6));
-        blogWriterButton.setLayoutParams(blogParams);
-        root.addView(blogWriterButton);
+        root.addView(actionCard(
+                "STEP 3", "네이버 블로그 자동화",
+                "선택한 롱테일 주제와 정리된 이미지를 이용해 생성부터 발행까지 연결합니다.",
+                blogWriterButton, UiKit.NAVY));
 
+        LinearLayout statusCard = UiKit.card(this);
+        statusCard.addView(UiKit.sectionTitle(this, "작업 상태"));
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
-        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(12));
-        progressParams.setMargins(0, dp(14), 0, 0);
-        root.addView(progressBar, progressParams);
+        UiKit.tintProgress(progressBar, UiKit.PRIMARY);
+        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(-1, dp(8));
+        progressParams.setMargins(0, dp(4), 0, dp(4));
+        statusCard.addView(progressBar, progressParams);
 
-        statusText = new TextView(this);
-        statusText.setTextColor(Color.rgb(52, 64, 84));
-        statusText.setTextSize(14);
-        LinearLayout.LayoutParams statusParams = new LinearLayout.LayoutParams(-1, -2);
-        statusParams.setMargins(0, dp(18), 0, 0);
-        root.addView(statusText, statusParams);
+        statusText = UiKit.status(this);
+        statusCard.addView(statusText);
+        root.addView(statusCard);
 
         return scrollView;
     }
 
-    private Button createPrimaryButton(String text) {
-        Button button = new Button(this);
-        button.setAllCaps(false);
-        button.setText(text);
-        button.setTextSize(16);
-        button.setTextColor(Color.WHITE);
-        button.setBackgroundColor(Color.rgb(47, 111, 237));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(54));
-        params.setMargins(0, 0, 0, dp(12));
+    private LinearLayout actionCard(String step, String title, String description,
+                                    Button button, int accent) {
+        LinearLayout card = UiKit.card(this);
+        card.addView(UiKit.badge(this, step, accent));
+        card.addView(UiKit.sectionTitle(this, title));
+        TextView descriptionView = UiKit.body(this, description);
+        LinearLayout.LayoutParams descriptionParams =
+                new LinearLayout.LayoutParams(-1, -2);
+        descriptionParams.setMargins(0, 0, 0, dp(14));
+        card.addView(descriptionView, descriptionParams);
+        card.addView(button);
+        return card;
+    }
+
+    private Button createPrimaryButton(String text, int color) {
+        Button button = UiKit.primaryButton(this, text, color);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, dp(50));
         button.setLayoutParams(params);
         return button;
     }
@@ -627,6 +655,7 @@ public class MainActivity extends Activity {
 
     private void setControlsEnabled(boolean enabled) {
         cropButton.setEnabled(enabled);
+        keywordButton.setEnabled(enabled);
         blogWriterButton.setEnabled(enabled);
     }
 

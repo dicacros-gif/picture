@@ -77,6 +77,22 @@ public class BlogAutoAccessibilityService extends AccessibilityService {
      * 각 단계 사이에 지연을 둬 화면 전환을 기다린다.
      */
     void automateNaverPost(final String content, final boolean publish) {
+        automateNaverPost(content, publish, false);
+    }
+
+    void automateNaverPost(final String content, final boolean publish,
+                           final boolean sharedImages) {
+        if (sharedImages) {
+            handler.postDelayed(this::tapCenter, 2400);
+            handler.postDelayed(() -> setTextOnFocused(content), 3400);
+            if (publish) {
+                handler.postDelayed(
+                        () -> clickByTexts("발행", "등록", "다음", "확인"), 6200);
+                handler.postDelayed(
+                        () -> clickByTexts("발행", "등록", "확인", "완료"), 8200);
+            }
+            return;
+        }
         handler.postDelayed(this::tapBottomCenter, 1500);
         handler.postDelayed(() -> clickByTexts("글쓰기", "새 글", "글 작성"), 2600);
         handler.postDelayed(this::tapCenter, 4200);
