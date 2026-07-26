@@ -292,7 +292,7 @@ def fetch_realtime_groups() -> dict[str, list[str]]:
             groups[label] = [
                 normalize_keyword(str(value))
                 for value in values
-                if normalize_keyword(str(value)) and not is_ephemeral_keyword(str(value))
+                if normalize_keyword(str(value))
             ][:10]
         except Exception:
             groups[label] = []
@@ -304,7 +304,6 @@ def fetch_realtime_groups() -> dict[str, list[str]]:
             normalize_keyword(str(item.get("keyword", "")))
             for item in values
             if normalize_keyword(str(item.get("keyword", "")))
-            and not is_ephemeral_keyword(str(item.get("keyword", "")))
         ][:10]
     except Exception:
         groups["네이버 시그널"] = []
@@ -431,6 +430,8 @@ class PictureCleanerApp:
         self._keyword_ui()
         self._blog_ui()
         self._comment_ui()
+        # 프로그램 시작 화면은 실시간 연관 검색어로 고정한다.
+        tabs.select(self.keyword_tab)
         ttk.Separator(outer).pack(fill="x", pady=(12, 7))
         ttk.Label(outer, textvariable=self.status).pack(anchor="w")
 
@@ -479,19 +480,21 @@ class PictureCleanerApp:
         ttk.Button(toolbar, text="연관 검색어만 복사", command=self.copy_related_only).pack(
             side="left", padx=8
         )
-        split = ttk.Panedwindow(self.keyword_tab, orient="vertical")
+        # 왼쪽은 실시간 키워드 선택, 오른쪽은 선택 항목의 연관 검색어만 표시한다.
+        split = ttk.Panedwindow(self.keyword_tab, orient="horizontal")
         split.pack(fill="both", expand=True)
         realtime_box = ttk.LabelFrame(split, text="일회성 키워드를 제외한 실시간 검색어 · 한 개만 선택", padding=8)
         related_box = ttk.LabelFrame(split, text="선택한 검색어의 연관 검색어", padding=8)
-        split.add(realtime_box, weight=3)
-        split.add(related_box, weight=2)
+        split.add(realtime_box, weight=1)
+        split.add(related_box, weight=1)
         canvas = __import__("tkinter").Canvas(realtime_box, highlightthickness=0)
         scroll = ttk.Scrollbar(realtime_box, orient="vertical", command=canvas.yview)
         self.realtime_list = ttk.Frame(canvas)
         self.realtime_list.bind(
             "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=self.realtime_list, anchor="nw")
+        list_window = canvas.create_window((0, 0), window=self.realtime_list, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(list_window, width=event.width))
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
@@ -572,7 +575,10 @@ class PictureCleanerApp:
                 padding=8,
             )
             card.pack(fill="x", padx=4, pady=5)
-            words = groups.get(source, [])
+            words = [
+                word for word in groups.get(source, [])
+                if not is_ephemeral_keyword(word)
+            ]
             if not words:
                 ttk.Label(card, text="수집 결과 없음", style="Sub.TLabel").pack(
                     anchor="w"
@@ -985,9 +991,9 @@ class PictureCleanerApp:
         self.realtime_by_source = result
         crawled_total = sum(len(values) for values in result.values())
         usable_total = 0
-        for column, source in enumerate(("다음", "구글", "크리에이터 어드바이저", "네이버 시그널")):
+        for row, source in enumerate(("다음", "구글", "크리에이터 어드바이저", "네이버 시그널")):
             section = ttk.LabelFrame(self.realtime_list, text=source, padding=8)
-            section.grid(row=0, column=column, sticky="nsew", padx=5, pady=3)
+            section.grid(row=row, column=0, sticky="ew", padx=5, pady=3)
             values = [word for word in result.get(source, []) if not is_ephemeral_keyword(word)]
             usable_total += len(values)
             if not values:
@@ -1000,7 +1006,7 @@ class PictureCleanerApp:
                     variable=self.selected_realtime,
                     command=lambda word=keyword: self.select_realtime_keyword(word),
                 ).pack(anchor="w", fill="x", pady=2)
-            self.realtime_list.columnconfigure(column, weight=1)
+        self.realtime_list.columnconfigure(0, weight=1)
         self.status.set(
             f"실시간 검색어 {crawled_total}개 수집 · 일회성 제외 {usable_total}개 · 한 개를 선택하세요."
         )
@@ -1030,19 +1036,33 @@ class PictureCleanerApp:
                     self.refresh_images()
                 elif kind == "keywords":
                     _, seed, result = event
-                    lines = []
                     merged = []
+                    failed_sources = []
                     for source, words in result.items():
-                        lines.append(f"[{source}]")
-                        lines.extend(words or ["조회 결과 없음"])
-                        lines.append("")
-                        merged.extend(words)
+                        usable = [word for word in words if normalize_keyword(word)]
+                        if usable:
+                            merged.extend(usable)
+                        else:
+                            failed_sources.append(source)
+                    merged = list(dict.fromkeys(merged))
                     self.keyword_text.delete("1.0", "end")
-                    self.keyword_text.insert("1.0", "\n".join(lines))
+                    if merged:
+                        self.keyword_text.insert("1.0", "\n".join(merged))
                     self.seed.set(seed)
                     self.keyword_db = list(dict.fromkeys(self.keyword_db + merged))[-500:]
                     save_json(DB_FILE, self.keyword_db)
-                    self.status.set(f"연관 검색어 {len(set(merged))}개 조회 완료")
+                    if merged and failed_sources:
+                        self.status.set(
+                            f"'{seed}' 연관 검색어 {len(merged)}개 · "
+                            f"{', '.join(failed_sources)} 조회 결과 없음"
+                        )
+                    elif merged:
+                        self.status.set(f"'{seed}' 연관 검색어 {len(merged)}개 조회 완료")
+                    else:
+                        self.status.set(
+                            f"'{seed}' 연관 검색어 조회 결과 없음 · "
+                            f"{', '.join(failed_sources) or '전체 출처'}"
+                        )
                 elif kind == "realtime":
                     result = event[1]
                     self.show_realtime_sources(result)
