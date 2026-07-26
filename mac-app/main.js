@@ -1,13 +1,128 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, session } = require("electron");
 const fs = require("fs");
 const path = require("path");
+const { spawn } = require("child_process");
 
 let mainWindow;
 let naverWindow;
 let neighborJobCancelled = false;
+let whaleProcess;
+const WHALE_DEBUG_PORT = 9339;
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const userDataFile = name => path.join(app.getPath("userData"), name);
+
+class CdpPage {
+  constructor(webSocketUrl) {
+    this.nextId = 1;
+    this.pending = new Map();
+    this.socket = new WebSocket(webSocketUrl);
+    this.ready = new Promise((resolve, reject) => {
+      this.socket.onopen = resolve;
+      this.socket.onerror = () => reject(new Error("네이버 웨일 자동화 연결에 실패했습니다."));
+    });
+    this.socket.onmessage = event => {
+      const message = JSON.parse(event.data);
+      if (!message.id || !this.pending.has(message.id)) return;
+      const { resolve, reject } = this.pending.get(message.id);
+      this.pending.delete(message.id);
+      if (message.error) reject(new Error(message.error.message)); else resolve(message.result || {});
+    };
+  }
+  async send(method, params = {}) {
+    await this.ready;
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.socket.send(JSON.stringify({ id, method, params }));
+    });
+  }
+  async initialize() {
+    await this.send("Page.enable");
+    await this.send("Runtime.enable");
+  }
+  async navigate(url) {
+    await this.send("Page.navigate", { url });
+    await wait(2200);
+  }
+  async evaluateFrames(expression) {
+    const tree = await this.send("Page.getFrameTree");
+    const ids = [];
+    const visit = node => {
+      if (node?.frame?.id) ids.push(node.frame.id);
+      for (const child of node?.childFrames || []) visit(child);
+    };
+    visit(tree.frameTree);
+    const results = [];
+    for (const frameId of ids) {
+      try {
+        const world = await this.send("Page.createIsolatedWorld", {
+          frameId, worldName: `picture-cleaner-${Date.now()}-${frameId}`, grantUniversalAccess: true
+        });
+        const evaluated = await this.send("Runtime.evaluate", {
+          expression, contextId: world.executionContextId,
+          awaitPromise: true, returnByValue: true, userGesture: true
+        });
+        if (!evaluated.exceptionDetails) results.push(evaluated.result?.value);
+      } catch {}
+    }
+    return results;
+  }
+  disconnect() {
+    try { this.socket.close(); } catch {}
+  }
+}
+
+function whaleExecutable() {
+  const candidates = [
+    "/Applications/Naver Whale.app/Contents/MacOS/Naver Whale",
+    path.join(app.getPath("home"), "Applications/Naver Whale.app/Contents/MacOS/Naver Whale")
+  ];
+  return candidates.find(candidate => fs.existsSync(candidate));
+}
+
+async function ensureWhale() {
+  if (process.platform !== "darwin") return null;
+  const executable = whaleExecutable();
+  if (!executable) throw new Error("네이버 웨일이 설치되어 있지 않습니다. 웨일을 설치한 뒤 다시 실행해 주세요.");
+  const versionUrl = `http://127.0.0.1:${WHALE_DEBUG_PORT}/json/version`;
+  try {
+    const response = await fetch(versionUrl);
+    if (response.ok) return;
+  } catch {}
+  const profile = path.join(app.getPath("userData"), "naver-whale-profile");
+  whaleProcess = spawn(executable, [
+    `--remote-debugging-port=${WHALE_DEBUG_PORT}`,
+    "--remote-allow-origins=*",
+    `--user-data-dir=${profile}`,
+    "--start-maximized",
+    "--no-first-run",
+    "--disable-notifications",
+    "about:blank"
+  ], { detached: false, stdio: "ignore" });
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      const response = await fetch(versionUrl);
+      if (response.ok) return;
+    } catch {}
+    await wait(250);
+  }
+  throw new Error("네이버 웨일 자동화 연결을 시작하지 못했습니다.");
+}
+
+async function openWhalePage(url) {
+  await ensureWhale();
+  const response = await fetch(
+    `http://127.0.0.1:${WHALE_DEBUG_PORT}/json/new?${encodeURIComponent(url)}`,
+    { method: "PUT" }
+  );
+  if (!response.ok) throw new Error("네이버 웨일 탭을 열지 못했습니다.");
+  const target = await response.json();
+  const page = new CdpPage(target.webSocketDebuggerUrl);
+  await page.initialize();
+  await wait(1800);
+  return page;
+}
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
@@ -15,6 +130,7 @@ function createMainWindow() {
     height: 820,
     minWidth: 940,
     minHeight: 680,
+    fullscreen: process.platform === "darwin",
     titleBarStyle: "hiddenInset",
     backgroundColor: "#f4f7fb",
     webPreferences: {
@@ -168,6 +284,12 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
 });
 
 ipcMain.handle("open-naver-login", async (_event, blogId) => {
+  if (process.platform === "darwin") {
+    await openWhalePage(blogId
+      ? `https://blog.naver.com/${encodeURIComponent(blogId)}`
+      : "https://nid.naver.com/nidlogin.login");
+    return true;
+  }
   const win = getNaverWindow();
   await win.loadURL(blogId ? `https://blog.naver.com/${encodeURIComponent(blogId)}` : "https://nid.naver.com/nidlogin.login");
   win.show();
@@ -175,6 +297,10 @@ ipcMain.handle("open-naver-login", async (_event, blogId) => {
 });
 
 ipcMain.handle("open-blog-write", async () => {
+  if (process.platform === "darwin") {
+    await openWhalePage("https://blog.naver.com/GoBlogWrite.naver");
+    return true;
+  }
   const win = getNaverWindow();
   await win.loadURL("https://blog.naver.com/GoBlogWrite.naver");
   win.show();
@@ -191,7 +317,172 @@ ipcMain.handle("set-settings", (_event, settings) => {
   return true;
 });
 
+async function recentWhalePosts(page, blogId) {
+  await page.navigate(`https://blog.naver.com/PostList.naver?blogId=${encodeURIComponent(blogId)}&from=postList`);
+  const values = await page.evaluateFrames(`(() => {
+    const cutoff = Date.now() - 10 * 86400000;
+    const links = [...document.querySelectorAll('a[href*="logNo="],a[href*="/${blogId}/"]')];
+    const out = [];
+    for (const a of links) {
+      const m = (a.href||'').match(/(?:logNo=|\\/${blogId}\\/)(\\d+)/);
+      if (!m || out.some(x => x.logNo === m[1])) continue;
+      const box = a.closest('li,article,.post') || a.parentElement;
+      const dm = (box?.innerText||'').match(/(20\\d{2})[.\\/-]\\s*(\\d{1,2})[.\\/-]\\s*(\\d{1,2})/);
+      const date = dm ? new Date(+dm[1],+dm[2]-1,+dm[3]).getTime() : Date.now();
+      if (date >= cutoff) out.push({logNo:m[1],title:(a.innerText||'').trim(),date});
+    }
+    return out;
+  })()`);
+  const posts = values.flatMap(value => Array.isArray(value) ? value : []);
+  return posts.filter((post, index, all) => all.findIndex(x => x.logNo === post.logNo) === index)
+    .sort((a, b) => b.date - a.date);
+}
+
+async function replyCommentsInWhale(event, options) {
+  const blogId = String(options.blogId || "dicajohn").trim();
+  const phrases = unique(options.phrases || []);
+  if (!phrases.length) throw new Error("감사 문구를 한 개 이상 입력해 주세요.");
+  const send = payload => event.sender.send("reply-progress", payload);
+  const processedPath = userDataFile("replied-comments.json");
+  let processed = {};
+  try { processed = JSON.parse(fs.readFileSync(processedPath, "utf8")); } catch {}
+  const page = await openWhalePage("about:blank");
+  try {
+    const posts = await recentWhalePosts(page, blogId);
+    let done = 0, skipped = 0, failed = 0;
+    for (const post of posts) {
+      send({ status: `웨일에서 글 확인: ${post.title || post.logNo}`, done, skipped, failed });
+      await page.navigate(`https://blog.naver.com/PostView.naver?blogId=${encodeURIComponent(blogId)}&logNo=${post.logNo}`);
+      await Promise.all((await page.evaluateFrames(`(() => {
+        const toggle=[...document.querySelectorAll('button,a')].find(e=>(e.innerText||'').includes('댓글'));
+        if(toggle)toggle.click(); return true;
+      })()`)).map(() => Promise.resolve()));
+      await wait(900);
+      const results = await page.evaluateFrames(`(async () => {
+        const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+        const blogId=${JSON.stringify(blogId)}, phrases=${JSON.stringify(phrases)};
+        const processed=${JSON.stringify(processed)}, logNo=${JSON.stringify(post.logNo)};
+        const blocks=[...document.querySelectorAll('[class*="comment_item"],[class*="u_cbox_comment_box"],li[class*="comment"]')];
+        let done=0,skipped=0,failed=0;
+        for(const block of blocks){
+          const author=(block.querySelector('[class*="name"],[class*="nick"]')?.innerText||'').trim();
+          const body=(block.querySelector('[class*="text"],[class*="contents"]')?.innerText||'').trim();
+          const key=logNo+':'+author+':'+body.slice(0,80);
+          if(!body||author===blogId||processed[key]){skipped++;continue;}
+          const own=[...block.querySelectorAll('[class*="reply"],[class*="comment"]')]
+            .some(e=>(e.querySelector('[class*="name"],[class*="nick"]')?.innerText||'').includes(blogId));
+          if(own){skipped++;continue;}
+          const reply=[...block.querySelectorAll('button,a')].find(e=>/답글|답변/.test(e.innerText||''));
+          if(!reply){failed++;continue;} reply.click(); await sleep(300);
+          const editor=block.querySelector('textarea,[contenteditable="true"]')||document.querySelector('textarea:focus,[contenteditable="true"]:focus');
+          if(!editor){failed++;continue;}
+          const phrase=phrases[Math.floor(Math.random()*phrases.length)]; editor.focus();
+          if(editor.tagName==='TEXTAREA'){
+            Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(editor,phrase);
+            editor.dispatchEvent(new Event('input',{bubbles:true}));
+          }else{editor.textContent=phrase;editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:phrase}));}
+          const submit=[...block.querySelectorAll('button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
+          if(!submit){failed++;continue;} submit.click(); await sleep(650);
+          processed[key]={at:new Date().toISOString(),phrase};done++;
+        }
+        return {done,skipped,failed,processed,found:blocks.length};
+      })()`);
+      const result = results.find(value => value?.found) || { done: 0, skipped: 0, failed: 0, processed };
+      done += result.done || 0; skipped += result.skipped || 0; failed += result.failed || 0;
+      processed = result.processed || processed;
+      fs.writeFileSync(processedPath, JSON.stringify(processed, null, 2));
+    }
+    const summary = { posts: posts.length, done, skipped, failed };
+    send({ status: "웨일 댓글 답글 완료", ...summary, complete: true });
+    return summary;
+  } finally { page.disconnect(); }
+}
+
+async function heartRecentInWhale(event, options) {
+  const blogId = String(options.blogId || "dicajohn").trim();
+  const send = payload => event.sender.send("heart-progress", payload);
+  const page = await openWhalePage("about:blank");
+  try {
+    const posts = await recentWhalePosts(page, blogId);
+    let hearted = 0, skipped = 0, failed = 0;
+    for (const post of posts) {
+      send({ status: `웨일 공감 확인: ${post.title || post.logNo}`, hearted, skipped, failed });
+      await page.navigate(`https://blog.naver.com/PostView.naver?blogId=${encodeURIComponent(blogId)}&logNo=${post.logNo}`);
+      const results = await page.evaluateFrames(`(async () => {
+        const candidates=[...document.querySelectorAll('button,a')].filter(e=>/공감|좋아요/.test((e.innerText||'')+' '+(e.getAttribute('aria-label')||'')));
+        const button=candidates.find(e=>!/true|on|active|취소|해제|선택됨/.test((e.getAttribute('aria-pressed')||'')+' '+e.className+' '+(e.getAttribute('aria-label')||'')+' '+(e.title||'')));
+        if(!button)return candidates.length?'skipped':'failed';
+        button.click();await new Promise(r=>setTimeout(r,650));return 'hearted';
+      })()`);
+      const result = results.find(value => value === "hearted" || value === "skipped") || "failed";
+      if (result === "hearted") hearted++; else if (result === "skipped") skipped++; else failed++;
+    }
+    const summary = { posts: posts.length, hearted, skipped, failed };
+    send({ status: "웨일 최근 10일 공감 확인 완료", ...summary, complete: true });
+    return summary;
+  } finally { page.disconnect(); }
+}
+
+async function neighborCommentsInWhale(event, options) {
+  const blogId = String(options.blogId || "dicajohn").trim();
+  const phrases = unique(options.phrases || []);
+  const intervalSeconds = Math.max(15, Math.min(3600, Number(options.intervalSeconds) || 30));
+  const requestedMax = Number(options.maxPosts) || 20;
+  if (requestedMax > 200) throw new Error("이웃 새글은 한 번에 최대 200개까지 처리할 수 있습니다.");
+  if (!phrases.length) throw new Error("이웃 새글 댓글 문구를 한 개 이상 입력해 주세요.");
+  const maxPosts = Math.max(1, Math.min(200, requestedMax));
+  const send = payload => event.sender.send("neighbor-progress", payload);
+  const processedPath = userDataFile("neighbor-comments.json");
+  let processed = {};
+  try { processed = JSON.parse(fs.readFileSync(processedPath, "utf8")); } catch {}
+  neighborJobCancelled = false;
+  const page = await openWhalePage("https://section.blog.naver.com/BlogHome.naver");
+  try {
+    const values = await page.evaluateFrames(`(() => [...document.querySelectorAll('a[href*="blog.naver.com"]')]
+      .map(a=>({url:a.href,title:(a.innerText||'').trim()}))
+      .filter(x=>/(?:logNo=|blog\\.naver\\.com\\/[\\w.-]+\\/\\d+)/.test(x.url)))()`);
+    let links = values.flatMap(value => Array.isArray(value) ? value : []);
+    links = links.filter((item, index, all) => all.findIndex(x => x.url === item.url) === index).slice(0, maxPosts);
+    let done = 0, skipped = 0, failed = 0;
+    for (const item of links) {
+      if (neighborJobCancelled) break;
+      const key = item.url.replace(/[?#].*$/, "");
+      if (processed[key]) { skipped++; continue; }
+      send({ status: `웨일 이웃 글 확인: ${item.title || key}`, done, skipped, failed });
+      await page.navigate(item.url);
+      const results = await page.evaluateFrames(`(async () => {
+        const sleep=ms=>new Promise(r=>setTimeout(r,ms));const blogId=${JSON.stringify(blogId)};
+        const comments=[...document.querySelectorAll('[class*="comment"],[class*="u_cbox"]')];
+        if(comments.some(e=>(e.innerText||'').includes(blogId)))return 'skipped';
+        const toggle=[...document.querySelectorAll('button,a')].find(e=>/댓글/.test(e.innerText||''));
+        if(toggle){toggle.click();await sleep(450);}
+        const editor=document.querySelector('textarea,[contenteditable="true"]');if(!editor)return 'failed';
+        const phrases=${JSON.stringify(phrases)},phrase=phrases[Math.floor(Math.random()*phrases.length)];
+        editor.focus();
+        if(editor.tagName==='TEXTAREA'){
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(editor,phrase);
+          editor.dispatchEvent(new Event('input',{bubbles:true}));
+        }else{editor.textContent=phrase;editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:phrase}));}
+        await sleep(250);const scope=editor.closest('form,[class*="comment"],[class*="write"]')||document;
+        const submit=[...scope.querySelectorAll('button,a')].find(e=>/등록|확인/.test(e.innerText||'')&&!e.disabled);
+        if(!submit)return 'failed';submit.click();await sleep(700);return 'done';
+      })()`);
+      const result = results.find(value => value === "done" || value === "skipped") || "failed";
+      if (result === "done") {
+        done++; processed[key] = { at: new Date().toISOString() };
+        fs.writeFileSync(processedPath, JSON.stringify(processed, null, 2));
+      } else if (result === "skipped") skipped++; else failed++;
+      send({ status: `${intervalSeconds}초 후 다음 이웃 글로 이동`, done, skipped, failed });
+      for (let second = 0; second < intervalSeconds && !neighborJobCancelled; second++) await wait(1000);
+    }
+    const summary = { found: links.length, done, skipped, failed, stopped: neighborJobCancelled };
+    send({ status: neighborJobCancelled ? "사용자가 중지했습니다." : "웨일 이웃 새글 완료", ...summary, complete: true });
+    return summary;
+  } finally { page.disconnect(); }
+}
+
 ipcMain.handle("reply-comments", async (event, options) => {
+  if (process.platform === "darwin") return replyCommentsInWhale(event, options);
   const blogId = String(options.blogId || "").trim();
   const phrases = unique(options.phrases || []);
   if (!blogId) throw new Error("네이버 블로그 아이디를 입력해 주세요.");
@@ -297,6 +588,7 @@ ipcMain.handle("reply-comments", async (event, options) => {
 });
 
 ipcMain.handle("heart-recent-posts", async (event, options) => {
+  if (process.platform === "darwin") return heartRecentInWhale(event, options);
   const blogId = String(options.blogId || "dicajohn").trim();
   const win = getNaverWindow();
   const send = payload => event.sender.send("heart-progress", payload);
@@ -360,10 +652,13 @@ ipcMain.handle("stop-neighbor-comments", () => {
 });
 
 ipcMain.handle("comment-neighbor-feed", async (event, options) => {
+  if (process.platform === "darwin") return neighborCommentsInWhale(event, options);
   const blogId = String(options.blogId || "dicajohn").trim();
   const phrases = unique(options.phrases || []);
   const intervalSeconds = Math.max(15, Math.min(3600, Number(options.intervalSeconds) || 30));
-  const maxPosts = Math.max(1, Math.min(100, Number(options.maxPosts) || 20));
+  const requestedMax = Number(options.maxPosts) || 20;
+  if (requestedMax > 200) throw new Error("이웃 새글은 한 번에 최대 200개까지 처리할 수 있습니다.");
+  const maxPosts = Math.max(1, Math.min(200, requestedMax));
   if (!phrases.length) throw new Error("이웃 새글 댓글 문구를 한 개 이상 입력해 주세요.");
 
   neighborJobCancelled = false;

@@ -59,6 +59,7 @@ $("processImages").onclick = async () => {
 
 let selectedRealtime = "";
 let relatedWords = [];
+let prefixWords = [];
 
 function isEphemeral(keyword) {
   const value = String(keyword || "").toLowerCase();
@@ -70,21 +71,50 @@ function isEphemeral(keyword) {
   ].some(pattern => pattern.test(value));
 }
 
-async function loadRelated(seed) {
+function comparisonKey(value) {
+  return String(value || "").normalize("NFC").toLocaleLowerCase("ko-KR").replace(/[\W_]+/gu, "");
+}
+
+function mergedWords(items, excluded = new Set()) {
+  const seen = new Set(excluded);
+  return items.filter(x => !x.error && x.keyword).map(x => String(x.keyword).normalize("NFC").trim())
+    .filter(word => {
+      const key = comparisonKey(word);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+async function loadRelated(rawSeed) {
+  const seed = String(rawSeed || "").normalize("NFC").replace(/\s+/g, " ").trim();
+  if (!seed) {
+    $("relatedStatus").textContent = "검색할 키워드를 입력하세요.";
+    return;
+  }
   selectedRealtime = seed;
   document.querySelectorAll(".keyword-option").forEach(row =>
     row.classList.toggle("selected", row.dataset.keyword === seed));
-  $("selectedKeyword").textContent = `선택: ${seed}`;
+  $("manualKeyword").value = seed;
+  $("selectedKeyword").textContent = `전체 문구: ${seed}`;
   $("keywordList").innerHTML = '<div class="loading"><span></span>연관 검색어 조회 중</div>';
+  $("prefixList").innerHTML = "";
   $("relatedStatus").textContent = "";
+  $("prefixStatus").textContent = "";
   $("copyRelated").disabled = true;
+  $("copyPrefix").disabled = true;
   try {
-    const items = await window.picture.collectKeywords(seed);
+    const prefix = seed.split(" ").length > 1 ? seed.split(" ")[0] : "";
+    const [items, prefixItems] = await Promise.all([
+      window.picture.collectKeywords(seed),
+      prefix ? window.picture.collectKeywords(prefix) : Promise.resolve([])
+    ]);
     const failed = items.filter(x => x.error).map(x => x.source);
-    const seen = new Set();
-    relatedWords = items.filter(x => !x.error && x.keyword).map(x => x.keyword.trim())
-      .filter(word => word && word !== seed && !seen.has(word.toLocaleLowerCase("ko-KR")) &&
-        seen.add(word.toLocaleLowerCase("ko-KR")));
+    const excluded = new Set([comparisonKey(seed)]);
+    relatedWords = mergedWords(items, excluded);
+    const prefixExcluded = new Set([comparisonKey(seed), comparisonKey(prefix)]);
+    relatedWords.forEach(word => prefixExcluded.add(comparisonKey(word)));
+    prefixWords = prefix ? mergedWords(prefixItems, prefixExcluded) : [];
     $("keywordList").innerHTML = relatedWords.length
       ? relatedWords.map(word => `<div class="related-item">${escapeHtml(word)}</div>`).join("")
       : '<div class="selected-empty">표시할 연관 검색어가 없습니다.</div>';
@@ -92,8 +122,20 @@ async function loadRelated(seed) {
       ? `${relatedWords.length}개 · ${[...new Set(failed)].join(", ")} 조회 결과 없음`
       : `중복 제거된 연관 검색어 ${relatedWords.length}개`;
     $("copyRelated").disabled = !relatedWords.length;
+    $("prefixKeyword").textContent = prefix ? `첫 단어 추가 검색: ${prefix}` : "첫 단어 추가 검색";
+    $("prefixList").innerHTML = prefixWords.length
+      ? prefixWords.map(word => `<div class="related-item">${escapeHtml(word)}</div>`).join("")
+      : "";
+    const prefixFailed = prefixItems.filter(x => x.error).map(x => x.source);
+    $("prefixStatus").textContent = prefix
+      ? (prefixWords.length
+          ? `상단과 중복 제거 · 추가 연관 검색어 ${prefixWords.length}개${prefixFailed.length ? ` · ${[...new Set(prefixFailed)].join(", ")} 조회 실패` : ""}`
+          : "상단 결과와 중복되지 않는 추가 검색어가 없습니다.")
+      : "여러 단어를 검색하면 첫 단어 결과가 중복 없이 표시됩니다.";
+    $("copyPrefix").disabled = !prefixWords.length;
   } catch (error) {
     relatedWords = [];
+    prefixWords = [];
     $("keywordList").innerHTML = "";
     $("relatedStatus").textContent = `조회 실패: ${error.message}`;
   }
@@ -131,10 +173,22 @@ async function loadRealtime() {
 }
 
 $("refreshRealtime").onclick = loadRealtime;
+$("manualSearch").onclick = () => loadRelated($("manualKeyword").value);
+$("manualKeyword").onkeydown = event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    loadRelated($("manualKeyword").value);
+  }
+};
 $("copyRelated").onclick = async () => {
   if (!relatedWords.length) return;
   await navigator.clipboard.writeText(relatedWords.join("\n"));
   $("relatedStatus").textContent = `중복 없는 연관 검색어 ${relatedWords.length}개를 복사했습니다.`;
+};
+$("copyPrefix").onclick = async () => {
+  if (!prefixWords.length) return;
+  await navigator.clipboard.writeText(prefixWords.join("\n"));
+  $("prefixStatus").textContent = `중복 없는 첫 단어 추가 결과 ${prefixWords.length}개를 복사했습니다.`;
 };
 
 function settings() {
@@ -172,6 +226,7 @@ $("neighborStart").onclick = async () => {
   try {
     await saveSettings();
     const s = settings();
+    if (s.maxPosts > 200) throw new Error("이웃 새글은 한 번에 최대 200개까지 입력할 수 있습니다.");
     const result = await window.picture.commentNeighborFeed({
       blogId: s.blogId, phrases: s.neighborPhrases,
       intervalSeconds: s.intervalSeconds, maxPosts: s.maxPosts
