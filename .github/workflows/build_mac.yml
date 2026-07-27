@@ -26,6 +26,26 @@ jobs:
       - name: Build Apple Silicon app
         working-directory: mac-app
         run: npm run build:mac
+      - name: Verify ad-hoc signature and launch
+        working-directory: mac-app
+        run: |
+          APP_PATH="dist/mac-arm64/Picture Cleaner.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign -d --entitlements :- "$APP_PATH"
+          "$APP_PATH/Contents/MacOS/Picture Cleaner" --smoke-test
+      - name: Create Mac installation package
+        working-directory: mac-app
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          PACKAGE_DIR="dist/Picture-Cleaner-M1-$VERSION"
+          ZIP_PATH="dist/Picture-Cleaner-M1-$VERSION.zip"
+          mkdir -p "$PACKAGE_DIR"
+          ditto "dist/mac-arm64/Picture Cleaner.app" "$PACKAGE_DIR/Picture Cleaner.app"
+          cp "Install-Picture-Cleaner.command" "$PACKAGE_DIR/Install-Picture-Cleaner.command"
+          cp "MAC-INSTALL.txt" "$PACKAGE_DIR/MAC-INSTALL.txt"
+          chmod 755 "$PACKAGE_DIR/Install-Picture-Cleaner.command"
+          ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_DIR" "$ZIP_PATH"
+          unzip -l "$ZIP_PATH" | grep -E "Picture Cleaner.app/Contents/MacOS/Picture Cleaner|Install-Picture-Cleaner.command"
       - uses: actions/upload-artifact@v4
         with:
           name: Picture-Cleaner-M1

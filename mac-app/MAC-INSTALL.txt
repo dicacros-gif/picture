@@ -1,0 +1,11 @@
+Picture Cleaner M1 설치 방법
+
+1. ZIP 파일의 압축을 완전히 풉니다.
+2. Install-Picture-Cleaner.command를 Control-클릭한 후 '열기'를 선택합니다.
+3. 설치 도구가 ~/Applications/Picture Cleaner.app에 복사하고,
+   다운로드 격리 속성과 코드 서명을 확인한 뒤 앱을 실행합니다.
+4. 다음 실행부터 Finder의 사용자 응용 프로그램 폴더에서
+   Picture Cleaner.app을 바로 실행하면 됩니다.
+
+Apple Developer ID 공증판이 아니므로, 처음 설치 도구를 열 때 macOS가
+확인을 요청할 수 있습니다. 설치 도구는 이 앱 외의 보안 설정을 변경하지 않습니다.

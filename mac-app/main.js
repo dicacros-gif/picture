@@ -3,6 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const isSmokeTest = process.argv.includes("--smoke-test");
 
 let mainWindow;
 let naverWindow;
@@ -221,11 +222,12 @@ async function requireNaverWhaleLogin(page) {
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
+    show: !isSmokeTest,
     width: 1180,
     height: 820,
     minWidth: 940,
     minHeight: 680,
-    fullscreen: process.platform === "darwin",
+    fullscreen: process.platform === "darwin" && !isSmokeTest,
     titleBarStyle: "hiddenInset",
     backgroundColor: "#f4f7fb",
     webPreferences: {
@@ -234,6 +236,10 @@ function createMainWindow() {
       nodeIntegration: false
     }
   });
+  if (isSmokeTest) {
+    mainWindow.webContents.once("did-finish-load", () => app.exit(0));
+    mainWindow.webContents.once("did-fail-load", () => app.exit(1));
+  }
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 

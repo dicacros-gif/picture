@@ -1,13 +1,13 @@
 {
   "name": "picture-cleaner-mac",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "Picture Cleaner for Apple Silicon Mac",
   "main": "main.js",
   "author": "dicacros-gif",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "build:mac": "electron-builder --mac zip --arm64"
+    "build:mac": "electron-builder --mac dir --arm64"
   },
   "devDependencies": {
     "electron": "37.2.3",
@@ -17,6 +17,7 @@
     "appId": "com.dicacros.picturecleaner.mac",
     "productName": "Picture Cleaner",
     "asar": true,
+    "forceCodeSigning": true,
     "files": [
       "main.js",
       "preload.js",
@@ -30,7 +31,10 @@
           "arch": ["arm64"]
         }
       ],
-      "identity": null,
+      "identity": "-",
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.mac.plist",
+      "entitlementsInherit": "entitlements.mac.plist",
       "artifactName": "Picture-Cleaner-M1-${version}.${ext}"
     }
   }
