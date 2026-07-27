@@ -42,4 +42,4 @@ npm ci
 npm run build:mac
 ```
 
-결과물은 `dist/Picture-Cleaner-M1-1.7.1.zip`입니다.
+결과물은 `dist/Picture-Cleaner-M1-1.7.2.zip`입니다.

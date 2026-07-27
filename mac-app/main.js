@@ -1,7 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, shell, session, nativeImage } = require("electron");
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const crypto = require("crypto");
 const isSmokeTest = process.argv.includes("--smoke-test");
 
@@ -126,10 +126,27 @@ class CdpPage {
 }
 
 function whaleExecutable() {
-  const candidates = [
-    "/Applications/Naver Whale.app/Contents/MacOS/Naver Whale",
-    path.join(app.getPath("home"), "Applications/Naver Whale.app/Contents/MacOS/Naver Whale")
+  const applicationBundles = [
+    "/Applications/Whale.app",
+    path.join(app.getPath("home"), "Applications/Whale.app"),
+    "/Applications/Naver Whale.app",
+    path.join(app.getPath("home"), "Applications/Naver Whale.app")
   ];
+  try {
+    const spotlightResult = execFileSync(
+      "/usr/bin/mdfind",
+      ["kMDItemCFBundleIdentifier == 'com.naver.Whale'"],
+      { encoding: "utf8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    applicationBundles.push(...spotlightResult.split(/\r?\n/).map(value => value.trim()).filter(Boolean));
+  } catch {}
+  const candidates = [];
+  for (const bundle of [...new Set(applicationBundles)]) {
+    candidates.push(
+      path.join(bundle, "Contents/MacOS/Whale"),
+      path.join(bundle, "Contents/MacOS/Naver Whale")
+    );
+  }
   return candidates.find(candidate => fs.existsSync(candidate));
 }
 
