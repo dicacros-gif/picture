@@ -26,6 +26,12 @@ jobs:
       - name: Build Apple Silicon app
         working-directory: mac-app
         run: npm run build:mac
+      - name: Apply Apple Silicon ad-hoc signature
+        working-directory: mac-app
+        run: |
+          APP_PATH="dist/mac-arm64/Picture Cleaner.app"
+          codesign --force --deep --sign - --timestamp=none --options runtime \
+            --entitlements "entitlements.mac.plist" "$APP_PATH"
       - name: Verify ad-hoc signature and launch
         working-directory: mac-app
         run: |

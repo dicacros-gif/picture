@@ -17,7 +17,6 @@
     "appId": "com.dicacros.picturecleaner.mac",
     "productName": "Picture Cleaner",
     "asar": true,
-    "forceCodeSigning": true,
     "files": [
       "main.js",
       "preload.js",
@@ -31,7 +30,7 @@
           "arch": ["arm64"]
         }
       ],
-      "identity": "-",
+      "identity": null,
       "hardenedRuntime": true,
       "entitlements": "entitlements.mac.plist",
       "entitlementsInherit": "entitlements.mac.plist",
