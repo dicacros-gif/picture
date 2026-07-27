@@ -212,7 +212,11 @@ async function loadRealtime() {
   realtimeTotals = { crawled: 0, usable: 0, creator: 0 };
   try {
     const result = await window.picture.collectRealtime();
-    const rendered = realtimeSources.map(source => keywordSourceGroup(source, result[source], 10));
+    const rendered = realtimeSources.map(source => keywordSourceGroup(
+      result._sourceModes?.[source] ? `${source} · ${result._sourceModes[source]}` : source,
+      result[source],
+      10
+    ));
     realtimeTotals.crawled = rendered.reduce((sum, group) => sum + group.rawCount, 0);
     realtimeTotals.usable = rendered.reduce((sum, group) => sum + group.usableCount, 0);
     $("realtimeSources").innerHTML = rendered.map(group => group.html).join("");

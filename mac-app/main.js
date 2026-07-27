@@ -280,9 +280,13 @@ function getNaverWindow() {
   return naverWindow;
 }
 
-async function fetchText(url) {
+async function fetchText(url, timeoutMs = 10000) {
   const response = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X 14_5) AppleWebKit/537.36 Chrome/126 Safari/537.36" }
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Apple Silicon Mac OS X 14_5) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+      "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.7"
+    },
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   const bytes = await response.arrayBuffer();
@@ -308,6 +312,90 @@ async function waitForPage(win, predicate, timeout = 18000) {
   return false;
 }
 
+function extractEmbeddedJson(source, marker) {
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const start = source.indexOf("{", markerIndex + marker.length);
+  if (start < 0) return null;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < source.length; index++) {
+    const char = source[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quoted = false;
+      continue;
+    }
+    if (char === '"') quoted = true;
+    else if (char === "{") depth++;
+    else if (char === "}" && --depth === 0) {
+      try { return JSON.parse(source.slice(start, index + 1)); } catch { return null; }
+    }
+  }
+  return null;
+}
+
+function extractDaumHomepageTrends(html, limit = 10) {
+  const data = extractEmbeddedJson(String(html || ""), "window.tillerInitData=");
+  if (data) {
+    const stack = [data];
+    while (stack.length) {
+      const node = stack.pop();
+      if (!node || typeof node !== "object") continue;
+      if (node.uiType === "REALTIME_TREND_TOP") {
+        const keywords = unique((node.contents?.data?.keywords || []).map(item => item?.keyword));
+        if (keywords.length) return keywords.slice(0, limit);
+      }
+      if (Array.isArray(node)) stack.push(...node);
+      else stack.push(...Object.values(node));
+    }
+  }
+
+  const start = String(html || "").indexOf('class="d_trendrank"');
+  const section = start >= 0 ? String(html).slice(start, start + 60000) : String(html || "");
+  const keywords = [];
+  for (const match of section.matchAll(/data-tiara-copy="([^"]+)"/g)) {
+    const value = match[1]
+      .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    if (value && !keywords.includes(value)) keywords.push(value);
+    if (keywords.length >= limit) break;
+  }
+  return unique(keywords).slice(0, limit);
+}
+
+function decodeXmlText(value) {
+  return String(value || "")
+    .replace(/^<!\[CDATA\[([\s\S]*)\]\]>$/, "$1")
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&#(\d+);/g, (_match, code) => String.fromCodePoint(Number(code)))
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .trim();
+}
+
+function extractGoogleTrendsRss(xml, limit = 10) {
+  const keywords = [];
+  for (const item of String(xml || "").matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)) {
+    const title = item[1].match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+    const keyword = decodeXmlText(title?.[1]);
+    if (keyword && !keywords.includes(keyword)) keywords.push(keyword);
+    if (keywords.length >= limit) break;
+  }
+  return unique(keywords).slice(0, limit);
+}
+
+async function collectDaumHomepageTrends() {
+  return extractDaumHomepageTrends(await fetchText("https://www.daum.net/", 6500), 10);
+}
+
+async function collectGoogleTrendsRss() {
+  return extractGoogleTrendsRss(
+    await fetchText("https://trends.google.com/trending/rss?geo=KR", 6500), 10);
+}
+
 async function collectRealtimeDirect() {
   const definitions = [
     ["다음", "https://adsensefarm.kr/realtime/daum.php", data => data?.data],
@@ -318,18 +406,42 @@ async function collectRealtimeDirect() {
   ];
   const entries = await Promise.all(definitions.map(async ([source, url, pick]) => {
     try {
-      const data = JSON.parse(await fetchText(url));
+      const data = JSON.parse(await fetchText(url, 5500));
       return [source, unique(pick(data) || []).slice(0, 10)];
     } catch {
       return [source, []];
     }
   }));
-  return Object.fromEntries(entries);
+  const output = Object.fromEntries(entries);
+  const sourceModes = {};
+  if ((output["다음"] || []).length < 10) {
+    try {
+      const fallback = await collectDaumHomepageTrends();
+      output["다음"] = unique([...(output["다음"] || []), ...fallback]).slice(0, 10);
+      if (fallback.length) sourceModes["다음"] = "다음 홈페이지 직접";
+    } catch {}
+  }
+  if ((output["구글"] || []).length < 10) {
+    try {
+      const fallback = await collectGoogleTrendsRss();
+      output["구글"] = unique([...(output["구글"] || []), ...fallback]).slice(0, 10);
+      if (fallback.length) sourceModes["구글"] = "Google Trends RSS";
+    } catch {}
+  }
+  return { output, sourceModes };
 }
 
 ipcMain.handle("collect-realtime", async () => {
-  const output = await collectRealtimeDirect();
-  if (Object.values(output).every(values => values.length >= 10)) return output;
+  const { output, sourceModes } = await collectRealtimeDirect();
+  if (Object.values(output).every(values => values.length >= 10)) {
+    return { ...output, _sourceModes: sourceModes };
+  }
+  if ((output["다음"] || []).length >= 10 &&
+      (output["구글"] || []).length >= 10 &&
+      (output["네이버 시그널"] || []).length >= 10 &&
+      !(output["크리에이터 어드바이저"] || []).length) {
+    return { ...output, _sourceModes: sourceModes };
+  }
   const collector = new BrowserWindow({
     show: false,
     width: 1400,
@@ -339,7 +451,7 @@ ipcMain.handle("collect-realtime", async () => {
   try {
     await collector.loadURL("https://adsensefarm.kr/realtime");
     await waitForPage(collector, `(() => [...document.querySelectorAll('.item .kwds .keyword')]
-      .some(e => (e.innerText||'').trim() && (e.innerText||'').trim() !== '-'))()`);
+      .some(e => (e.innerText||'').trim() && (e.innerText||'').trim() !== '-'))()`, 6500);
     const adsense = await collector.webContents.executeJavaScript(`(() => {
       const defs = [
         {source:'다음', titles:['다음 실시간 검색어']},
@@ -370,7 +482,7 @@ ipcMain.handle("collect-realtime", async () => {
   } finally {
     if (!collector.isDestroyed()) collector.destroy();
   }
-  return output;
+  return { ...output, _sourceModes: sourceModes };
 });
 
 function extractCreatorAdvisorKeywords(textBlocks, category, limit = 20) {
