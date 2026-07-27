@@ -3,6 +3,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("picture", {
   saveImages: images => ipcRenderer.invoke("save-images", images),
   collectRealtime: () => ipcRenderer.invoke("collect-realtime"),
+  collectCreatorAdvisor: blogId => ipcRenderer.invoke("collect-creator-advisor", blogId),
   collectKeywords: seed => ipcRenderer.invoke("collect-keywords", seed),
   googleImageSearch: keyword => ipcRenderer.invoke("google-image-search", keyword),
   openLastGoogleImages: () => ipcRenderer.invoke("open-last-google-images"),
@@ -20,5 +21,7 @@ contextBridge.exposeInMainWorld("picture", {
   onReplyProgress: callback => ipcRenderer.on("reply-progress", (_e, value) => callback(value)),
   onHeartProgress: callback => ipcRenderer.on("heart-progress", (_e, value) => callback(value)),
   onNeighborProgress: callback => ipcRenderer.on("neighbor-progress", (_e, value) => callback(value)),
-  onGoogleImageProgress: callback => ipcRenderer.on("google-image-progress", (_e, value) => callback(value))
+  onGoogleImageProgress: callback => ipcRenderer.on("google-image-progress", (_e, value) => callback(value)),
+  onCreatorAdvisorProgress: callback =>
+    ipcRenderer.on("creator-advisor-progress", (_e, value) => callback(value))
 });

@@ -170,31 +170,113 @@ function escapeHtml(value) {
     ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 }
 
+const realtimeSources = ["다음", "구글", "크리에이터 어드바이저", "네이버 시그널"];
+const creatorAdvisorCategories = ["세계여행", "비즈니스·경제", "IT·컴퓨터", "교육·학문", "자동차", "게임"];
+let realtimeTotals = { crawled: 0, usable: 0, creator: 0 };
+let creatorAdvisorLoading = false;
+
+function keywordSourceGroup(source, input, limit, options = {}) {
+  const raw = [...new Set((input || [])
+    .map(value => String(value).normalize("NFC").trim()).filter(Boolean))].slice(0, limit);
+  const words = options.excludeEphemeral === false ? raw : raw.filter(word => !isEphemeral(word));
+  const rows = words.map((word, index) =>
+    `<div class="keyword-option" data-keyword="${escapeHtml(word)}"><span class="radio"></span><span>${index + 1}. ${escapeHtml(word)}</span></div>`
+  ).join("");
+  return {
+    rawCount: raw.length,
+    usableCount: words.length,
+    html: `<div class="source-group${options.creator ? " creator-source" : ""}">
+      <div class="source-name"><span>${escapeHtml(source)}</span><span class="source-count">${raw.length}/${limit}</span></div>
+      ${rows || `<div class="pane-status">${escapeHtml(options.emptyMessage || "가져온 결과 없음")}</div>`}
+    </div>`
+  };
+}
+
+function wireKeywordOptions(root = $("realtimeSources")) {
+  root.querySelectorAll(".keyword-option").forEach(row =>
+    row.onclick = () => loadRelated(row.dataset.keyword));
+}
+
+function renderRealtimeSummary(extra = "") {
+  const creatorSummary = realtimeTotals.creator
+    ? ` · 검색 유입 트렌드 ${realtimeTotals.creator}/120개`
+    : "";
+  $("sourceSummary").textContent =
+    `실시간 ${realtimeTotals.crawled}/40개 수집 · 일회성 제외 ${realtimeTotals.usable}개${creatorSummary}${extra}`;
+}
+
 async function loadRealtime() {
   $("realtimeSources").innerHTML = '<div class="loading"><span></span>4개 출처 연결 중</div>';
   $("sourceSummary").textContent = "실시간 검색어를 자동으로 불러오는 중입니다…";
   setBusy($("refreshRealtime"), true);
+  realtimeTotals = { crawled: 0, usable: 0, creator: 0 };
   try {
     const result = await window.picture.collectRealtime();
-    const sources = ["다음", "구글", "크리에이터 어드바이저", "네이버 시그널"];
-    let crawled = 0, usable = 0;
-    $("realtimeSources").innerHTML = sources.map(source => {
-      const raw = [...new Set((result[source] || []).map(x => String(x).trim()).filter(Boolean))];
-      const words = raw.filter(word => !isEphemeral(word));
-      crawled += raw.length; usable += words.length;
-      const rows = words.map((word, index) =>
-        `<div class="keyword-option" data-keyword="${escapeHtml(word)}"><span class="radio"></span><span>${index + 1}. ${escapeHtml(word)}</span></div>`
-      ).join("");
-      return `<div class="source-group"><div class="source-name">${source}<span class="source-count">${raw.length}/10</span></div>${rows || '<div class="pane-status">가져온 결과 없음</div>'}</div>`;
-    }).join("");
-    $("realtimeSources").querySelectorAll(".keyword-option").forEach(row =>
-      row.onclick = () => loadRelated(row.dataset.keyword));
-    $("sourceSummary").textContent = `4개 출처 총 ${crawled}/40개 수집 · 일회성 제외 ${usable}개`;
+    const rendered = realtimeSources.map(source => keywordSourceGroup(source, result[source], 10));
+    realtimeTotals.crawled = rendered.reduce((sum, group) => sum + group.rawCount, 0);
+    realtimeTotals.usable = rendered.reduce((sum, group) => sum + group.usableCount, 0);
+    $("realtimeSources").innerHTML = rendered.map(group => group.html).join("");
+    wireKeywordOptions();
+    renderRealtimeSummary(" · 검색 유입 트렌드 6개 분야 연결 중…");
   } catch (error) {
     $("realtimeSources").innerHTML = "";
     $("sourceSummary").textContent = `실시간 검색어 수집 실패: ${error.message}`;
-  } finally { setBusy($("refreshRealtime"), false); }
+  }
+
+  const creatorSlot = document.createElement("div");
+  creatorSlot.id = "creatorAdvisorSources";
+  creatorSlot.innerHTML = `
+    <div class="source-divider">
+      <b>크리에이터 어드바이저 · 검색 유입 트렌드</b>
+      <span>6개 분야 · 각 20개</span>
+    </div>
+    ${creatorAdvisorCategories.map(category => `
+      <div class="source-group creator-source">
+        <div class="source-name"><span>${escapeHtml(category)}</span><span class="source-count">연결 중</span></div>
+        <div class="loading compact-loading"><span></span>인기 유입 검색어 준비 중</div>
+      </div>`).join("")}`;
+  $("realtimeSources").appendChild(creatorSlot);
+
+  creatorAdvisorLoading = true;
+  try {
+    const result = await window.picture.collectCreatorAdvisor("macdcross");
+    const rendered = creatorAdvisorCategories.map(category =>
+      keywordSourceGroup(category, result.groups?.[category], 20, {
+        creator: true,
+        excludeEphemeral: false,
+        emptyMessage: result.errors?.[category] || "가져온 결과 없음"
+      }));
+    realtimeTotals.creator = rendered.reduce((sum, group) => sum + group.rawCount, 0);
+    creatorSlot.innerHTML = `
+      <div class="source-divider">
+        <b>크리에이터 어드바이저 · 검색 유입 트렌드</b>
+        <span>6개 분야 · 각 20개</span>
+      </div>
+      ${rendered.map(group => group.html).join("")}`;
+    wireKeywordOptions(creatorSlot);
+    const failedCount = Object.keys(result.errors || {}).length;
+    renderRealtimeSummary(failedCount ? ` · ${failedCount}개 분야 조회 실패` : "");
+  } catch (error) {
+    creatorSlot.innerHTML = `
+      <div class="source-divider">
+        <b>크리에이터 어드바이저 · 검색 유입 트렌드</b>
+        <span>웨일 확인 필요</span>
+      </div>
+      ${creatorAdvisorCategories.map(category => keywordSourceGroup(category, [], 20, {
+        creator: true,
+        emptyMessage: "웨일 로그인 후 새로고침해 주세요."
+      }).html).join("")}`;
+    renderRealtimeSummary(` · 검색 유입 트렌드 조회 실패: ${error.message}`);
+  } finally {
+    creatorAdvisorLoading = false;
+    setBusy($("refreshRealtime"), false);
+  }
 }
+
+window.picture.onCreatorAdvisorProgress(progress => {
+  if (!creatorAdvisorLoading || progress.complete) return;
+  renderRealtimeSummary(` · ${progress.index}/${progress.total} ${progress.status}`);
+});
 
 $("refreshRealtime").onclick = loadRealtime;
 $("manualSearch").onclick = () => loadRelated($("manualKeyword").value);

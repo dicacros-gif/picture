@@ -13,6 +13,15 @@ let lastGoogleImageSearch = null;
 let lastGoogleCaptureFolder = "";
 let activeNaverTask = "";
 const WHALE_DEBUG_PORT = 9339;
+const CREATOR_ADVISOR_BLOG_ID = "macdcross";
+const CREATOR_ADVISOR_CATEGORIES = [
+  "세계여행",
+  "비즈니스·경제",
+  "IT·컴퓨터",
+  "교육·학문",
+  "자동차",
+  "게임"
+];
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const userDataFile = name => path.join(app.getPath("userData"), name);
@@ -102,6 +111,14 @@ class CdpPage {
       clip: { x: clip.x, y: clip.y, width: clip.width, height: clip.height, scale: 1 }
     });
     return Buffer.from(result.data || "", "base64");
+  }
+  async close() {
+    try {
+      await this.ready;
+      this.socket.send(JSON.stringify({ id: this.nextId++, method: "Page.close", params: {} }));
+      await wait(200);
+    } catch {}
+    this.disconnect();
   }
   disconnect() {
     try { this.socket.close(); } catch {}
@@ -355,6 +372,172 @@ ipcMain.handle("collect-realtime", async () => {
   }
   return output;
 });
+
+function extractCreatorAdvisorKeywords(textBlocks, category, limit = 20) {
+  const ignored = new Set([
+    "검색 유입 트렌드",
+    "메인 유입 트렌드",
+    "주제별 비교",
+    "주제별 트렌드",
+    "주제별 인기유입검색어",
+    "성별,연령별 인기유입검색어",
+    "유입순 보기",
+    "설정순 보기",
+    "new",
+    category,
+    category.replace(/·/g, " ")
+  ]);
+  const normalizedCategory = category.replace(/[\s·]/g, "");
+  let best = [];
+  for (const block of textBlocks) {
+    const lines = String(block || "").split(/\r?\n/)
+      .map(line => line.replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const start = lines.findIndex(line => line.replace(/[\s·]/g, "") === normalizedCategory);
+    if (start < 0) continue;
+    const values = [];
+    for (const line of lines.slice(start + 1)) {
+      const value = line
+        .replace(/\s*(?:new|[▲△▼▽]\s*\d+|-)\s*$/i, "")
+        .replace(/^\s*\d+\s*[.)]?\s*/, "")
+        .trim();
+      if (!value || ignored.has(value) ||
+          /^(?:new|[▲△▼▽]?\s*\d+|-|\d+)$/i.test(value) ||
+          value.length > 80) continue;
+      if (!values.includes(value)) values.push(value);
+      if (values.length >= limit) break;
+    }
+    if (values.length > best.length) best = values;
+    if (best.length >= limit) break;
+  }
+  return best.slice(0, limit);
+}
+
+function creatorAdvisorClickExpression(label) {
+  return `(async () => {
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const wanted = ${JSON.stringify(label)};
+    const visible = element => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 &&
+        style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const nodes = [...document.querySelectorAll('button,a,[role="button"],li,span,div')];
+    const target = nodes.find(element =>
+      visible(element) &&
+      (element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim() === wanted);
+    if (!target) return false;
+    target.click();
+    await sleep(650);
+    return true;
+  })()`;
+}
+
+function creatorAdvisorCategoryExpression(category, limit = 20) {
+  return `(async () => {
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const wanted = ${JSON.stringify(category)}.replace(/[\\s·]/g, '');
+    const findSlide = () => {
+      for (const swiper of document.querySelectorAll('.u_ni_search_swiper')) {
+        const slides = [...swiper.querySelectorAll('.swiper-slide')];
+        const index = slides.findIndex(slide => {
+          const lines = (slide.innerText || slide.textContent || '').split('\\n')
+            .map(line => line.trim()).filter(Boolean);
+          return (lines[0] || '').replace(/[\\s·]/g, '') === wanted;
+        });
+        if (index < 0) continue;
+        if (swiper.swiper && typeof swiper.swiper.slideTo === 'function') {
+          swiper.swiper.slideTo(index, 0);
+        } else {
+          swiper.scrollLeft = Math.max(0, index * swiper.clientWidth);
+          slides[index].scrollIntoView({ block: 'nearest', inline: 'center' });
+        }
+        return slides[index];
+      }
+      return null;
+    };
+    const started = Date.now();
+    let activated = false;
+    while (Date.now() - started < 25000) {
+      const slide = findSlide();
+      if (slide) {
+        activated = true;
+        const text = (slide.innerText || slide.textContent || '').trim();
+        const lines = text.split('\\n').map(line => line.trim()).filter(Boolean);
+        if (lines.length >= ${Math.min(limit, 10)} &&
+            !text.includes('데이터를 불러오고 있습니다')) return { activated, text };
+      }
+      await sleep(400);
+    }
+    return { activated, text: '' };
+  })()`;
+}
+
+async function collectCreatorAdvisorTrends(event, blogId = CREATOR_ADVISOR_BLOG_ID) {
+  if (process.platform !== "darwin") {
+    throw new Error("크리에이터 어드바이저 자동 조회는 맥용 앱의 네이버 웨일에서 실행됩니다.");
+  }
+  const normalizedBlogId =
+    String(blogId || CREATOR_ADVISOR_BLOG_ID).trim() || CREATOR_ADVISOR_BLOG_ID;
+  const url =
+    `https://creator-advisor.naver.com/naver_blog/${encodeURIComponent(normalizedBlogId)}/trends`;
+  const page = await openWhalePage(url);
+  let loggedIn = false;
+  const groups = {};
+  const errors = {};
+  const send = payload => event.sender.send("creator-advisor-progress", payload);
+  try {
+    await requireNaverWhaleLogin(page);
+    loggedIn = true;
+    await page.evaluateMain(`(async () => {
+      const started = Date.now();
+      while (document.readyState !== 'complete' && Date.now() - started < 20000) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      return document.readyState;
+    })()`);
+    await page.evaluateMain(creatorAdvisorClickExpression("검색 유입 트렌드")).catch(() => false);
+    await page.evaluateMain(creatorAdvisorClickExpression("주제별 인기유입검색어")).catch(() => false);
+
+    for (let index = 0; index < CREATOR_ADVISOR_CATEGORIES.length; index++) {
+      const category = CREATOR_ADVISOR_CATEGORIES[index];
+      send({
+        category,
+        index: index + 1,
+        total: CREATOR_ADVISOR_CATEGORIES.length,
+        status: `${category} 인기 유입 검색어를 가져오는 중`
+      });
+      try {
+        const result = await page.evaluateMain(creatorAdvisorCategoryExpression(category, 20));
+        if (!result?.activated) {
+          throw new Error(`'${category}' 분야 카드를 찾지 못했습니다.`);
+        }
+        const keywords = extractCreatorAdvisorKeywords([result.text], category, 20);
+        if (!keywords.length) {
+          throw new Error(`'${category}' 분야 키워드를 찾지 못했습니다.`);
+        }
+        groups[category] = keywords;
+      } catch (error) {
+        groups[category] = [];
+        errors[category] = error.message;
+      }
+    }
+    send({
+      index: CREATOR_ADVISOR_CATEGORIES.length,
+      total: CREATOR_ADVISOR_CATEGORIES.length,
+      status: "크리에이터 어드바이저 검색 유입 트렌드 조회 완료",
+      complete: true
+    });
+    return { groups, errors, categories: CREATOR_ADVISOR_CATEGORIES };
+  } finally {
+    if (loggedIn) await page.close(); else page.disconnect();
+  }
+}
+
+ipcMain.handle("collect-creator-advisor", (event, blogId) =>
+  runNaverTask("크리에이터 어드바이저 트렌드", () =>
+    collectCreatorAdvisorTrends(event, blogId)));
 
 ipcMain.handle("save-images", async (_event, images) => {
   const picked = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory", "createDirectory"] });
