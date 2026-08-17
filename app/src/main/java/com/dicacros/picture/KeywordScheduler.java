@@ -2,6 +2,7 @@ package com.dicacros.picture;
 
 import android.app.AlarmManager;
 import android.app.PendingIntent;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -9,13 +10,12 @@ import android.os.Build;
 final class KeywordScheduler {
 
     private static final int REQUEST_CODE = 7020;
-    private static final long INTERVAL_MS = 60L * 60L * 1000L;
+    private static final String LEGACY_ACTION =
+            "com.dicacros.picture.COLLECT_REALTIME_KEYWORDS";
+    private static final String LEGACY_RECEIVER =
+            "com.dicacros.picture.KeywordAlarmReceiver";
 
     private KeywordScheduler() {
-    }
-
-    static void ensureScheduled(Context context) {
-        schedule(context, System.currentTimeMillis() + INTERVAL_MS);
     }
 
     static void collectNow(Context context) {
@@ -30,35 +30,20 @@ final class KeywordScheduler {
         }
     }
 
-    static void scheduleNext(Context context) {
-        schedule(context, System.currentTimeMillis() + INTERVAL_MS);
-    }
-
-    private static void schedule(Context context, long triggerAt) {
+    static void cancelScheduled(Context context) {
         AlarmManager alarmManager =
                 (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
-        if (alarmManager == null) {
-            return;
-        }
-        PendingIntent pendingIntent = pendingIntent(context);
-        try {
-            if (Build.VERSION.SDK_INT >= 31 && !alarmManager.canScheduleExactAlarms()) {
-                alarmManager.setAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
-            } else {
-                alarmManager.setExactAndAllowWhileIdle(
-                        AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
+        Intent intent = new Intent();
+        intent.setComponent(new ComponentName(context.getPackageName(), LEGACY_RECEIVER));
+        intent.setAction(LEGACY_ACTION);
+        int flags = PendingIntent.FLAG_NO_CREATE | PendingIntent.FLAG_IMMUTABLE;
+        PendingIntent pendingIntent =
+                PendingIntent.getBroadcast(context, REQUEST_CODE, intent, flags);
+        if (pendingIntent != null) {
+            if (alarmManager != null) {
+                alarmManager.cancel(pendingIntent);
             }
-        } catch (SecurityException exception) {
-            alarmManager.setAndAllowWhileIdle(
-                    AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
+            pendingIntent.cancel();
         }
-    }
-
-    private static PendingIntent pendingIntent(Context context) {
-        Intent intent = new Intent(context, KeywordAlarmReceiver.class);
-        intent.setAction(KeywordAlarmReceiver.ACTION_COLLECT);
-        int flags = PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
-        return PendingIntent.getBroadcast(context, REQUEST_CODE, intent, flags);
     }
 }

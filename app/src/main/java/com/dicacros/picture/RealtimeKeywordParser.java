@@ -43,7 +43,8 @@ final class RealtimeKeywordParser {
                     + "if(defs[d].names.indexOf(title)>=0)card=cards[i];}"
                     + "if(!card)continue;var links=card.querySelectorAll('.kwds .keyword a');"
                     + "for(var k=0;k<links.length&&k<10;k++){"
-                    + "var text=(links[k].innerText||links[k].textContent||'').replace(/\\s+/g,' ').trim();"
+                    + "var text=(links[k].innerText||links[k].textContent||'')"
+                    + ".replace(/\\s+/g,' ').trim();"
                     + "if(text)out.push({keyword:text,source:defs[d].source,rank:k+1});}}"
                     + "return JSON.stringify(out);}catch(e){return JSON.stringify([]);}})();";
 

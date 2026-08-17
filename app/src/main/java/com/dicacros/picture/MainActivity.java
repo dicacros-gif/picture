@@ -13,7 +13,6 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -59,7 +58,6 @@ public class MainActivity extends Activity {
     private static final String OUTPUT_FOLDER = "Pictures/PictureCleaner";
     private static final String PREFS = "picture_main";
 
-    private static final int ANALYSIS_LONG_SIDE = 900;
     private static final int STRIP_ROWS = 256;
     private static final int MAX_DECODE_PIXELS = 32 * 1024 * 1024;
     private static final int TARGET_LONG = 2048;
@@ -84,8 +82,8 @@ public class MainActivity extends Activity {
         setContentView(createContentView());
         registerChallengeReceiver();
         updateStatus("오늘 캡처한 스크린샷을 크롭하고 해상도를 개선할 준비가 됐습니다.");
+        KeywordScheduler.cancelScheduled(this);
         KeywordScheduler.collectNow(this);
-        KeywordScheduler.ensureScheduled(this);
         maybeRequestAllFilesAccess();
         if (KeywordCollectorService.isChallengeRequired()) {
             showChallengeWebView();
@@ -142,7 +140,7 @@ public class MainActivity extends Activity {
                 v -> startActivity(new Intent(this, KeywordActivity.class)));
         root.addView(actionCard(
                 "STEP 2", "실시간 연관 검색어",
-                "앱 실행 시 4개 출처 40개를 수집하고, 일회성 이슈를 제외해 선택 가능한 주제로 보여줍니다.",
+                "다음·Google 직접 수집과 애드센스팜·시그널을 함께 새로고침하고 저장 시점별로 보여줍니다.",
                 keywordButton, UiKit.TEAL));
 
         blogWriterButton = createPrimaryButton("블로그 자동화 열기", UiKit.NAVY);
@@ -175,8 +173,8 @@ public class MainActivity extends Activity {
         challengeCard.addView(UiKit.badge(this, "사용자 확인", UiKit.TEAL));
         challengeCard.addView(UiKit.sectionTitle(this, "애드센스팜 로봇 확인"));
         challengeCard.addView(UiKit.body(this,
-                "자동 우회하지 않습니다. 아래 페이지에 확인 버튼이 보이면 직접 체크해 주세요. "
-                        + "확인이 끝나면 같은 쿠키로 실시간 검색어 수집을 자동 재개합니다."));
+                "아래 페이지에 확인 버튼이 보이면 직접 체크해 주세요. "
+                        + "확인이 끝나면 같은 쿠키로 수집을 자동 재개합니다."));
 
         challengeStatusText = UiKit.status(this);
         challengeStatusText.setText("확인 페이지를 불러오는 중입니다.");
@@ -231,8 +229,7 @@ public class MainActivity extends Activity {
         IntentFilter filter = new IntentFilter();
         filter.addAction(KeywordCollectorService.ACTION_CHALLENGE_REQUIRED);
         filter.addAction(KeywordCollectorService.ACTION_CHALLENGE_CLEARED);
-        registerReceiver(
-                challengeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        registerReceiver(challengeReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         challengeReceiverRegistered = true;
     }
 
@@ -242,7 +239,7 @@ public class MainActivity extends Activity {
         }
         challengeCard.setVisibility(View.VISIBLE);
         challengeStatusText.setText("로봇 확인이 필요합니다. 아래 페이지에서 직접 체크해 주세요.");
-        updateStatus("실시간 검색어 수집을 계속하려면 상단 로봇 확인을 완료해 주세요.");
+        updateStatus("애드센스팜 수집을 계속하려면 상단 로봇 확인을 완료해 주세요.");
         String currentUrl = challengeWebView.getUrl();
         if (currentUrl == null || "about:blank".equals(currentUrl)) {
             challengeWebView.loadUrl(ADSENSEFARM_URL);
@@ -298,7 +295,7 @@ public class MainActivity extends Activity {
                                 if (count >= 30) {
                                     CookieManager.getInstance().flush();
                                     challengeStatusText.setText(
-                                            "확인이 완료됐습니다. 40개 검색어 수집을 다시 시작합니다.");
+                                            "확인이 완료됐습니다. 네 출처 수집을 다시 시작합니다.");
                                     updateStatus("로봇 확인 완료 · 실시간 검색어 수집을 다시 시작합니다.");
                                     hideChallengeWebView();
                                     KeywordCollectorService.retryAfterChallenge(this);
@@ -531,127 +528,176 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------
     //  크롭
     // ---------------------------------------------------------------
+    /**
+     * 세로(위·아래)만 크롭한다. 가로(좌·우)는 절대 자르지 않는다.
+     * 배경이 검정이든 흰색이든 상관없이, 실제 사진(콘텐츠 밀도가 높은 행)만 남기고
+     * 위아래의 단색 여백과 희미한 글자 줄까지 제거한다.
+     */
     private Bitmap cropContent(Bitmap source) {
-        Rect bounds = detectContentBounds(source);
-        if (bounds.width() <= 0 || bounds.height() <= 0
-                || (bounds.width() == source.getWidth() && bounds.height() == source.getHeight())) {
-            return source;
+        int[] band = detectVerticalCropBand(source);
+        int top = band[0];
+        int bottom = band[1];
+        int h = source.getHeight();
+        if (top <= 0 && bottom >= h) {
+            return source; // 잘라낼 여백이 없음(전체가 콘텐츠)
         }
-        return Bitmap.createBitmap(source, bounds.left, bounds.top, bounds.width(), bounds.height());
+        if (bottom - top < h / 12) {
+            return source; // 검출이 너무 작으면 원본 유지(과잉 크롭 방지)
+        }
+        return Bitmap.createBitmap(source, 0, top, source.getWidth(), bottom - top);
     }
 
-    private Rect detectContentBounds(Bitmap fullBitmap) {
-        int fullW = fullBitmap.getWidth();
-        int fullH = fullBitmap.getHeight();
-        float scale = Math.min(1f, ANALYSIS_LONG_SIDE / (float) Math.max(fullW, fullH));
-        int aw = Math.max(1, Math.round(fullW * scale));
-        int ah = Math.max(1, Math.round(fullH * scale));
+    /** 실제 사진이 차지하는 세로 구간 [top, bottom)을 원본 좌표로 돌려준다(가로는 전폭 유지). */
+    private int[] detectVerticalCropBand(Bitmap full) {
+        int fullW = full.getWidth();
+        int fullH = full.getHeight();
+        int aw = Math.max(1, Math.min(fullW, 192));
+        int ah = Math.max(1, Math.min(fullH, 1800));
         Bitmap small = (aw == fullW && ah == fullH)
-                ? fullBitmap
-                : Bitmap.createScaledBitmap(fullBitmap, aw, ah, true);
-
+                ? full
+                : Bitmap.createScaledBitmap(full, aw, ah, true);
         int[] px = new int[aw * ah];
         small.getPixels(px, 0, aw, 0, 0, aw, ah);
-        if (small != fullBitmap) {
+        if (small != full) {
             small.recycle();
         }
 
-        boolean[] content = new boolean[aw * ah];
+        int[] rowMedian = new int[ah];
+        int[] lumaRow = new int[aw];
         for (int y = 0; y < ah; y++) {
-            for (int x = 0; x < aw; x++) {
-                int idx = y * aw + x;
-                int c = px[idx];
-                int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
-                int max = Math.max(r, Math.max(g, b));
-                int min = Math.min(r, Math.min(g, b));
-                int sat = max - min;
-                int lum = (r * 299 + g * 587 + b * 114) / 1000;
-                int edge = 0;
-                if (x + 1 < aw) {
-                    edge += Math.abs(lum - lumOf(px[idx + 1]));
-                }
-                if (y + 1 < ah) {
-                    edge += Math.abs(lum - lumOf(px[idx + aw]));
-                }
-                boolean flat = (lum <= 30 || lum >= 248) && sat < 14 && edge < 16;
-                content[idx] = !flat && (sat > 18 || edge > 22);
-            }
-        }
-
-        int[] rowScore = new int[ah];
-        for (int y = 0; y < ah; y++) {
-            int score = 0;
             int base = y * aw;
             for (int x = 0; x < aw; x++) {
-                if (content[base + x]) {
-                    score++;
-                }
+                lumaRow[x] = lumOf(px[base + x]);
             }
-            rowScore[y] = score;
-        }
-        boolean[] rowActive = smoothActive(rowScore, Math.max(1, aw / 12), 1);
-        int[] vBand = longestRun(rowActive);
-        int top = vBand[0];
-        int bottom = vBand[1];
-        if (bottom - top < ah / 8) {
-            return new Rect(0, 0, fullW, fullH);
+            rowMedian[y] = medianOf(lumaRow, aw);
         }
 
-        int[] colScore = new int[aw];
-        for (int x = 0; x < aw; x++) {
-            int score = 0;
-            for (int y = top; y < bottom; y++) {
-                if (content[y * aw + x]) {
-                    score++;
+        int edgeRows = Math.max(2, ah / 12);
+        int[] edgeMedians = new int[edgeRows * 2];
+        for (int i = 0; i < edgeRows; i++) {
+            edgeMedians[i] = rowMedian[i];
+            edgeMedians[edgeRows + i] = rowMedian[ah - edgeRows + i];
+        }
+        int edgeMedian = percentileOf(edgeMedians, 0.50f);
+        int backgroundLuma = percentileOf(edgeMedians, edgeMedian < 128 ? 0.25f : 0.75f);
+
+        final int blockCount = Math.min(24, aw);
+        float[] coverage = new float[ah];
+        for (int y = 0; y < ah; y++) {
+            int base = y * aw;
+            int activeBlocks = 0;
+            for (int block = 0; block < blockCount; block++) {
+                int startX = block * aw / blockCount;
+                int endX = Math.max(startX + 1, (block + 1) * aw / blockCount);
+                int count = endX - startX;
+                int sumLuma = 0;
+                int sumLumaSquared = 0;
+                int sumSaturation = 0;
+                for (int x = startX; x < endX; x++) {
+                    int color = px[base + x];
+                    int red = (color >> 16) & 0xFF;
+                    int green = (color >> 8) & 0xFF;
+                    int blue = color & 0xFF;
+                    int luma = lumOf(color);
+                    sumLuma += luma;
+                    sumLumaSquared += luma * luma;
+                    sumSaturation += Math.max(red, Math.max(green, blue))
+                            - Math.min(red, Math.min(green, blue));
+                }
+                float meanLuma = sumLuma / (float) count;
+                float variance = sumLumaSquared / (float) count - meanLuma * meanLuma;
+                float deviation = (float) Math.sqrt(Math.max(0f, variance));
+                float meanSaturation = sumSaturation / (float) count;
+                if (Math.abs(meanLuma - backgroundLuma) >= 18f
+                        || deviation >= 16f
+                        || meanSaturation >= 18f) {
+                    activeBlocks++;
                 }
             }
-            colScore[x] = score;
-        }
-        boolean[] colActive = smoothActive(colScore, Math.max(1, (bottom - top) / 12), 1);
-        int[] hBand = longestRun(colActive);
-        int left = hBand[0];
-        int right = hBand[1];
-        if (right - left < aw / 8) {
-            left = 0;
-            right = aw;
+            coverage[y] = activeBlocks / (float) blockCount;
         }
 
-        float inv = 1f / scale;
-        int pad = Math.max(2, Math.min(fullW, fullH) / 300);
-        int fLeft = clampInt(Math.round(left * inv) - pad, 0, fullW - 1);
-        int fTop = clampInt(Math.round(top * inv) - pad, 0, fullH - 1);
-        int fRight = clampInt(Math.round(right * inv) + pad, fLeft + 1, fullW);
-        int fBottom = clampInt(Math.round(bottom * inv) + pad, fTop + 1, fullH);
-        return new Rect(fLeft, fTop, fRight, fBottom);
+        float[] smoothedCoverage = smoothCoverage(coverage, Math.max(3, ah / 300));
+        boolean[] photo = new boolean[ah];
+        for (int y = 0; y < ah; y++) {
+            photo[y] = smoothedCoverage[y] >= 0.78f;
+        }
+        // 사진 내부의 얇은 단색 구간은 잇되, 하단의 희미한 글자·버튼과는 연결하지 않는다.
+        bridgeGaps(photo, Math.max(3, ah / 40));
+
+        int[] run = longestRun(photo); // [start, end)
+        int top = run[0];
+        int bottom = run[1];
+        if (bottom <= top) {
+            return new int[]{0, fullH};
+        }
+        // 하단 경계에 바로 붙은 반투명 캡션이 다시 포함되지 않도록 안쪽 안전 여백을 둔다.
+        bottom = Math.max(top + 1, bottom - Math.max(2, ah / 200));
+        float sy = fullH / (float) ah;
+        int fTop = clampInt(Math.round(top * sy), 0, fullH - 1);
+        int fBottom = clampInt(Math.round(bottom * sy), fTop + 1, fullH);
+        return new int[]{fTop, fBottom};
+    }
+
+    /** 배열의 중앙값(원본 훼손 없이 복사 후 정렬). */
+    private int medianOf(int[] values, int length) {
+        int[] copy = new int[length];
+        System.arraycopy(values, 0, copy, 0, length);
+        java.util.Arrays.sort(copy);
+        return copy[length / 2];
+    }
+
+    private int percentileOf(int[] values, float percentile) {
+        int[] copy = values.clone();
+        java.util.Arrays.sort(copy);
+        int index = clampInt(Math.round((copy.length - 1) * percentile), 0, copy.length - 1);
+        return copy[index];
+    }
+
+    private float[] smoothCoverage(float[] values, int requestedRadius) {
+        int radius = Math.max(1, requestedRadius);
+        float[] smoothed = new float[values.length];
+        float running = 0f;
+        int left = 0;
+        int right = 0;
+        for (int i = 0; i < values.length; i++) {
+            int wantedRight = Math.min(values.length, i + radius + 1);
+            while (right < wantedRight) {
+                running += values[right++];
+            }
+            int wantedLeft = Math.max(0, i - radius);
+            while (left < wantedLeft) {
+                running -= values[left++];
+            }
+            smoothed[i] = running / Math.max(1, right - left);
+        }
+        return smoothed;
+    }
+
+    /** true 사이의 false 구간이 maxGap 이하이면 메워 하나의 밴드로 잇는다. */
+    private void bridgeGaps(boolean[] a, int maxGap) {
+        int n = a.length;
+        int i = 0;
+        while (i < n) {
+            if (a[i]) {
+                i++;
+                continue;
+            }
+            int j = i;
+            while (j < n && !a[j]) {
+                j++;
+            }
+            if (i > 0 && j < n && (j - i) <= maxGap) {
+                for (int k = i; k < j; k++) {
+                    a[k] = true;
+                }
+            }
+            i = j;
+        }
     }
 
     private int lumOf(int c) {
         return (((c >> 16) & 0xFF) * 299 + ((c >> 8) & 0xFF) * 587 + (c & 0xFF) * 114) / 1000;
-    }
-
-    private boolean[] smoothActive(int[] score, int threshold, int radius) {
-        int n = score.length;
-        boolean[] active = new boolean[n];
-        int max = 1;
-        for (int s : score) {
-            max = Math.max(max, s);
-        }
-        int thresh = Math.max(threshold, max / 6);
-        boolean[] raw = new boolean[n];
-        for (int i = 0; i < n; i++) {
-            raw[i] = score[i] >= thresh;
-        }
-        for (int i = 0; i < n; i++) {
-            boolean on = false;
-            for (int d = -radius; d <= radius && !on; d++) {
-                int j = i + d;
-                if (j >= 0 && j < n && raw[j]) {
-                    on = true;
-                }
-            }
-            active[i] = on;
-        }
-        return active;
     }
 
     private int[] longestRun(boolean[] active) {

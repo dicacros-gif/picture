@@ -32,8 +32,10 @@ final class NaverWebPublishCoordinator {
     private int imageBaseline;
     private int publishClicks;
     private boolean autoPublish;
+    private boolean imagesRequired;
     private String title = "";
     private String body = "";
+    private String editorUrl = "";
     private List<Uri> images = Collections.emptyList();
 
     NaverWebPublishCoordinator(Context context, WebView web, Listener listener) {
@@ -52,11 +54,16 @@ final class NaverWebPublishCoordinator {
         title = parts[0];
         body = parts[1];
         autoPublish = publish;
+        imagesRequired = useImages;
         images = useImages
                 ? ProcessedImageStore.todayImages(context, 12)
                 : Collections.emptyList();
         running = true;
         int currentToken = ++token;
+        if (imagesRequired && images.isEmpty()) {
+            fail("1번에서 오늘 정리한 사진을 찾지 못했습니다. 사진 자동 삽입을 끄거나 먼저 이미지를 정리하세요.");
+            return;
+        }
         progress(55, "네이버 편집기가 준비되기를 기다립니다.");
         waitForEditor(currentToken, 0);
     }
@@ -67,6 +74,7 @@ final class NaverWebPublishCoordinator {
         imagePickerRequested = false;
         deliveredImages = -1;
         publishClicks = 0;
+        editorUrl = "";
     }
 
     boolean onShowFileChooser(ValueCallback<Uri[]> callback) {
@@ -95,6 +103,7 @@ final class NaverWebPublishCoordinator {
             }
             if (state.editorReady && state.bodyReady) {
                 imageBaseline = state.imageCount;
+                editorUrl = state.url;
                 fillEditor(currentToken, 0);
                 return;
             }
@@ -271,9 +280,7 @@ final class NaverWebPublishCoordinator {
                 return;
             }
             NaverPublisher.State state = NaverPublisher.parseState(raw);
-            if (state.success
-                    || (!state.editorReady && !state.publishReady
-                    && !state.loginRequired)) {
+            if (state.success || isPublishedPostUrl(state.url)) {
                 succeed("네이버 블로그 발행 완료를 확인했습니다.");
                 return;
             }
@@ -326,5 +333,31 @@ final class NaverWebPublishCoordinator {
     private String suffix(String error) {
         return error == null || error.trim().isEmpty()
                 ? "" : ": " + error.trim();
+    }
+
+    private boolean isPublishedPostUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()
+                || rawUrl.equals(editorUrl)) {
+            return false;
+        }
+        String lower = rawUrl.toLowerCase(java.util.Locale.ROOT);
+        if (!lower.contains("blog.naver.com")
+                || lower.contains("redirect=write")
+                || lower.contains("postwrite")) {
+            return false;
+        }
+        if (lower.contains("logno=") || lower.contains("postview")) {
+            return true;
+        }
+        try {
+            List<String> segments = Uri.parse(rawUrl).getPathSegments();
+            if (segments.size() < 2) {
+                return false;
+            }
+            String last = segments.get(segments.size() - 1);
+            return last.matches("\\d{5,}");
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 }

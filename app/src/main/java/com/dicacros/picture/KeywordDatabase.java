@@ -18,7 +18,7 @@ import java.util.Set;
 final class KeywordDatabase extends SQLiteOpenHelper {
 
     private static final String DB_NAME = "picture_keywords.db";
-    private static final int DB_VERSION = 2;
+    private static final int DB_VERSION = 3;
 
     KeywordDatabase(Context context) {
         super(context.getApplicationContext(), DB_NAME, null, DB_VERSION);
@@ -53,6 +53,7 @@ final class KeywordDatabase extends SQLiteOpenHelper {
                 + "last_used INTEGER NOT NULL DEFAULT 0,"
                 + "PRIMARY KEY(seed, keyword))");
         database.execSQL("CREATE INDEX related_seed_idx ON related_keyword(seed)");
+        createSnapshotTables(database);
     }
 
     @Override
@@ -71,6 +72,10 @@ final class KeywordDatabase extends SQLiteOpenHelper {
             database.execSQL(
                     "ALTER TABLE related_keyword ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0");
         }
+        if (oldVersion < 3) {
+            createSnapshotTables(database);
+            migrateLegacySnapshots(database);
+        }
     }
 
     void upsertRankings(List<RankedKeyword> rankings) {
@@ -81,35 +86,88 @@ final class KeywordDatabase extends SQLiteOpenHelper {
         long now = System.currentTimeMillis();
         database.beginTransaction();
         try {
-            for (RankedKeyword item : rankings) {
-                String keyword = normalizeKeyword(item.keyword);
-                if (!isUsableKeyword(keyword)) {
-                    continue;
-                }
-                Existing existing = readExisting(database, keyword);
-                if (existing == null) {
-                    ContentValues values = new ContentValues();
-                    values.put("keyword", keyword);
-                    values.put("sources", item.source);
-                    values.put("best_rank", item.rank);
-                    values.put("first_seen", now);
-                    values.put("last_seen", now);
-                    database.insertWithOnConflict(
-                            "keyword_history", null, values, SQLiteDatabase.CONFLICT_IGNORE);
-                } else {
-                    ContentValues values = new ContentValues();
-                    values.put("sources", mergeSources(existing.sources, item.source));
-                    values.put("best_rank", Math.min(existing.bestRank, item.rank));
-                    values.put("last_seen", now);
-                    values.put("seen_count", existing.seenCount + 1);
-                    database.update("keyword_history", values, "keyword=?",
-                            new String[]{keyword});
-                }
-            }
+            upsertRankings(database, rankings, now);
             database.setTransactionSuccessful();
         } finally {
             database.endTransaction();
         }
+    }
+
+    long saveSnapshot(List<RankedKeyword> rankings, int rawCount) {
+        if (rankings == null || rankings.isEmpty()) {
+            return -1L;
+        }
+        SQLiteDatabase database = getWritableDatabase();
+        long capturedAt = System.currentTimeMillis();
+        database.beginTransaction();
+        try {
+            ContentValues snapshot = new ContentValues();
+            snapshot.put("captured_at", capturedAt);
+            snapshot.put("raw_count", Math.max(rawCount, rankings.size()));
+            long snapshotId = database.insertOrThrow(
+                    "keyword_snapshot", null, snapshot);
+
+            Set<String> inserted = new LinkedHashSet<>();
+            List<RankedKeyword> valid = new ArrayList<>();
+            for (RankedKeyword item : rankings) {
+                String keyword = normalizeKeyword(item.keyword);
+                String source = item.source == null ? "" : item.source.trim();
+                String key = keyword.toLowerCase(Locale.ROOT);
+                if (!isUsableKeyword(keyword) || source.isEmpty() || !inserted.add(key)) {
+                    continue;
+                }
+                ContentValues values = new ContentValues();
+                values.put("snapshot_id", snapshotId);
+                values.put("source", source);
+                values.put("rank", Math.max(1, item.rank));
+                values.put("keyword", keyword);
+                database.insertWithOnConflict(
+                        "keyword_snapshot_item", null, values,
+                        SQLiteDatabase.CONFLICT_IGNORE);
+                valid.add(new RankedKeyword(keyword, source, Math.max(1, item.rank)));
+            }
+            ContentValues count = new ContentValues();
+            count.put("item_count", valid.size());
+            database.update("keyword_snapshot", count,
+                    "snapshot_id=?", new String[]{String.valueOf(snapshotId)});
+            upsertRankings(database, valid, capturedAt);
+            database.setTransactionSuccessful();
+            return snapshotId;
+        } finally {
+            database.endTransaction();
+        }
+    }
+
+    List<SnapshotInfo> loadSnapshots(int limit) {
+        List<SnapshotInfo> snapshots = new ArrayList<>();
+        int safeLimit = Math.max(1, Math.min(1000, limit));
+        try (Cursor cursor = getReadableDatabase().query(
+                "keyword_snapshot",
+                new String[]{"snapshot_id", "captured_at", "raw_count", "item_count"},
+                "item_count>0", null, null, null,
+                "captured_at DESC, snapshot_id DESC", String.valueOf(safeLimit))) {
+            while (cursor.moveToNext()) {
+                snapshots.add(new SnapshotInfo(
+                        cursor.getLong(0), cursor.getLong(1),
+                        cursor.getInt(2), cursor.getInt(3)));
+            }
+        }
+        return snapshots;
+    }
+
+    List<RankedKeyword> loadSnapshot(long snapshotId) {
+        List<RankedKeyword> rankings = new ArrayList<>();
+        try (Cursor cursor = getReadableDatabase().query(
+                "keyword_snapshot_item",
+                new String[]{"keyword", "source", "rank"},
+                "snapshot_id=?", new String[]{String.valueOf(snapshotId)},
+                null, null, "source ASC, rank ASC, keyword ASC")) {
+            while (cursor.moveToNext()) {
+                rankings.add(new RankedKeyword(
+                        cursor.getString(0), cursor.getString(1), cursor.getInt(2)));
+            }
+        }
+        return rankings;
     }
 
     void addManualKeyword(String rawKeyword) {
@@ -413,12 +471,22 @@ final class KeywordDatabase extends SQLiteOpenHelper {
         return scalarCount("SELECT COUNT(*) FROM related_keyword");
     }
 
+    int snapshotCount() {
+        return scalarCount("SELECT COUNT(*) FROM keyword_snapshot WHERE item_count>0");
+    }
+
     int pruneOlderThanDays(int days) {
         long cutoff = System.currentTimeMillis()
                 - Math.max(1, days) * 24L * 60L * 60L * 1000L;
         SQLiteDatabase database = getWritableDatabase();
         database.beginTransaction();
         try {
+            database.execSQL("DELETE FROM keyword_snapshot_item WHERE snapshot_id IN "
+                    + "(SELECT snapshot_id FROM keyword_snapshot WHERE captured_at<?)",
+                    new Object[]{cutoff});
+            int snapshotDeleted = database.delete(
+                    "keyword_snapshot", "captured_at<?",
+                    new String[]{String.valueOf(cutoff)});
             int relatedDeleted = database.delete(
                     "related_keyword", "fetched_at<?",
                     new String[]{String.valueOf(cutoff)});
@@ -428,7 +496,7 @@ final class KeywordDatabase extends SQLiteOpenHelper {
             database.execSQL("DELETE FROM related_keyword WHERE seed NOT IN "
                     + "(SELECT keyword FROM keyword_history)");
             database.setTransactionSuccessful();
-            return relatedDeleted + keywordDeleted;
+            return snapshotDeleted + relatedDeleted + keywordDeleted;
         } finally {
             database.endTransaction();
         }
@@ -468,6 +536,80 @@ final class KeywordDatabase extends SQLiteOpenHelper {
             }
         }
         return null;
+    }
+
+    private void upsertRankings(
+            SQLiteDatabase database, List<RankedKeyword> rankings, long now) {
+        for (RankedKeyword item : rankings) {
+            String keyword = normalizeKeyword(item.keyword);
+            if (!isUsableKeyword(keyword)) {
+                continue;
+            }
+            Existing existing = readExisting(database, keyword);
+            if (existing == null) {
+                ContentValues values = new ContentValues();
+                values.put("keyword", keyword);
+                values.put("sources", item.source);
+                values.put("best_rank", item.rank);
+                values.put("first_seen", now);
+                values.put("last_seen", now);
+                database.insertWithOnConflict(
+                        "keyword_history", null, values, SQLiteDatabase.CONFLICT_IGNORE);
+            } else {
+                ContentValues values = new ContentValues();
+                values.put("sources", mergeSources(existing.sources, item.source));
+                values.put("best_rank", Math.min(existing.bestRank, item.rank));
+                values.put("last_seen", now);
+                values.put("seen_count", existing.seenCount + 1);
+                database.update("keyword_history", values, "keyword=?",
+                        new String[]{keyword});
+            }
+        }
+    }
+
+    private static void createSnapshotTables(SQLiteDatabase database) {
+        database.execSQL("CREATE TABLE IF NOT EXISTS keyword_snapshot ("
+                + "snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                + "captured_at INTEGER NOT NULL,"
+                + "raw_count INTEGER NOT NULL DEFAULT 0,"
+                + "item_count INTEGER NOT NULL DEFAULT 0)");
+        database.execSQL("CREATE INDEX IF NOT EXISTS keyword_snapshot_time_idx "
+                + "ON keyword_snapshot(captured_at DESC)");
+        database.execSQL("CREATE TABLE IF NOT EXISTS keyword_snapshot_item ("
+                + "snapshot_id INTEGER NOT NULL,"
+                + "source TEXT NOT NULL,"
+                + "rank INTEGER NOT NULL,"
+                + "keyword TEXT NOT NULL COLLATE NOCASE,"
+                + "PRIMARY KEY(snapshot_id, source, keyword))");
+        database.execSQL("CREATE INDEX IF NOT EXISTS keyword_snapshot_item_idx "
+                + "ON keyword_snapshot_item(snapshot_id, source, rank)");
+    }
+
+    private static void migrateLegacySnapshots(SQLiteDatabase database) {
+        database.execSQL("INSERT INTO keyword_snapshot(captured_at,raw_count,item_count) "
+                + "SELECT last_seen,0,0 FROM keyword_history "
+                + "WHERE sources<>'' GROUP BY last_seen");
+        migrateLegacySource(database, "다음");
+        migrateLegacySource(database, "구글");
+        migrateLegacySource(database, "네이버");
+        migrateLegacySource(database, "시그널");
+        database.execSQL("UPDATE keyword_snapshot SET "
+                + "item_count=(SELECT COUNT(*) FROM keyword_snapshot_item item "
+                + "WHERE item.snapshot_id=keyword_snapshot.snapshot_id),"
+                + "raw_count=(SELECT COUNT(*) FROM keyword_snapshot_item item "
+                + "WHERE item.snapshot_id=keyword_snapshot.snapshot_id)");
+        database.execSQL("DELETE FROM keyword_snapshot WHERE item_count=0");
+    }
+
+    private static void migrateLegacySource(SQLiteDatabase database, String source) {
+        database.execSQL("INSERT OR IGNORE INTO keyword_snapshot_item"
+                        + "(snapshot_id,source,rank,keyword) "
+                        + "SELECT snapshot.snapshot_id,?,history.best_rank,history.keyword "
+                        + "FROM keyword_history history "
+                        + "JOIN keyword_snapshot snapshot "
+                        + "ON snapshot.captured_at=history.last_seen "
+                        + "WHERE instr(',' || history.sources || ',', ',' || ? || ',')>0",
+                new Object[]{source, source});
     }
 
     private void saveRelatedSource(SQLiteDatabase database, String seed, String source,
@@ -554,6 +696,20 @@ final class KeywordDatabase extends SQLiteOpenHelper {
             this.keyword = normalizeKeyword(keyword);
             this.source = source;
             this.rank = rank;
+        }
+    }
+
+    static final class SnapshotInfo {
+        final long id;
+        final long capturedAt;
+        final int rawCount;
+        final int itemCount;
+
+        SnapshotInfo(long id, long capturedAt, int rawCount, int itemCount) {
+            this.id = id;
+            this.capturedAt = capturedAt;
+            this.rawCount = rawCount;
+            this.itemCount = itemCount;
         }
     }
 

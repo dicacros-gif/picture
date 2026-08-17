@@ -37,7 +37,8 @@ final class BlogGenerator {
         sb.append("주제: ").append(topic.trim()).append('\n');
         if (keywords != null && !keywords.isEmpty()) {
             sb.append("사용자가 선택한 실시간 검색어와 연관 검색어"
-                            + "(다음·구글·크리에이터·시그널 및 네이버·다음·구글 연관어): ")
+                            + "(다음·Google Trends·크리에이터·시그널 및 "
+                            + "네이버·다음·구글 연관어): ")
                     .append(join(keywords, ", ")).append('\n');
             sb.append("경기 결과·당첨 번호처럼 잠깐 보고 마는 내용은 버리고, 사람들이 반복해서 궁금해할 질문·비교·이유·전망 중심으로 활용하세요.\n");
             sb.append("인물·외국인·해외·기업 주제라면 프로필, 배경, 관계, 사업, 영향, 전망처럼 장기적으로 검색되는 서로 다른 궁금증을 균형 있게 다루세요.\n");

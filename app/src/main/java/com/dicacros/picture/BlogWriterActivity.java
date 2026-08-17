@@ -44,7 +44,7 @@ import java.util.concurrent.Executors;
  * 네이버 블로그 글쓰기 자동화 콘솔.
  *
  *  - macdcross/dicajohn/임의 아이디 다계정 로그인(쿠키 스냅샷)
- *  - adsensefarm 실시간 검색어 추출 → Gemini/ChatGPT 로 지침 기반 초안 생성(BlogGenerator)
+ *  - 저장된 실시간 검색어 → Gemini/ChatGPT 로 지침 기반 초안 생성(BlogGenerator)
  *  - 발행 방식: 초안만 / 앱 내 WebView 자동 발행 / 네이버 앱 스플릿뷰 + 접근성 자동 탭
  *  - API 기반 화면 꺼짐·백그라운드 주기 처리(BlogAutoService + AlarmManager)
  *  - 모든 옵션은 AutoConfig 에 저장되어 앱을 껏다 켜도, 재부팅해도 유지
@@ -303,7 +303,7 @@ public class BlogWriterActivity extends Activity {
         UiKit.stylePrimary(autoButton, UiKit.PRIMARY);
         automationCard.addView(autoButton);
         automationCard.addView(UiKit.caption(this,
-                "실시간 검색어 수집과 API 글쓰기는 1시간마다 실행되며 10일 지난 검색어는 정리됩니다."));
+                "API 글쓰기 자동화만 1시간마다 실행됩니다. 검색어는 앱 실행 또는 새로고침 버튼으로만 갱신합니다."));
 
         autoStatusText = UiKit.status(this);
         automationCard.addView(autoStatusText);

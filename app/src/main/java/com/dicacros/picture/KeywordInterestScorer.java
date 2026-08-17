@@ -33,6 +33,30 @@ final class KeywordInterestScorer {
             "실시간 교통", "교통 상황"
     };
 
+    // 스포츠 경기·선수 기록 등 뉴스만 보고 빠지는 스포츠 관련 검색어.
+    private static final String[] SPORTS_SIGNALS = {
+            "야구", "축구", "농구", "배구", "골프", "테니스", "탁구", "배드민턴",
+            "프로야구", "프로축구", "월드컵", "올림픽", "아시안게임", "리그",
+            "프리미어리그", "라리가", "분데스리가", "세리에", "챔피언스리그",
+            "kbo", "mlb", "nba", "epl", "선발투수", "구원", "세이브", "타율",
+            "방어율", "삼진", "볼넷", "실책", "완봉", "완투", "이닝", "홈런",
+            "타점", "안타", "선제골", "결승골", "역전골", "자책골", "감독",
+            "구단", "이적", "예선", "본선", "4강", "8강", "16강", "준결승",
+            "결승전", "연장전", "승부차기", "승부", "우승", "준우승", "패배",
+            "친선경기", "국가대표", "손흥민", "오타니", "스포츠", "선수", "대표팀",
+            "득점", "승점", "시즌", "토너먼트",
+            "챔피언", "fc", "유나이티드", "올스타", "드래프트"
+    };
+
+    // 죽음·사고·범죄 등 부정적이고 소모성 뉴스 검색어(수집 금지).
+    private static final String[] NEGATIVE_SIGNALS = {
+            "사망", "죽음", "숨진", "숨져", "별세", "타계", "부고", "빈소",
+            "영결", "발인", "사인", "자살", "극단적", "참사", "화재", "폭발",
+            "붕괴", "추락", "침몰", "실종", "납치", "살해", "살인", "피살",
+            "흉기", "성폭행", "성추행", "마약", "음주운전", "뺑소니", "참변",
+            "비보", "비극", "부상", "중상", "사고사", "변사", "숨졌다"
+    };
+
     private KeywordInterestScorer() {
     }
 
@@ -132,6 +156,16 @@ final class KeywordInterestScorer {
     static boolean isEphemeral(String keyword) {
         String lower = keyword == null ? "" : keyword.toLowerCase(Locale.ROOT);
         for (String signal : EPHEMERAL_SIGNALS) {
+            if (lower.contains(signal)) {
+                return true;
+            }
+        }
+        for (String signal : SPORTS_SIGNALS) {
+            if (lower.contains(signal)) {
+                return true;
+            }
+        }
+        for (String signal : NEGATIVE_SIGNALS) {
             if (lower.contains(signal)) {
                 return true;
             }
