@@ -1722,8 +1722,24 @@ class NaverAutomation:
             break
         return result
 
-    def _inspect_reference_license(self, driver, source_url: str, image_url: str) -> dict:
+    @staticmethod
+    def _reference_language_evidence(page: dict, observed_url: str) -> dict:
+        language = str(page.get("document_language", "")).strip().lower()
+        description = re.sub(r"\s+", " ", str(page.get("english_description", ""))).strip()
+        document_is_english = bool(re.fullmatch(r"en(?:-[a-z0-9]+)*", language))
+        description_is_english = (page.get("english_description_visible") is True
+                                  and len(re.findall(r"\b[A-Za-z]{2,}\b", description)) >= 3)
+        verified = document_is_english or description_is_english
+        return {"source_language": "en" if verified else language,
+                "english_source_verified": verified, "language_evidence_url": observed_url,
+                "language_evidence": ("Observed document.documentElement.lang=" + language if document_is_english
+                                      else "Visible English-labelled file description" if description_is_english else ""),
+                "english_description_excerpt": description[:300] if description_is_english else ""}
+
+    def _inspect_reference_license(self, driver, source_url: str, image_url: str, *, english_only: bool = False) -> dict:
         unverified = {"license_verified": False, "license_url": "", "attribution": ""}
+        if english_only:
+            unverified.update(source_language="", english_source_verified=False)
         source = urllib.parse.urlparse(source_url)
         if source.hostname != "commons.wikimedia.org" or "/wiki/File:" not in source.path:
             return unverified
@@ -1732,23 +1748,43 @@ class NaverAutomation:
         try:
             driver.switch_to.new_window("tab")
             opened = driver.current_window_handle
-            driver.get(source_url)
+            request_url = source_url
+            if english_only:
+                query = [(key, value) for key, value in urllib.parse.parse_qsl(source.query, keep_blank_values=True)
+                         if key.lower() != "uselang"]
+                query.append(("uselang", "en"))
+                request_url = urllib.parse.urlunparse(source._replace(query=urllib.parse.urlencode(query)))
+            driver.get(request_url)
             WebDriverWait(driver, 15).until(
                 lambda d: d.find_elements(By.CSS_SELECTOR, "#file, .licensetpl")
             )
-            if driver.current_url.split("#", 1)[0] != source_url.split("#", 1)[0]:
+            actual = urllib.parse.urlparse(driver.current_url)
+            if english_only:
+                if (actual.scheme not in {"https", "http"} or actual.hostname != source.hostname
+                        or urllib.parse.unquote(actual.path) != urllib.parse.unquote(source.path)):
+                    return unverified
+            elif driver.current_url.split("#", 1)[0] != source_url.split("#", 1)[0]:
                 return unverified
             page = driver.execute_script("""
                 const authorLabel = document.getElementById('fileinfotpl_aut');
+                const englishDescription=[...document.querySelectorAll(
+                  '.description.en, .description[lang="en"], .description [lang="en"], [lang="en"] .description'
+                )].find(e=>e.getClientRects().length && getComputedStyle(e).visibility!=='hidden');
                 return {
                   original_file_present: Boolean(document.querySelector('#file a[href]')),
                   author: authorLabel && authorLabel.nextElementSibling
                     ? authorLabel.nextElementSibling.innerText : '',
                   license_links: [...document.querySelectorAll('.licensetpl a[href]')]
-                    .map(a => a.href)
+                    .map(a => a.href),
+                  document_language: document.documentElement.lang || '',
+                  english_description_visible: Boolean(englishDescription),
+                  english_description: englishDescription?.innerText || ''
                 };
             """)
-            return self._commons_license_evidence(source_url, image_url, page or {})
+            evidence = self._commons_license_evidence(source_url, image_url, page or {})
+            if english_only:
+                evidence.update(self._reference_language_evidence(page or {}, driver.current_url))
+            return evidence
         except Exception as exc:
             self.log(f"참고 이미지 원문 라이선스를 확인하지 못해 제외 대상으로 표시합니다: {exc}")
             return unverified
@@ -1760,23 +1796,33 @@ class NaverAutomation:
                     driver.switch_to.window(previous)
 
     def capture_google_reference_candidates(
-        self, keyword: str, output_dir: Path, count: int = 2
+        self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
     ) -> list[dict]:
-        """Capture the first two eligible previews; licensing/vision gates stay explicit.
+        """Capture up to ten eligible previews; licensing/vision gates stay explicit.
 
         Screenshots contain only the image element. Embedded text or watermarks
         are preserved and must be rejected by the later CLI visual review.
+        reuse_only scans past ineligible results, accepting only file-specific
+        Commons licenses that permit reuse without a public attribution line.
+        english_only requires an English query and observed English source-page
+        language, independently of Google's language filter.
         """
         keyword = str(keyword or "").strip()
         if not keyword:
             raise ValueError("Google 참고 이미지 검색어가 없습니다.")
-        count = max(1, min(2, int(count)))
+        if english_only and (not keyword.isascii() or re.search(r"[A-Za-z]{2,}", keyword) is None):
+            raise ValueError("영어 이미지 검색에는 영문 단어로 번역된 검색어가 필요합니다.")
+        count = max(1, min(10, int(count)))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         driver = self._driver()
-        search_url = "https://www.google.com/search?" + urllib.parse.urlencode({
-            "tbm": "isch", "hl": "ko", "safe": "active", "tbs": "il:cl", "q": keyword
-        })
+        search_options = {
+            "tbm": "isch", "hl": "en" if english_only else "ko", "safe": "active", "tbs": "il:cl",
+            "q": keyword + (" site:commons.wikimedia.org" if reuse_only else "")
+        }
+        if english_only:
+            search_options["lr"] = "lang_en"
+        search_url = "https://www.google.com/search?" + urllib.parse.urlencode(search_options)
         driver.get(search_url)
         selector = "img.YQ4gaf, img.rg_i, div[data-ri] img"
         try:
@@ -1827,6 +1873,20 @@ class NaverAutomation:
                     return [...new Set(links)];
                 """, preview, thumbnail)
                 source_url = self._reference_source_url(links or [])
+                evidence = self._inspect_reference_license(driver, source_url, info["url"], english_only=True) if english_only else \
+                    self._inspect_reference_license(driver, source_url, info["url"])
+                if english_only and evidence.get("english_source_verified") is not True:
+                    seen.add(info["url"])
+                    self.log(f"Google 참고 이미지 {rank}번 · 영어 원문 페이지를 확인하지 못해 다음 후보를 확인합니다.")
+                    continue
+                if reuse_only and (evidence.get("license_verified") is not True
+                        or evidence.get("commercial_use_allowed") is not True
+                        or evidence.get("modification_allowed") is not True
+                        or evidence.get("attribution_required") is not False
+                        or evidence.get("share_alike") is not False):
+                    seen.add(info["url"])
+                    self.log(f"Google 참고 이미지 {rank}번 · 출처 표시 없는 재사용 권한을 확인하지 못해 다음 후보를 확인합니다.")
+                    continue
                 old_style = preview.get_attribute("style") or ""
                 try:
                     driver.execute_script("arguments[0].style.setProperty('object-fit','contain','important');", preview)
@@ -1840,7 +1900,6 @@ class NaverAutomation:
                 image = self._gently_enhance_google_image(image)
                 path = output_dir / f"google_reference_{len(candidates)+1:02d}.jpg"
                 self._save_clean_jpeg(image, path)
-                evidence = self._inspect_reference_license(driver, source_url, info["url"])
                 candidate = {
                     "path": str(path.resolve()), "provider": "google", "query": keyword,
                     "search_rank": rank, "source_url": source_url, "url": source_url,
@@ -1849,6 +1908,8 @@ class NaverAutomation:
                     "capture_width": capture_size[0], "capture_height": capture_size[1],
                     "capture_method": "image_element_screenshot", "upscaled": image.size != capture_size,
                     "vision_reviewed": False, "license_filter": "Creative Commons (not proof)",
+                    "reuse_only": reuse_only,
+                    "english_only": english_only,
                     "captured_at": datetime.now().isoformat(timespec="seconds"), **evidence,
                 }
                 candidates.append(candidate)
@@ -2867,11 +2928,13 @@ class NaverAutomation:
         ).encode("utf-8")).hexdigest()
         if article.get("reviewed_content_sha256") != content_hash:
             raise ValueError("CLI 검수 이후 제목 또는 본문이 변경되었거나 검수 해시가 없습니다.")
-        if not isinstance(images, list) or not 6 <= len(images) <= 8:
-            raise ValueError("검수한 생성 이미지 6장과 선택 참고 이미지 최대 2장이 필요합니다.")
+        if not isinstance(images, list) or not 6 <= len(images) <= 16:
+            raise ValueError("검수한 이미지 6~16장과 첫 생성 표지 사진이 필요합니다.")
         generated = [item for item in images if isinstance(item, dict) and item.get("provider") != "google"]
-        if len(generated) != 6:
-            raise ValueError("검수한 생성 이미지는 정확히 6장이어야 합니다.")
+        if not 1 <= len(generated) <= 6:
+            raise ValueError("생성 표지 사진을 포함한 생성 이미지 1~6장이 필요합니다. 부족분은 권리 확인된 참고 이미지로 보충하세요.")
+        if sum(isinstance(item, dict) and item.get("provider") == "google" for item in images) > 10:
+            raise ValueError("Google 참고 이미지는 최대 10장까지 배치할 수 있습니다.")
         checked: list[dict] = []
         seen: set[str] = set()
         for item in images:
@@ -2906,14 +2969,36 @@ class NaverAutomation:
                     raise ValueError("동일조건변경허락 참고 이미지는 자동 발행 대상에서 제외합니다.")
                 if item.get("attribution_required"):
                     raise ValueError("공개 출처 표시가 필요한 참고 이미지는 이 글의 자동 발행 대상에서 제외합니다.")
+                license_parts = urllib.parse.urlparse(str(item["license_url"]))
+                if (license_parts.scheme != "https" or license_parts.hostname != "creativecommons.org"
+                        or license_parts.path.rstrip("/") not in {"/publicdomain/zero/1.0", "/publicdomain/mark/1.0"}
+                        or item.get("attribution_required") is not False):
+                    raise ValueError("참고 이미지에는 출처 표시가 필요 없는 CC0 또는 공개 도메인 라이선스 확인이 필요합니다.")
             reviews = item.get("reviews")
             if item.get("approved") is not True or not isinstance(reviews, list) or not reviews or any(
                 not isinstance(review, dict) or review.get("approved") is not True for review in reviews
             ):
                 raise ValueError("모든 발행 이미지에는 통과한 CLI 시각 검수 기록이 필요합니다.")
+            if item.get("provider") == "google" and (item.get("caption_text") or item.get("caption_applied")):
+                caption = item.get("caption_text")
+                if (not isinstance(caption, str) or not 1 <= len(caption) <= 10
+                        or not re.search(r"[가-힣]", caption) or re.search(r"https?://|www\.|[\r\n]", caption, re.I)
+                        or item.get("caption_applied") is not True or item.get("original_text_free") is not True
+                        or item.get("caption_placement") != "top" or item.get("caption_layout") != "separate_band"
+                        or type(item.get("caption_band_height")) is not int or item["caption_band_height"] <= 0
+                        or item.get("cover_headline") or item.get("cover_text_applied")):
+                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 상단 별도 영역의 10자 이내 한글 캡션이 필요합니다.")
+                for review in reviews:
+                    if (any(review.get(flag) is not True for flag in ("caption_exact", "caption_legible", "no_other_text"))
+                            or review.get("text_free") is not False
+                            or not isinstance(review.get("detected_text"), str)
+                            or re.sub(r"\s+", "", review["detected_text"]) != re.sub(r"\s+", "", caption)):
+                        raise ValueError("Google 참고 이미지에 추가한 캡션의 정확성·가독성·다른 글자 없음 검수가 필요합니다.")
             checked.append({**item, "path": str(path), "sha256": digest})
         # Stable sort retains caller order when more than one picture shares a paragraph.
         checked.sort(key=lambda item: item["paragraph_index"])
+        if checked[0].get("provider") == "google" or checked[0]["paragraph_index"] != 0:
+            raise ValueError("첫 사진은 첫 구역에 배치한 검수된 생성 표지 사진이어야 합니다.")
         if article.get("image_policy") == IMAGE_POLICY:
             expected_headline = cover_headline(article.get("cover_headline", ""))
             if (not checked or checked[0].get("provider") == "google" or checked[0]["paragraph_index"] != 0
@@ -2931,6 +3016,10 @@ class NaverAutomation:
                                 or review.get("text_free") is not False
                                 or re.sub(r"\s+", "", str(review.get("detected_text", ""))) != re.sub(r"\s+", "", expected_headline)):
                             raise ValueError("첫 사진의 한글 문구 정확성 검수가 필요합니다.")
+                    elif item.get("provider") == "google" and item.get("caption_applied") is True:
+                        # The source image was text-free; the separately added
+                        # caption was checked against the final exported image above.
+                        continue
                     elif item.get("cover_headline") or item.get("cover_text_applied") or review.get("text_free") is not True:
                         raise ValueError("두 번째 이후 사진에는 글자가 없어야 합니다.")
         return title, paragraphs, checked
@@ -3382,6 +3471,69 @@ class NaverAutomation:
                 "image_count": len(actual_images), "image_positions_match": position_matches,
                 "image_identity_matches": identity_matches, "bold_rendered": bold_matches, "colors_rendered": colors_match}
 
+    @classmethod
+    def _publication_key(cls, blog_id: str, article: dict) -> str:
+        """Compute the original submission identity without opening image files."""
+        blog_id = cls._clean_blog_id(blog_id)
+        if not isinstance(article, dict):
+            raise ValueError("발행 기록 조회에는 원고 객체가 필요합니다.")
+        title, paragraphs, images = article.get("title"), article.get("paragraphs"), article.get("images")
+        if not isinstance(title, str) or not title.strip() or len(title.strip()) > 100 or "\n" in title:
+            raise ValueError("발행 제목은 1~100자의 한 줄이어야 합니다.")
+        if (not isinstance(paragraphs, list) or len(paragraphs) != 8
+                or any(not isinstance(item, str) or not item.strip() for item in paragraphs)):
+            raise ValueError("발행 기록 조회에는 비어 있지 않은 본문 8개 구역이 필요합니다.")
+        if not isinstance(images, list) or not 6 <= len(images) <= 16:
+            raise ValueError("발행 기록 조회에는 이미지 6~16장의 식별 정보가 필요합니다.")
+        for item in images:
+            if (not isinstance(item, dict) or type(item.get("paragraph_index")) is not int
+                    or not 0 <= item["paragraph_index"] <= 7
+                    or not isinstance(item.get("sha256"), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
+                raise ValueError("발행 기록 조회에 필요한 이미지 해시 또는 배치 정보가 올바르지 않습니다.")
+        identity = {"blog_id": blog_id.lower(), "title": title.strip(),
+                    "paragraphs": [item.strip() for item in paragraphs],
+                    "images": [{"sha256": item["sha256"], "position": item["paragraph_index"]}
+                               for item in sorted(images, key=lambda item: item["paragraph_index"])]}
+        return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def publication_receipt_for(self, blog_id: str, article: dict) -> dict | None:
+        """Read a matching durable receipt; never open a browser or require local images."""
+        key = self._publication_key(blog_id, article)
+        path = self.data_dir / "publication_receipts" / f"{key}.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError("기존 발행 기록을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다.") from exc
+        try:
+            receipt = json.loads(raw)
+            if (not isinstance(receipt, dict) or receipt.get("status") not in {"published", "uncertain"}
+                    or receipt.get("article_key", key) != key
+                    or type(receipt.get("published")) is not bool
+                    or (receipt["published"] != (receipt["status"] == "published"))):
+                raise ValueError("Invalid publication receipt")
+            if receipt["published"]:
+                parts = urllib.parse.urlparse(str(receipt.get("url", "")))
+                query = urllib.parse.parse_qs(parts.query)
+                blog_key = self._clean_blog_id(blog_id).lower()
+                path_matches = re.fullmatch(re.escape(blog_key) + r"/\d+/?",
+                                            urllib.parse.unquote(parts.path).lstrip("/").lower())
+                query_matches = (parts.path.lower().endswith("/postview.naver")
+                                 and (query.get("blogId") or [""])[0].lower() == blog_key
+                                 and re.fullmatch(r"\d+", (query.get("logNo") or [""])[0]))
+                if (parts.scheme not in {"https", "http"}
+                        or parts.hostname not in {"blog.naver.com", "m.blog.naver.com"}
+                        or not (path_matches or query_matches)):
+                    raise ValueError("Invalid published URL")
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("기존 발행 기록을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다.") from exc
+        if receipt["published"] and "content_verified" not in receipt:
+            receipt = {**receipt, "content_verified": False,
+                       "content_verification_issues": ["이전 버전의 발행 기록에는 게시 본문·이미지 확인 결과가 없습니다."]}
+        return receipt
+
     def _write_publication_receipt(self, path: Path, receipt: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
@@ -3489,17 +3641,13 @@ class NaverAutomation:
         if publish and save_draft:
             raise ValueError("자동 발행과 임시저장을 동시에 선택할 수 없습니다. 임시저장은 publish=False로 실행하세요.")
         blog_id = self._clean_blog_id(blog_id)
+        if publish:
+            prior = self.publication_receipt_for(blog_id, article)
+            if prior is not None:
+                return {**prior, "reused_receipt": True}
         title, paragraphs, images = self._validate_publish_article(article)
-        identity = {"blog_id": blog_id.lower(), "title": title, "paragraphs": paragraphs,
-                    "images": [{"sha256": item["sha256"], "position": item["paragraph_index"]} for item in images]}
-        key = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        key = self._publication_key(blog_id, {"title": title, "paragraphs": paragraphs, "images": images})
         receipt_path = self.data_dir / "publication_receipts" / f"{key}.json"
-        if publish and receipt_path.exists():
-            try:
-                prior = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                raise RuntimeError("기존 발행 기록을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다.")
-            return {**prior, "reused_receipt": True}
         driver = self._driver()
         bold_terms = article.get("bold_terms", [])
         visual_style = article.get("visual_style")
@@ -3547,7 +3695,8 @@ class NaverAutomation:
                    "message": "발행 제출을 시도했습니다. 완료가 확인되지 않으면 웨일에서 게시 상태를 확인하세요. 자동 재시도하지 않습니다."}
         if not self._claim_publication_receipt(receipt_path, receipt):
             # Another running application acquired this article while we prepared it.
-            return {**receipt, "reused_receipt": True,
+            prior = self.publication_receipt_for(blog_id, article)
+            return {**(prior or receipt), "reused_receipt": True,
                     "message": "다른 실행의 발행 기록이 있어 최종 발행을 누르지 않았습니다."}
         try:
             final_button.click()
@@ -3558,9 +3707,43 @@ class NaverAutomation:
             self.log(receipt["message"])
             return receipt
         receipt.update({"published": True, "status": "published", "url": url,
+                        "content_verified": False,
+                        "content_verification_issues": ["게시 본문·이미지 확인이 아직 완료되지 않았습니다."],
                         "message": "게시글 주소와 제목을 확인했습니다."})
+        # Persist the confirmed submission before inspecting content. Inspection
+        # failure must never turn a completed publication into a retryable draft.
+        self._write_publication_receipt(receipt_path, receipt)
+        snapshot = {}
+        try:
+            def content_ready(_driver):
+                nonlocal snapshot
+                inspected = self.inspect_published_naver_article(
+                    blog_id, {**article, "title": title, "paragraphs": paragraphs, "images": images},
+                    expected_image_ids=image_ids,
+                )
+                if not isinstance(inspected, dict):
+                    raise ValueError("게시 본문·이미지 검사 결과 형식이 올바르지 않습니다.")
+                snapshot = inspected
+                return snapshot.get("verified") is True
+            WebDriverWait(driver, 10).until(content_ready)
+            receipt["content_verified"] = True
+            receipt["content_verification_issues"] = []
+            receipt["message"] = "게시글 주소·제목·본문 8개 구역과 이미지 배치를 확인했습니다."
+        except Exception as exc:
+            labels = {"title_matches": "게시글 제목이 다릅니다.", "sections_match": "본문 구역이 누락되거나 내용이 다릅니다.",
+                      "image_positions_match": "사진 수 또는 배치가 다릅니다.",
+                      "image_identity_matches": "게시 사진의 식별 정보가 다릅니다.",
+                      "bold_rendered": "중요 내용의 굵은 서식을 확인하지 못했습니다.",
+                      "colors_rendered": "본문 강조 색상을 확인하지 못했습니다."}
+            issues = [message for flag, message in labels.items() if snapshot.get(flag) is False]
+            if isinstance(snapshot.get("message"), str) and snapshot["message"]:
+                issues.append(snapshot["message"])
+            receipt["content_verification_issues"] = issues or [f"게시 본문·이미지 확인을 완료하지 못했습니다: {exc}"]
+            receipt["message"] = "발행은 완료됐지만 게시 내용 확인이 필요합니다. 원고를 보존하며 자동 재발행하지 않습니다."
+        receipt["content_verification"] = snapshot
         self._write_publication_receipt(receipt_path, receipt)
         self.log(f"네이버 발행 완료 확인: {url}")
+        self.log(receipt["message"])
         return receipt
 
     @classmethod

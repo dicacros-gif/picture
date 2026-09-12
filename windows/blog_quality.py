@@ -26,7 +26,7 @@ def ending(sentence):
     return match.group(1) if match else None
 
 
-def inspect_article(article, keywords, topic):
+def inspect_article(article, keywords, topic, *, mode='strict'):
     issues = []
     def add(code, index, text, detail):
         issues.append({'code': code, 'index': index, 'text': text, 'detail': detail})
@@ -47,8 +47,10 @@ def inspect_article(article, keywords, topic):
     all_sentences = []
     for i, p in enumerate(paragraphs):
         body = '\n'.join(line for line in p.splitlines() if not line.strip().startswith(('❝', '─', '#')))
-        if len(p.replace('\n', '')) < 650:
+        if mode != 'natural' and len(p.replace('\n', '')) < 650:
             add('section_length', i, '', '구역별 650자 이상: 확인된 정보로 보강')
+        elif mode == 'natural' and len(body.strip()) < 60:
+            add('section_length', i, '', '내용이 거의 없는 구역: 분량 채우기 대신 독자에게 필요한 설명 보강')
         concrete += bool(SPECIFIC.search(body))
         for sentence in sentences(p):
             all_sentences.append((i, sentence))
@@ -88,8 +90,24 @@ def inspect_article(article, keywords, topic):
     word_count = len(visible.split())
     if topic and word_count:
         density = visible.count(topic) / word_count * 100
-        if not 2 <= density <= 3:
-            add('density', -1, '', f'주제어 밀도 {density:.2f}% (공백 단위 어절 대비 정확한 주제어 출현): 목표 2~3%')
+        if density > 3 or (mode != 'natural' and density < 2):
+            detail = '반복이 과도하므로 줄이기. 최소 밀도를 맞추려고 문장을 추가하지 않기' if mode == 'natural' else '목표 2~3%'
+            add('density', -1, '', f'주제어 밀도 {density:.2f}% (공백 단위 어절 대비 정확한 주제어 출현): {detail}')
+    if mode == 'natural':
+        generic = ('중요한 역할을', '많은 도움이', '신중하게 고려', '꼼꼼하게 확인', '다양한 측면에서')
+        for phrase in generic:
+            if visible.count(phrase) >= 3:
+                for index, sentence in all_sentences:
+                    if phrase in sentence:
+                        add('generic_repetition', index, sentence, f"상투적인 '{phrase}' 반복을 구체적인 이유·행동·판단 기준으로 바꾸기")
+        hooks = {}
+        for index, sentence in all_sentences:
+            if sentence.endswith('?'):
+                hooks.setdefault(sentence, []).append(index)
+        for sentence, indices in hooks.items():
+            if len(indices) >= 3:
+                for index in indices[1:]:
+                    add('hook_repetition', index, sentence, '같은 후킹 문장 반복 대신 해당 구역의 구체적인 궁금증으로 연결')
     return issues
 
 
@@ -119,7 +137,7 @@ def apply_patches(article, response, issues):
     return result
 
 
-def local_cleanup(article, issues):
+def local_cleanup(article, issues, *, mode='strict'):
     """Apply only meaning-preserving edits; never invent facts or approvals."""
     result = copy.deepcopy(article)
     changes = []
@@ -160,7 +178,7 @@ def local_cleanup(article, issues):
         if issue['code'] != 'section_length' or i < 0:
             continue
         for claim in available:
-            if len(result['paragraphs'][i].replace('\n', '')) >= 650:
+            if len(result['paragraphs'][i].replace('\n', '')) >= (120 if mode == 'natural' else 650):
                 break
             if any(claim in p for p in result['paragraphs']) or PUBLIC_SOURCE.search(claim) or ATTRIBUTION.search(claim):
                 continue

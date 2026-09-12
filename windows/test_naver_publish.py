@@ -6,6 +6,7 @@ import json
 import re
 import tempfile
 import unittest
+import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,7 @@ from PIL import Image
 from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from naver_automation import NaverAutomation
+from blog_visual_style import IMAGE_POLICY
 
 
 class ImmediateWait:
@@ -157,6 +159,7 @@ class PublishTests(unittest.TestCase):
         self.app._article_ready_to_publish = MagicMock(return_value=True)
         self.app._find_publish_control = MagicMock(side_effect=lambda _driver, final=False: self.final if final else self.opener)
         self.app._published_article_url = MagicMock(return_value="https://blog.naver.com/testblog/123456789012")
+        self.app.inspect_published_naver_article = MagicMock(return_value={"verified": True})
         self.wait = patch("naver_automation.WebDriverWait", ImmediateWait)
         self.wait.start()
         self.addCleanup(self.wait.stop)
@@ -167,9 +170,122 @@ class PublishTests(unittest.TestCase):
             ensure_ascii=False, sort_keys=True
         ).encode("utf-8")).hexdigest()
 
+    def _append_google_images(self, count, *, captions=False):
+        for index in range(count):
+            path = self.root / f"reference-{index}.png"
+            Image.new("RGB", (20, 20), (15, index * 17, 110)).save(path)
+            item = {"path": str(path), "provider": "google", "paragraph_index": index % 8,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "approved": True,
+                    "license_verified": True, "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+                    "commercial_use_allowed": True, "modification_allowed": True, "attribution_required": False,
+                    "reviews": [{"provider": "claude", "approved": True, "text_free": True}]}
+            if captions:
+                item.update(caption_text="방문 전 확인", caption_applied=True, caption_placement="top",
+                            caption_layout="separate_band", caption_band_height=100, original_text_free=True)
+                item["reviews"] = [{"provider": "claude", "approved": True, "text_free": False,
+                                    "caption_exact": True, "caption_legible": True, "no_other_text": True,
+                                    "detected_text": "방문 전 확인"}]
+            self.article["images"].append(item)
+
+    def test_six_generated_plus_ten_references_publish_sixteen_images_and_reuse_receipt(self):
+        self._append_google_images(10)
+        self.app._prepare_article_in_writer.return_value = [f"id-{index}" for index in range(16)]
+        result = self.app.publish_naver_article("testblog", self.article)
+        self.assertEqual(result["image_count"], 16)
+        self.assertEqual(len(self.app._prepare_article_in_writer.call_args.args[4]), 16)
+        self.assertEqual(result["image_positions"], sorted(item["paragraph_index"] for item in self.article["images"]))
+        self.assertEqual(self.app.publication_receipt_for("testblog", self.article)["article_key"], result["article_key"])
+        self.assertTrue(self.app.publish_naver_article("testblog", self.article)["reused_receipt"])
+        self.final.click.assert_called_once()
+
+    def test_sixteen_uploads_preserve_order_for_multiple_images_in_each_section(self):
+        self._append_google_images(10)
+        title, paragraphs, images = self.app._validate_publish_article(self.article)
+        state = {"data": document(paragraphs), "uploaded": 0}
+        self.app._open_writer = MagicMock(return_value=(MagicMock(), MagicMock()))
+        self.app._editor_has_existing_content = MagicMock(return_value=False)
+        self.app._replace_editor_text = MagicMock()
+        self.app._read_article_document = MagicMock(side_effect=lambda _driver: copy.deepcopy(state["data"]))
+        self.app._set_article_document = MagicMock(side_effect=lambda _driver, value: state.update(data=copy.deepcopy(value)))
+        self.app._focus_body_image_position = MagicMock()
+        def upload(_driver, paths):
+            self.assertEqual(len(paths), 1)
+            index = state["uploaded"]
+            state["data"]["document"]["components"].append({"@ctype": "image", "id": f"uploaded-{index}",
+                                                                "src": f"https://local.invalid/{index}"})
+            state["uploaded"] += 1
+        self.app._upload_blog_images = MagicMock(side_effect=upload)
+        ids = NaverAutomation._prepare_article_in_writer(self.app, self.driver, "testblog", title, paragraphs, images)
+        self.assertEqual(ids, [f"uploaded-{index}" for index in range(16)])
+        self.assertEqual(self.app._upload_blog_images.call_count, 16)
+        self.assertEqual([call.args[1][0] for call in self.app._upload_blog_images.call_args_list],
+                         [item["path"] for item in images])
+        positions = [item["paragraph_index"] for item in images]
+        self.assertTrue(NaverAutomation._verify_article_document(state["data"], paragraphs, ids, positions))
+        self.assertFalse(NaverAutomation._verify_article_document(state["data"], paragraphs,
+                         [ids[1], ids[0], *ids[2:]], positions))
+        self.assertEqual(positions[:3], [0, 0, 0])
+
+    def test_seventeenth_image_and_eleventh_google_reference_are_rejected(self):
+        self._append_google_images(11)
+        with self.assertRaisesRegex(ValueError, "6~16"):
+            self.app._validate_publish_article(self.article)
+        self.article["images"].pop(5)
+        with self.assertRaisesRegex(ValueError, "최대 10장"):
+            self.app._validate_publish_article(self.article)
+
+    def test_reference_caption_requires_original_text_free_and_exact_final_vision_review(self):
+        self._append_google_images(1, captions=True)
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 7)
+        for changes in ({"original_text_free": False}, {"caption_applied": False}, {"caption_layout": "over_image"},
+                        {"caption_text": "열한글자이상의아주긴설명입니다"}, {"caption_text": "영문\n표시"},
+                        {"caption_text": "ABC"}):
+            invalid = copy.deepcopy(self.article)
+            invalid["images"][-1].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "상단 별도"):
+                self.app._validate_publish_article(invalid)
+        for changes in ({"caption_exact": False}, {"caption_legible": False}, {"no_other_text": False},
+                        {"detected_text": "다른 문구"}, {"text_free": True}):
+            invalid = copy.deepcopy(self.article)
+            invalid["images"][-1]["reviews"][0].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "캡션의 정확성"):
+                self.app._validate_publish_article(invalid)
+
+    def test_generated_cover_policy_allows_only_separately_verified_reference_captions(self):
+        self._append_google_images(4, captions=True)
+        headline = "방문 전 확인"
+        self.article.update(image_policy=IMAGE_POLICY, cover_headline=headline)
+        for image in self.article["images"][:6]:
+            image["image_policy"] = IMAGE_POLICY
+            image["reviews"][0]["text_free"] = True
+        cover = self.article["images"][0]
+        cover.update(cover_headline=headline, cover_text_applied=True, cover_aspect_ratio="1:1",
+                     cover_text_color="#8CE88C", width=20, height=20)
+        cover["reviews"][0].update(text_free=False, detected_text=headline,
+                                   **{flag: True for flag in ("cover_text_exact", "cover_text_legible", "no_other_text",
+                                       "square_1_to_1", "no_human_face", "bold_gothic", "text_shadow_visible", "approved_text_color")})
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 10)
+
+    def test_published_page_inspects_sixteen_images_in_repeated_section_positions(self):
+        self._append_google_images(10)
+        self.app._article_native_bold_rendered = MagicMock(return_value=True)
+        ordered = sorted(self.article["images"], key=lambda item: item["paragraph_index"])
+        ids = [f"image-{index}" for index in range(16)]
+        self.driver.execute_script.return_value = {"sections": list(self.article["paragraphs"]),
+            "images": [{"id": image_id, "position": image["paragraph_index"]} for image_id, image in zip(ids, ordered)]}
+        result = NaverAutomation.inspect_published_naver_article(self.app, "testblog", self.article, expected_image_ids=ids)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["image_count"], 16)
+        self.driver.get.assert_not_called()
+
     def test_success_clicks_final_once_and_checks_post_url_title(self):
         receipt = self.app.publish_naver_article("testblog", self.article)
         self.assertTrue(receipt["published"])
+        self.assertTrue(receipt["content_verified"])
+        self.assertEqual(receipt["content_verification_issues"], [])
+        self.app.inspect_published_naver_article.assert_called_once()
+        self.assertEqual(self.app.inspect_published_naver_article.call_args.kwargs["expected_image_ids"],
+                         [f"id-{i}" for i in range(6)])
         self.final.click.assert_called_once()
         self.opener.click.assert_called_once()
         self.app._published_article_url.assert_called_once_with(self.driver, "testblog", self.article["title"])
@@ -186,6 +302,88 @@ class PublishTests(unittest.TestCase):
         self.opener.click.assert_not_called()
         self.final.click.assert_not_called()
         self.assertFalse((self.root / "publication_receipts").exists())
+
+    def test_receipt_lookup_without_receipt_is_read_only(self):
+        self.assertIsNone(self.app.publication_receipt_for("testblog", self.article))
+        self.assertFalse((self.root / "publication_receipts").exists())
+        self.app._driver.assert_not_called()
+
+    def test_receipt_reuse_after_image_cleanup_never_requires_original_files(self):
+        receipt = self.app.publish_naver_article("testblog", self.article)
+        for item in self.article["images"]:
+            Path(item["path"]).unlink()
+        self.app._driver.reset_mock()
+        self.assertEqual(self.app.publication_receipt_for("testblog", self.article), receipt)
+        repeated = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(repeated["published"])
+        self.assertTrue(repeated["reused_receipt"])
+        self.app._driver.assert_not_called()
+        self.final.click.assert_called_once()
+
+    def test_receipt_identity_normalizes_title_sections_and_image_order(self):
+        self.app.publish_naver_article("testblog", self.article)
+        same = copy.deepcopy(self.article)
+        same["title"] = " " + same["title"] + " "
+        same["paragraphs"] = [" " + section + " " for section in same["paragraphs"]]
+        same["images"].reverse()
+        self.assertTrue(self.app.publication_receipt_for("TESTBLOG", same)["published"])
+        same["paragraphs"][0] += " 본문 수정"
+        self.assertIsNone(self.app.publication_receipt_for("testblog", same))
+
+    def test_receipt_lookup_rejects_corrupt_record_without_browser_or_rewrite(self):
+        receipt = self.app.publish_naver_article("testblog", self.article)
+        path = self.root / "publication_receipts" / f"{receipt['article_key']}.json"
+        for raw in ("{broken", "[]", json.dumps({**receipt, "article_key": "wrong"}),
+                    json.dumps({**receipt, "url": "https://blog.naver.com/otherblog/12345"})):
+            path.write_text(raw, encoding="utf-8")
+            self.app._driver.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, "기존 발행 기록"):
+                self.app.publication_receipt_for("testblog", self.article)
+            self.assertEqual(path.read_text(encoding="utf-8"), raw)
+            self.app._driver.assert_not_called()
+
+    def test_receipt_lookup_validates_metadata_without_opening_files(self):
+        for images in (None, [{"sha256": "invalid", "paragraph_index": 0}] * 6,
+                       [{**item, "paragraph_index": True} for item in self.article["images"]]):
+            with self.subTest(images=images), self.assertRaises(ValueError):
+                self.app.publication_receipt_for("testblog", {**self.article, "images": images})
+        self.app._driver.assert_not_called()
+
+    def test_legacy_published_receipt_preserves_success_and_marks_content_unverified(self):
+        receipt = self.app.publish_naver_article("testblog", self.article)
+        legacy = {key: value for key, value in receipt.items() if not key.startswith("content_verif")}
+        path = self.root / "publication_receipts" / f"{receipt['article_key']}.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        loaded = self.app.publication_receipt_for("testblog", self.article)
+        self.assertTrue(loaded["published"])
+        self.assertFalse(loaded["content_verified"])
+        self.assertTrue(loaded["content_verification_issues"])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), legacy)
+
+    def test_published_content_mismatch_preserves_submission_and_never_reclicks(self):
+        self.app.inspect_published_naver_article.return_value = {
+            "verified": False, "sections_match": False, "image_positions_match": False,
+        }
+        result = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(result["published"])
+        self.assertEqual(result["status"], "published")
+        self.assertFalse(result["content_verified"])
+        self.assertEqual(len(result["content_verification_issues"]), 2)
+        self.assertTrue(self.app.publish_naver_article("testblog", self.article)["published"])
+        self.final.click.assert_called_once()
+
+    def test_inspection_error_keeps_durable_confirmed_publication(self):
+        def failed_inspection(*args, **kwargs):
+            stored = json.loads(next((self.root / "publication_receipts").glob("*.json")).read_text(encoding="utf-8"))
+            self.assertTrue(stored["published"], "Submission must be durable before inspection")
+            raise WebDriverException("read-only page snapshot unavailable")
+        self.app.inspect_published_naver_article.side_effect = failed_inspection
+        result = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(result["published"])
+        self.assertFalse(result["content_verified"])
+        self.assertIn("snapshot unavailable", result["content_verification_issues"][0])
+        self.assertEqual(self.app.publication_receipt_for("testblog", self.article), result)
+        self.final.click.assert_called_once()
 
     def test_content_changed_after_panel_open_never_submits(self):
         self.app._article_ready_to_publish.side_effect = [True, False]
@@ -362,6 +560,28 @@ class PublishTests(unittest.TestCase):
         _title, sections, _images = self.app._validate_publish_article(self.article)
         self.assertEqual(sections, self.article["paragraphs"])
 
+    def test_verified_reference_can_replace_generated_body_image_but_never_cover(self):
+        ref = self.article["images"][3]
+        ref.update(provider="google", license_verified=True,
+                   license_url="https://creativecommons.org/publicdomain/zero/1.0/",
+                   commercial_use_allowed=True, modification_allowed=True, attribution_required=False)
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 6)
+        ref["reviews"][0]["approved"] = False
+        with self.assertRaisesRegex(ValueError, "시각 검수"):
+            self.app._validate_publish_article(self.article)
+        ref["reviews"][0]["approved"] = True
+        ref["paragraph_index"] = 0
+        self.article["images"][0]["paragraph_index"] = 1
+        with self.assertRaisesRegex(ValueError, "생성 표지"):
+            self.app._validate_publish_article(self.article)
+
+    def test_reference_cannot_claim_attribution_free_with_by_license(self):
+        self.article["images"][3].update(provider="google", license_verified=True,
+                   license_url="https://creativecommons.org/licenses/by/4.0/",
+                   commercial_use_allowed=True, modification_allowed=True, attribution_required=False)
+        with self.assertRaisesRegex(ValueError, "CC0"):
+            self.app._validate_publish_article(self.article)
+
     def test_public_markdown_and_source_urls_are_rejected(self):
         for text in ["**강조** 본문", "# 소제목", "출처 https://example.com/source"]:
             self.article["paragraphs"][0] = text
@@ -449,7 +669,7 @@ class PublishTests(unittest.TestCase):
             "images": [{"id": value, "position": image["paragraph_index"]}
                        for value, image in zip(ids, self.article["images"])],
         }
-        result = self.app.inspect_published_naver_article("testblog", self.article, expected_image_ids=ids)
+        result = NaverAutomation.inspect_published_naver_article(self.app, "testblog", self.article, expected_image_ids=ids)
         self.assertTrue(result["verified"])
         self.assertEqual(result["section_count"], 8)
         self.assertEqual(result["image_count"], 6)
@@ -467,9 +687,9 @@ class PublishTests(unittest.TestCase):
                        for i, image in enumerate(self.article["images"])],
         }
         self.driver.execute_script.return_value["images"][0]["position"] = 7
-        self.assertFalse(self.app.inspect_published_naver_article("testblog", self.article)["verified"])
+        self.assertFalse(NaverAutomation.inspect_published_naver_article(self.app, "testblog", self.article)["verified"])
         self.driver.execute_script.return_value["sections"].pop()
-        self.assertFalse(self.app.inspect_published_naver_article("testblog", self.article)["verified"])
+        self.assertFalse(NaverAutomation.inspect_published_naver_article(self.app, "testblog", self.article)["verified"])
 
 
 class ReferenceLicenseTests(unittest.TestCase):
@@ -480,6 +700,61 @@ class ReferenceLicenseTests(unittest.TestCase):
         page = {"original_file_present": True, "author": "Author", "license_links": ["https://creativecommons.org/publicdomain/zero/1.0/"]}
         page.update(changes)
         return NaverAutomation._commons_license_evidence(self.source, self.image, page)
+
+    def test_english_source_requires_observed_page_language_or_visible_english_description(self):
+        for page, expected in [({"document_language": "en-US"}, True),
+                               ({"document_language": "ko"}, False),
+                               ({"document_language": "ko", "english_description_visible": True,
+                                 "english_description": "An empty modern kitchen interior"}, True),
+                               ({"document_language": "ko", "english_description_visible": False,
+                                 "english_description": "An empty modern kitchen interior"}, False),
+                               ({"document_language": "ko", "english_description_visible": True,
+                                 "english_description": "한국어 설명"}, False)]:
+            with self.subTest(page=page):
+                result = NaverAutomation._reference_language_evidence(page, self.source + "?uselang=en")
+                self.assertIs(result["english_source_verified"], expected)
+                if expected:
+                    self.assertEqual(result["source_language"], "en")
+                    self.assertTrue(result["language_evidence"])
+
+    def test_english_inspection_visits_english_commons_and_preserves_license_source_identity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = NaverAutomation(Path(folder), lambda _: None)
+            driver = MagicMock()
+            driver.current_window_handle = "search"
+            driver.find_elements.return_value = [MagicMock()]
+            driver.get.side_effect = lambda url: setattr(driver, "current_url", url)
+            driver.execute_script.return_value = {"original_file_present": True, "author": "Example photographer",
+                "license_links": ["https://creativecommons.org/publicdomain/zero/1.0/"], "document_language": "en"}
+            source = self.source + "?oldid=123&uselang=ko"
+            with patch("naver_automation.WebDriverWait", ImmediateWait):
+                evidence = app._inspect_reference_license(driver, source, self.image, english_only=True)
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
+            self.assertEqual(query, {"oldid": ["123"], "uselang": ["en"]})
+            self.assertTrue(evidence["english_source_verified"])
+            self.assertTrue(evidence["license_verified"])
+            self.assertEqual(evidence["license_evidence_url"], source)
+            self.assertEqual(evidence["language_evidence_url"], driver.get.call_args.args[0])
+            driver.close.assert_called_once()
+            driver.switch_to.window.assert_called_once_with("search")
+
+    def test_english_query_validation_and_filters_do_not_assume_english_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = NaverAutomation(Path(folder), lambda _: None)
+            app._driver = MagicMock()
+            for query in ("한국 경제", "CPI 한국", "1234", ""):
+                with self.subTest(query=query), self.assertRaises(ValueError):
+                    app.capture_google_reference_candidates(query, Path(folder), english_only=True)
+            app._driver.assert_not_called()
+            driver = app._driver.return_value
+            driver.find_elements.return_value = []
+            with patch("naver_automation.WebDriverWait", ImmediateWait):
+                result = app.capture_google_reference_candidates("consumer price index", Path(folder), english_only=True)
+            self.assertEqual(result, [])
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
+            self.assertEqual(query["hl"], ["en"])
+            self.assertEqual(query["lr"], ["lang_en"])
+            self.assertEqual(query["q"], ["consumer price index"])
 
     def test_file_specific_cc0_proof_sets_rights_and_no_required_attribution(self):
         result = self.evidence()
@@ -560,6 +835,59 @@ class ReferenceLicenseTests(unittest.TestCase):
             self.assertTrue(all(item["capture_width"] == 400 for item in candidates))
             self.assertTrue(all(Path(item["path"]).is_file() for item in candidates))
             download.assert_not_called()
+
+    def test_reuse_only_skips_ineligible_results_and_stops_after_sixty_candidates(self):
+        reusable = {"license_verified": True, "commercial_use_allowed": True, "modification_allowed": True,
+                    "attribution_required": False, "share_alike": False,
+                    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"}
+        scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [3, 4], 4, 2, False),
+                     ([{}] * 61, [], 60, 4, False),
+                     ([reusable] * 12, list(range(1, 11)), 10, 20, False),
+                     ([{**reusable, "english_source_verified": False},
+                       {**reusable, "english_source_verified": True, "source_language": "en"}], [2], 2, 1, True)]
+        for rights, expected_ranks, expected_checks, requested, english in scenarios:
+            with self.subTest(expected_ranks=expected_ranks), tempfile.TemporaryDirectory() as folder:
+                app = NaverAutomation(Path(folder), lambda _: None)
+                driver = MagicMock()
+                app._driver = MagicMock(return_value=driver)
+                thumbnails = [MagicMock() for _ in rights]
+                preview = MagicMock()
+                preview.is_displayed.return_value = True
+                preview.get_attribute.return_value = "original-css"
+                buffer = io.BytesIO()
+                Image.new("RGB", (400, 240), "green").save(buffer, "PNG")
+                preview.screenshot_as_png = buffer.getvalue()
+                selection = {"index": 0}
+                for thumb in thumbnails:
+                    thumb.is_displayed.return_value = True
+                    thumb.rect = {"width": 200, "height": 150}
+                driver.find_elements.side_effect = lambda _by, selector: thumbnails if selector.startswith("img.YQ4gaf") else [preview]
+                def script(source, *arguments):
+                    if "scrollIntoView" in source:
+                        selection["index"] = thumbnails.index(arguments[0])
+                    elif "complete:e.complete" in source:
+                        return {"width": 800, "height": 480, "display_width": 400, "display_height": 240,
+                                "url": f"https://upload.wikimedia.org/image-{selection['index']}.jpg", "complete": True}
+                    elif "const links=[]" in source:
+                        return [f"https://commons.wikimedia.org/wiki/File:Example{selection['index']}.jpg"]
+                driver.execute_script.side_effect = script
+                app._inspect_reference_license = MagicMock(side_effect=lambda *_, **kwargs: rights[selection["index"]])
+                with patch("naver_automation.WebDriverWait", ImmediateWait), patch.object(app, "_download_google_preview") as download:
+                    keyword = "sample photos" if english else "예시 사진"
+                    captured = app.capture_google_reference_candidates(keyword, Path(folder), requested,
+                                                                       reuse_only=True, english_only=english)
+                self.assertEqual([item["search_rank"] for item in captured], expected_ranks)
+                self.assertEqual(app._inspect_reference_license.call_count, expected_checks)
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
+                self.assertEqual(query["q"], [keyword + " site:commons.wikimedia.org"])
+                if english:
+                    self.assertEqual(query["hl"], ["en"])
+                    self.assertEqual(query["lr"], ["lang_en"])
+                    self.assertTrue(all(item["english_source_verified"] and item["source_language"] == "en" for item in captured))
+                    self.assertTrue(all(call.kwargs == {"english_only": True} for call in app._inspect_reference_license.call_args_list))
+                self.assertTrue(all(item["reuse_only"] and item["vision_reviewed"] is False for item in captured))
+                self.assertEqual(len(list(Path(folder).glob("google_reference_*.jpg"))), len(expected_ranks))
+                download.assert_not_called()
 
 
 class PublishControlTests(unittest.TestCase):

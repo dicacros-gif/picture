@@ -37,6 +37,7 @@ def valid_article():
         "image_prompts": [f"문단 {index + 1}의 내용을 표현하는 이름 없는 노트북과 깔끔한 작업 공간, 자연광, 글자 없는 독창적인 사진" for index in range(8)],
         "highlight_phrases": [important], "bold_phrases": [important],
         "cover_headline": "배터리 수명비밀",
+        "google_captions": [f"관리 기준{index}" for index in range(8)],
         "sources": [{"title": "Manufacturer battery guidance", "url": "https://support.example.com/battery",
                      "verified": True, "is_primary": True, "supports": ["기기별 지원 기능과 사용 조건이 다를 수 있다."]}],
         "review": {"approved": True, "facts_verified": True, "sources_verified": True,
@@ -83,6 +84,9 @@ class FakeBridge:
                               square_1_to_1=True, no_human_face=True, bold_gothic=True,
                               text_shadow_visible=True, approved_text_color=True,
                               detected_text=context['expected_cover_headline'])
+            elif context.get('expected_caption'):
+                result.update(text_free=False, caption_exact=True, caption_legible=True, no_other_text=True,
+                              detected_text=context['expected_caption'])
             result["quality_score"] = 80 + image_index % 10
             if image_index in self.bad_image_indices:
                 result.update({"approved": False, "text_free": False, "issues": ["깨진 글자 발견"]})
@@ -117,13 +121,15 @@ class BlogWorkflowTests(unittest.TestCase):
         self.bridge = FakeBridge()
         self.cancel = threading.Event()
         self.workflow = BlogWorkflow(self.bridge, self.root / "runs", lambda _: None, self.cancel)
-        def delivery(source, destination, target_long_side=2048, headline=""):
+        def delivery(source, destination, target_long_side=2048, headline="", caption=""):
             with Image.open(source) as picture:
                 width, height = picture.size
                 picture.convert("RGB").save(destination, format="JPEG", quality=95)
             return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
                     "metadata_stripped": True, "delivery_format": "JPEG", "image_style": "photorealistic",
                     "cover_headline": headline, "cover_text_applied": bool(headline),
+                    "caption_text": caption, "caption_applied": bool(caption), "caption_placement": "top" if caption else "",
+                    "caption_band_height": 80 if caption else 0, "caption_layout": "separate_band" if caption else "",
                     "cover_text_color": "#8CE88C" if headline else "", "cover_aspect_ratio": "1:1" if headline else ""}
         self.export_patch = patch("blog_workflow.clean_export", side_effect=delivery)
         self.export_patch.start()
@@ -294,7 +300,9 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["google_images"]), 1)
         self.assertEqual(result["attributions"], [])
         self.assertTrue(result["google_images"][0]["approved"])
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 9)
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 10)
+        self.assertTrue(result["google_images"][0]["original_text_free"])
+        self.assertTrue(result["google_images"][0]["caption_applied"])
         self.assertNotIn("https://", result["text"])
         self.assertEqual(len(result["paragraphs"]), 8)
         self.assertEqual(len(result["reviewed_content_sha256"]), 64)

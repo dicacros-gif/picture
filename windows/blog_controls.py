@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import shutil
 import threading
@@ -16,7 +17,7 @@ from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLE
                               store_prompt, normalize_blocked_terms, blocked_term_hits)
 from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
-from blog_topic_history import TopicHistory, TopicHistoryError
+from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
 
 
 def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
@@ -62,6 +63,9 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_review_mode = StringVar(value=pref["review_mode"] if pref["review_mode"] in REVIEW_MODES else REVIEW_MODES[0])
         self.cli_models = {key: StringVar(value=model) for key, model in pref["models"].items()}
         self.cli_google = BooleanVar(value=pref["include_google"])
+        self.cli_image_retries = StringVar(value=str(pref.get("image_retry_limit", 2)))
+        self.cli_google_count = StringVar(value=str(pref.get("google_reference_count", 4)))
+        self.cli_editorial_mode = StringVar(value="자연스러운 구성" if pref.get("editorial_mode", "natural") == "natural" else "구역별 분량·밀도")
         self.cli_publication = StringVar(value=pref["publication_mode"])
         self.cli_duplicate_keywords = StringVar(value=str(pref["duplicate_keyword_threshold"]))
         self.cli_duplicate_titles = StringVar(value=str(pref["duplicate_title_threshold"]))
@@ -135,7 +139,7 @@ class BlogWorkflowControls(UnattendedControls):
         review = ttk.Combobox(options, textvariable=self.cli_review_mode, values=REVIEW_MODES, state="readonly", width=24)
         review.pack(side="left", padx=5)
         review.bind("<<ComboboxSelected>>", self._save_cli_selection)
-        ttk.Checkbutton(options, text="Google 후보 2장도 검수", variable=self.cli_google, command=self._save_cli_selection).pack(side="left", padx=8)
+        ttk.Checkbutton(options, text="Google 캡처도 활용", variable=self.cli_google, command=self._save_cli_selection).pack(side="left", padx=8)
         ttk.Button(options, text="CLI 연결 확인", command=self.check_blog_cli).pack(side="left", padx=8)
         ttk.Button(options, text="CLI 로그인 안내", command=self.show_cli_login_help).pack(side="left")
         ttk.Button(options, text="프로그램 다시 시작", command=self.restart_program).pack(side="left", padx=5)
@@ -167,7 +171,21 @@ class BlogWorkflowControls(UnattendedControls):
         duplicate_titles.pack(side="left")
         duplicate_keywords.bind("<FocusOut>", self._save_cli_selection)
         duplicate_titles.bind("<FocusOut>", self._save_cli_selection)
-        ttk.Label(self.blog_tab, text="연관 검색어의 질문 → 제목·8문단 → CLI 교차 검수 → Antigravity 4장 + ChatGPT 4장 → 검수 통과 6장", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
+        policy_row = ttk.Frame(settings)
+        policy_row.grid(row=6, column=0, columnspan=7, sticky="ew", pady=(6, 0))
+        ttk.Label(policy_row, text="글 구성").pack(side="left")
+        for variable, values, width in ((self.cli_editorial_mode, ["자연스러운 구성", "구역별 분량·밀도"], 19),
+                                       (self.cli_image_retries, ["1", "2", "3"], 3),
+                                       (self.cli_google_count, [str(i) for i in range(1, 11)], 3)):
+            if variable is self.cli_image_retries:
+                ttk.Label(policy_row, text=" 이미지별 재생성").pack(side="left", padx=(12, 2))
+            elif variable is self.cli_google_count:
+                ttk.Label(policy_row, text="회 · Google 캡처").pack(side="left", padx=(5, 2))
+            selector = ttk.Combobox(policy_row, textvariable=variable, values=values, width=width, state="readonly")
+            selector.pack(side="left", padx=3)
+            selector.bind("<<ComboboxSelected>>", self._save_cli_selection)
+        ttk.Label(policy_row, text="장 · 설정 변경은 다음 새 글부터", style="Sub.TLabel").pack(side="left", padx=5)
+        ttk.Label(self.blog_tab, text="검색 의도 → 제목·8구역 → CLI 교차 검수 → 생성 이미지 + 한글 설명을 넣은 Google 캡처", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
         panes = ttk.Panedwindow(self.blog_tab, orient="horizontal")
         panes.grid(row=2, column=0, sticky="nsew")
         left, right = ttk.Frame(panes), ttk.Frame(panes)
@@ -220,6 +238,14 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _save_cli_selection(self, _event=None):
         reverse = {label: key for key, label in PROVIDER_LABELS.items()}
+        def threshold(variable, key, default):
+            try:
+                value = float(variable.get())
+                if not math.isfinite(value) or not .1 <= value <= 1:
+                    raise ValueError
+                return value
+            except (ValueError, TypeError):
+                return self.cli_preferences.get(key, default)
         self.cli_preferences.update(
             order=[reverse[value.get()] for value in self.cli_order],
             stages=[{"provider": reverse[value.get()], "role": self.cli_roles[index].get(),
@@ -227,10 +253,13 @@ class BlogWorkflowControls(UnattendedControls):
             step_count=int(self.cli_step_count.get()), review_mode=self.cli_review_mode.get(),
             models={key: value.get().strip() for key, value in self.cli_models.items()},
             include_google=self.cli_google.get(), publication_mode=self.cli_publication.get(),
+            image_retry_limit=int(self.cli_image_retries.get()),
+            google_reference_count=int(self.cli_google_count.get()),
+            editorial_mode="natural" if self.cli_editorial_mode.get() == "자연스러운 구성" else "strict",
             auto_start_on_launch=self.auto_start_on_launch.get(),
             blocked_terms=normalize_blocked_terms(self.cli_blocked_terms.get("1.0", "end")),
-            duplicate_keyword_threshold=float(self.cli_duplicate_keywords.get()),
-            duplicate_title_threshold=float(self.cli_duplicate_titles.get()),
+            duplicate_keyword_threshold=threshold(self.cli_duplicate_keywords, "duplicate_keyword_threshold", .4),
+            duplicate_title_threshold=threshold(self.cli_duplicate_titles, "duplicate_title_threshold", .5),
         )
         self._sync_cli_step_boxes()
         self._persist_cli_preferences()
@@ -319,6 +348,9 @@ class BlogWorkflowControls(UnattendedControls):
         selected = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
         return {"steps": pref["order"][:pref["step_count"]], "review_mode": pref["review_mode"],
                 "quality_checks": True,
+                "image_retry_limit": pref.get("image_retry_limit", 2),
+                "google_reference_count": pref.get("google_reference_count", 4),
+                "editorial_mode": pref.get("editorial_mode", "natural"),
                 "stage_configs": pref["stages"][:pref["step_count"]],
                 "models": pref["models"], "base_prompt": selected["text"],
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
@@ -393,20 +425,30 @@ class BlogWorkflowControls(UnattendedControls):
         self._ensure_topic_allowed(topic, keywords, config)
         self.events.put(("cli_preparing", topic))
         self._preflight_cli_accounts(config)
+        workflow = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         google = []
         google_folder = None
+        search_folder = None
         if config["include_google"]:
-            self._naver_log("Google 이미지 후보 1·2번의 화면과 출처를 확인합니다.")
+            self._naver_log(f"Google 캡처 후보 최대 {config.get('google_reference_count', 4)}장의 화면과 사용 조건을 확인합니다.")
             try:
+                search = workflow.plan_google_image_search(topic, keywords, config["steps"],
+                    config["models"], stage_configs=config.get("stage_configs"))
+                search_folder = search.get("run_dir")
+                self._naver_log(f"Google 영어 이미지 검색: {search['query']}")
                 folder = self.cli_app_dir / "google-reference-candidates" / datetime.now().strftime("%Y%m%d-%H%M%S")
                 google_folder = folder
-                google = self.naver_bot.capture_google_reference_candidates(topic, folder, count=2)
+                google = self.naver_bot.capture_google_reference_candidates(search["query"], folder,
+                    count=config.get("google_reference_count", 4), reuse_only=True, english_only=True)
             except Exception as exc:
                 self._naver_log(f"Google 참고 이미지 생략: {exc}")
-        workflow = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         resume_options = {"resume_run_dir": config["resume_run_dir"]} if config.get("resume_run_dir") else {}
         resume_options["quality_checks"] = True
         resume_options["quality_topic"] = config.get("quality_topic", topic)
+        resume_options["image_retry_limit"] = config.get("image_retry_limit", 2)
+        resume_options["editorial_mode"] = config.get("editorial_mode", "natural")
+        if config.get("revision_feedback"):
+            resume_options["revision_feedback"] = config["revision_feedback"]
         if config.get("stage_configs"):
             resume_options["stage_configs"] = config["stage_configs"]
         brief = config["base_prompt"]
@@ -418,7 +460,8 @@ class BlogWorkflowControls(UnattendedControls):
                                    config["review_mode"], models=config["models"], google_candidates=google,
                                    **resume_options)
         article["blog_id"] = config["blog_id"]
-        article["auxiliary_dirs"] = [str(google_folder)] if google_folder else []
+        article["source_topic"] = config.get("quality_topic", topic)
+        article["auxiliary_dirs"] = [str(folder) for folder in (google_folder, search_folder) if folder]
         self.events.put(("cli_article", article))
         return article
 
@@ -472,33 +515,67 @@ class BlogWorkflowControls(UnattendedControls):
         self._naver_log(f"'{topic}'에 해당하는 조회·사용자 입력 연관 검색어 {len(keywords)}개로 원고를 준비합니다.")
         return self._prepare_cli_worker(topic, keywords, config)
 
+    @staticmethod
+    def _publication_payload(article):
+        payload = copy.deepcopy(article)
+        images, seen = [], set()
+        for image in [*payload.get("images", []), *payload.get("google_images", [])]:
+            key = (image.get("path"), image.get("sha256"), image.get("paragraph_index"))
+            if not (key[0] or key[1]) or key not in seen:
+                seen.add(key)
+                images.append(image)
+        payload["images"] = images
+        # Older manifests kept the approved cover text only on the image record.
+        if not payload.get("cover_headline"):
+            cover = next((item for item in images if item.get("provider") != "google"
+                          and item.get("paragraph_index") == 0 and item.get("cover_text_applied") is True), {})
+            if isinstance(cover.get("cover_headline"), str):
+                payload["cover_headline"] = cover["cover_headline"]
+        return payload
+
+    def _pending_publication_receipt(self, article, config):
+        reader = getattr(self.naver_bot, "publication_receipt_for", None)
+        if not callable(reader) or not config.get("blog_id"):
+            raise WorkflowError("이전 발행 결과를 확인할 영수증 조회 기능 또는 블로그 ID가 없습니다.")
+        receipt = reader(config["blog_id"], self._publication_payload(article))
+        if receipt is not None and not isinstance(receipt, dict):
+            raise WorkflowError("이전 발행 결과를 확인할 수 없습니다. 원고와 제출 상태를 보존합니다.")
+        return receipt
+
     def _publish_cli_worker(self, article, config):
         if self.full_auto_stop.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
         self._ensure_topic_allowed(article.get("topic", ""), article.get("keywords", []), config)
-        publish_payload = copy.deepcopy(article)
-        if publish_payload.get("google_images"):
-            publish_payload["images"] = [image for image in publish_payload["images"] if image.get("provider") != "google"] + publish_payload["google_images"]
+        publish_payload = self._publication_payload(article)
         result = self.naver_bot.publish_naver_article(config["blog_id"], publish_payload,
             publish=config["publish"], save_draft=config.get("save_draft", False))
+        return self._record_cli_publication(article, config, result)
+
+    def _record_cli_publication(self, article, config, result):
         article["publication"] = result
         # A bookkeeping failure must never hide an already successful publish.
         self.events.put(("cli_article", article))
         self.events.put(("cli_publication", result))
         try:
             if hasattr(self, "topic_history") and article.get("topic"):
-                if self.topic_history.record_publication(article["topic"], result, article.get("run_dir", ""),
-                                                         article.get("keywords", []), article.get("title", "")):
-                    consumed = [article["topic"], *article.get("keywords", [])]
+                source_topic = article.get("source_topic") or article["topic"]
+                consumed_keywords = list(dict.fromkeys([source_topic, *article.get("keywords", [])]))
+                newly_recorded = self.topic_history.record_publication(article["topic"], result, article.get("run_dir", ""),
+                                                                       consumed_keywords, article.get("title", ""))
+                if newly_recorded or confirmed_publication(result):
+                    consumed = [article["topic"], *consumed_keywords]
                     from keyword_database import consume, load_database, save_database
                     database_path = self.cli_app_dir / "keywords.json"
                     save_database(database_path, consume(load_database(database_path), consumed))
                     self.events.put(("cli_topic_consumed", article["topic"], consumed))
                     self._naver_log(f"발행 확인 · '{article['topic']}' 키워드를 후보 목록에서 제외했습니다.")
-                    self._cleanup_published_artifacts(article)
+                    if result.get("content_verified", True) is True:
+                        self._cleanup_published_artifacts(article)
+                    else:
+                        self._naver_log("게시 URL은 확인했습니다. 게시된 본문·사진을 확인할 자료를 보존하고 재발행하지 않습니다.")
                 elif result.get("status") == "uncertain":
                     self.topic_history.record_uncertain(article["topic"], result, article.get("run_dir", ""))
-        except TopicHistoryError as exc:
+        except (TopicHistoryError, OSError) as exc:
             self.full_auto_stop.set()
             self.naver_bot.stop_event.set()
             prefix = "게시글 발행은 완료됐지만" if result.get("published") else "발행 제출 결과 확인이 필요한 상태에서"
@@ -576,11 +653,39 @@ class BlogWorkflowControls(UnattendedControls):
         threading.Thread(target=self._full_automation_loop, args=(config,), daemon=True).start()
 
     def _cli_automation_cycle(self, config):
-        self._preflight_cli_accounts(config)
         pending_path = self.cli_app_dir / "pending-blog-topic.json"
         pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
-        if pending.get("publication_started"):
-            raise WorkflowError("확정 주제의 이전 발행 결과 확인이 필요합니다. 중복 발행을 막기 위해 원고를 보존합니다.")
+        if isinstance(pending.get("config"), dict):
+            config = copy.deepcopy(pending["config"])
+        if pending.get("publication_started") or pending.get("phase") in {"publishing", "submitted_uncertain"}:
+            was_uncertain = pending.get("phase") == "submitted_uncertain"
+            prepared = pending.get("prepared_article")
+            if not isinstance(prepared, dict):
+                run_dir = Path(pending.get("run_dir", "")).resolve()
+                parent = (self.cli_app_dir / "blog-runs").resolve()
+                if parent in run_dir.parents and (run_dir / "manifest.json").is_file():
+                    prepared = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+                    prepared["run_dir"] = str(run_dir)
+                    prepared.setdefault("source_topic", pending.get("choice", {}).get("source_topic")
+                                        or pending.get("choice", {}).get("topic", prepared.get("topic", "")))
+                    pending["prepared_article"] = prepared
+            if not isinstance(prepared, dict):
+                raise WorkflowError("이전 발행 결과와 준비된 원고를 확인할 자료가 필요합니다.")
+            receipt = self._pending_publication_receipt(prepared, config) if config.get("publish") else None
+            if (isinstance(receipt, dict) and receipt.get("published") is not True) or (was_uncertain and receipt is None):
+                pending["phase"] = "submitted_uncertain"
+                self._save_pending_topic(pending)
+                raise WorkflowError("이전 발행 결과 확인이 필요합니다. 이미 제출한 글은 다시 발행하지 않습니다.")
+            if isinstance(receipt, dict):
+                pending["confirmed_receipt"] = receipt
+                self._naver_log("저장된 게시 성공 영수증을 확인했습니다. 원고 재생성·재발행 없이 이력 처리를 이어갑니다.")
+            else:
+                self._naver_log("최종 발행 제출 기록이 없습니다. 준비된 같은 원고로 편집기 작업을 다시 시작합니다.")
+            pending["publication_started"] = False
+            pending["phase"] = "prepared"
+            self._save_pending_topic(pending)
+        if not isinstance(pending.get("prepared_article"), dict):
+            self._preflight_cli_accounts(config)
         if pending.get("choice"):
             return self._complete_selected_topic(config, pending["groups"], pending["related"],
                                                  pending["choice"], pending)
@@ -619,7 +724,7 @@ class BlogWorkflowControls(UnattendedControls):
                       "selection_run_dir": ""}
             self._naver_log(f"CLI 선정 거절 2회 · 스포츠·사망이 아닌 최고 점수 후보 '{fallback['topic']}'로 진행합니다.")
         self._ensure_topic_allowed(choice["topic"], choice["keywords"], config)
-        pending = {"choice": choice, "groups": groups, "related": related_by_topic}
+        pending = {"choice": choice, "groups": groups, "related": related_by_topic, "config": copy.deepcopy(config), "phase": "preparing"}
         self._save_pending_topic(pending)
         return self._complete_selected_topic(config, groups, related_by_topic, choice, pending)
 
@@ -642,7 +747,13 @@ class BlogWorkflowControls(UnattendedControls):
             recovery_config["selection_question"] = choice["semantic_selection"]["intent_question"]
         if pending.get("resume_run_dir"):
             recovery_config["resume_run_dir"] = pending["resume_run_dir"]
-        for index in range(1, 4):
+        if pending.get("revision_feedback"):
+            recovery_config["revision_feedback"] = pending["revision_feedback"]
+        topic, keywords = choice["topic"], choice["keywords"]
+        if isinstance(pending.get("prepared_article"), dict):
+            article = copy.deepcopy(pending["prepared_article"])
+            self._naver_log(f"'{topic}' · 승인된 준비 원고와 이미지를 다시 사용합니다.")
+        for index in ([] if article is not None else range(1, 4)):
             if self.full_auto_stop.is_set():
                 raise WorkflowError("사용자가 작업을 중지했습니다.")
             topic = choice["topic"]
@@ -658,8 +769,12 @@ class BlogWorkflowControls(UnattendedControls):
                 if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, prepared.get("title", ""),
                         keyword_threshold=config.get("duplicate_keyword_threshold", .4),
                         title_threshold=config.get("duplicate_title_threshold", .5)) is True:
+                    feedback = "같은 검색 주제를 유지하면서 기존 발행 글과 겹치는 제목·관점을 수정하세요. " + json.dumps({
+                        "duplicate_title": prepared.get("title", ""), "recent_publications": self.topic_history.recent_publications(30)}, ensure_ascii=False)
+                    pending["revision_feedback"] = recovery_config["revision_feedback"] = feedback
                     raise WorkflowError("확정 주제의 원고가 발행 이력과 유사합니다. 같은 주제의 원고 수정이 필요합니다.", Path(prepared["run_dir"]))
                 article = prepared
+                article["source_topic"] = current.get("source_topic", topic)
                 selection_value = current.get("selection_run_dir", "")
                 selection_dir = Path(selection_value) if selection_value else None
                 if selection_dir is not None and selection_dir.is_dir():
@@ -689,10 +804,15 @@ class BlogWorkflowControls(UnattendedControls):
         if article is None:
             raise WorkflowError(f"확정 주제 '{topic}'의 준비를 {len(attempts)}회 시도했지만 준비되지 않았습니다. 주제를 바꾸지 않고 검토 자료를 보존합니다.", recovery_config.get("resume_run_dir"))
         # Browser publication/draft failures never enter the candidate retry loop.
-        pending["publication_started"] = True
+        pending["prepared_article"] = copy.deepcopy(article)
+        pending["phase"] = "publishing"
+        pending["publication_started"] = False
         pending["run_dir"] = article["run_dir"]
         self._save_pending_topic(pending)
-        result = self._publish_cli_worker(article, config)
+        if pending.get("confirmed_receipt"):
+            result = self._record_cli_publication(article, config, pending["confirmed_receipt"])
+        else:
+            result = self._publish_cli_worker(article, config)
         if not result.get("published") and config["publish"]:
             raise RuntimeError("네이버 발행 완료를 확인하지 못했습니다.")
         (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)

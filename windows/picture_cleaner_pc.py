@@ -24,7 +24,7 @@ from send2trash import send2trash
 from chatgpt_classic_automation import ChatGPTClassicAutomation
 from blog_controls import BlogWorkflowControls, next_cycle_tick
 from blog_workflow import BlogWorkflow
-from blog_preferences import blocked_term_hits
+from blog_preferences import automation_config_snapshot, blocked_term_hits
 from blog_runtime import access_error_from_exception, wait_for_restart_parent
 from naver_automation import NaverAutomation
 
@@ -1051,7 +1051,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         completion_box.pack(side="left")
         self.cli_runtime_selectors.append(completion_box)
         completion_box.bind("<<ComboboxSelected>>", self._save_cli_selection)
-        ttk.Label(topbar, text="8문단 · 생성 이미지 6장 선정", style="Sub.TLabel").pack(side="left", padx=12)
+        ttk.Label(topbar, text="8구역 · 생성 이미지 + Google 캡처", style="Sub.TLabel").pack(side="left", padx=12)
         ttk.Checkbutton(
             topbar,
             text="다크 모드",
@@ -1683,6 +1683,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         access_problem = None
         try:
             while not self.full_auto_stop.is_set():
+                config = automation_config_snapshot(getattr(self, "settings", {}), config)
                 try:
                     self._run_full_automation_cycle(config)
                 except Exception as exc:
@@ -1698,19 +1699,20 @@ class PictureCleanerApp(BlogWorkflowControls):
                     )
                 if self.full_auto_stop.is_set():
                     break
-                try:
-                    interval_hours = int(self.settings.get("auto_interval_hours", config.get("interval_hours", 1)))
-                    if interval_hours not in range(1, 7): interval_hours = 1
-                except (TypeError, ValueError):
-                    interval_hours = 1
-                config["interval_hours"] = interval_hours
-                config["interval_seconds"] = interval_hours * 3600
-                now = time.monotonic()
-                next_tick = next_cycle_tick(next_tick, now, config["interval_seconds"])
-                remaining = next_tick - now
-                expected = datetime.now() + timedelta(seconds=remaining)
-                self.events.put(("status", f"다음 회차 {expected:%m/%d %H:%M} · {config['interval_hours']}시간마다 · {config.get('completion_label', '자동 발행')}"))
-                if self.full_auto_stop.wait(remaining):
+                finished_at, cycle_tick = time.monotonic(), next_tick
+                scheduled_hours = None
+                while not self.full_auto_stop.is_set():
+                    latest = automation_config_snapshot(getattr(self, "settings", {}), config)
+                    now = time.monotonic()
+                    if latest["interval_hours"] != scheduled_hours:
+                        scheduled_hours = latest["interval_hours"]
+                        next_tick = next_cycle_tick(cycle_tick, finished_at, latest["interval_seconds"])
+                        expected = datetime.now() + timedelta(seconds=max(0, next_tick - now))
+                        self.events.put(("status", f"다음 회차 {expected:%m/%d %H:%M} · {scheduled_hours}시간마다 · {latest.get('completion_label', '자동 발행')}"))
+                    remaining = next_tick - now
+                    if remaining <= 0 or self.full_auto_stop.wait(min(1.0, remaining)):
+                        break
+                if self.full_auto_stop.is_set():
                     break
                 self.naver_bot.reset_stop()
         finally:
@@ -2328,12 +2330,12 @@ class PictureCleanerApp(BlogWorkflowControls):
                         self.keyword_text.insert("1.0", "\n".join(merged))
                     self.seed.set(seed)
                     self.topic.set(compose_related_topic(seed, merged))
-                    from keyword_database import merge, consume, save_database, words
+                    from keyword_database import merge, consume, reconcile, save_database, words
                     allowed = self.topic_history.filter_keywords(merged)
-                    self.keyword_db_records = merge(merge({}, self.keyword_db), allowed)
+                    self.keyword_db_records = merge(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), allowed)
                     blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
                     self.keyword_db_records = consume(self.keyword_db_records, blocked)
-                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
                     self.keyword_db = words(self.keyword_db_records)
                     if merged and failed_sources:
                         self.status.set(
@@ -2385,12 +2387,12 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self.topic.set(
                         compose_related_topic(seed, combined_keywords)
                     )
-                    from keyword_database import merge, consume, save_database, words
+                    from keyword_database import merge, consume, reconcile, save_database, words
                     allowed = self.topic_history.filter_keywords(combined_keywords)
-                    self.keyword_db_records = merge(merge({}, self.keyword_db), allowed)
+                    self.keyword_db_records = merge(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), allowed)
                     blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
                     self.keyword_db_records = consume(self.keyword_db_records, blocked)
-                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
                     self.keyword_db = words(self.keyword_db_records)
                     full_failed = [
                         source for source, words in full_result.items() if not words
@@ -2497,10 +2499,10 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self._set_cli_runtime_controls(False)
                 elif kind == "cli_topic_consumed":
                     self.realtime_groups = self.topic_history.filter_groups(self.realtime_groups)
-                    from keyword_database import consume, merge, save_database, words
+                    from keyword_database import consume, reconcile, save_database, words
                     consumed = event[2] if len(event) > 2 else [event[1]]
-                    self.keyword_db_records = consume(merge({}, self.keyword_db), consumed)
-                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db_records = consume(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), consumed)
+                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
                     self.keyword_db = words(self.keyword_db_records)
                     self._render_keyword_groups(self.realtime_groups)
                     self.status.set(f"발행한 키워드 '{event[1]}' 제거 완료 · 다음 회차에는 다른 키워드를 선택합니다.")

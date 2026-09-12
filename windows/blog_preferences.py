@@ -102,6 +102,20 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
             return max(.1, min(1.0, float(value.get(name, default))))
         except (TypeError, ValueError):
             return default
+    try:
+        image_retry_limit = int(value.get("image_retry_limit", 2))
+        if isinstance(value.get("image_retry_limit"), bool) or str(value.get("image_retry_limit", 2)).strip() != str(image_retry_limit):
+            image_retry_limit = 2
+        if image_retry_limit not in range(1, 4):
+            image_retry_limit = 2
+    except (TypeError, ValueError, OverflowError):
+        image_retry_limit = 2
+    try:
+        google_reference_count = int(value.get("google_reference_count", 4))
+        if isinstance(value.get("google_reference_count"), bool) or not 1 <= google_reference_count <= 10:
+            google_reference_count = 4
+    except (TypeError, ValueError, OverflowError):
+        google_reference_count = 4
     return {
         "prompts": presets, "selected_prompt_id": selected,
         "default_revision": str(value.get("default_revision", "")),
@@ -110,6 +124,9 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         "review_mode": str(value.get("review_mode", "단계별 교차 검수")),
         "models": {key: str(models.get(key, "")).strip() for key in PROVIDER_LABELS},
         "include_google": value.get("include_google", True) is True,
+        "image_retry_limit": image_retry_limit,
+        "google_reference_count": google_reference_count,
+        "editorial_mode": value.get("editorial_mode") if value.get("editorial_mode") in ("natural", "strict") else "natural",
         "auto_start_on_launch": value.get("auto_start_on_launch", True) is True,
         "blocked_terms": normalize_blocked_terms(value.get("blocked_terms")),
         "duplicate_keyword_threshold": threshold("duplicate_keyword_threshold", .4),
@@ -118,6 +135,45 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
                              "임시저장까지만": "임시저장까지만", "입력만": "편집기에 입력만",
                              "편집기에 입력만": "편집기에 입력만"}.get(value.get("publication_mode"), "자동 발행"),
     }
+
+
+def automation_config_snapshot(settings: dict | None, fallback: dict | None = None) -> dict:
+    """Resolve the next cycle from saved plain data, without reading Tk variables."""
+    result = copy.deepcopy(fallback) if isinstance(fallback, dict) else {}
+    saved = copy.deepcopy(settings) if isinstance(settings, dict) else {}
+    preferences = saved.get("cli_workflow")
+    if isinstance(preferences, dict):
+        pref = normalize_preferences(preferences, str(result.get("base_prompt", "")),
+                                     str(saved.get("blog_prompt", "")))
+        prompt = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
+        result.update(
+            steps=pref["order"][:pref["step_count"]],
+            stage_configs=pref["stages"][:pref["step_count"]],
+            models=pref["models"], base_prompt=prompt["text"], prompt_id=prompt["id"],
+            review_mode=pref["review_mode"], include_google=pref["include_google"],
+            image_retry_limit=pref["image_retry_limit"],
+            google_reference_count=pref["google_reference_count"],
+            editorial_mode=pref["editorial_mode"],
+            publish=pref["publication_mode"] == "자동 발행",
+            save_draft=pref["publication_mode"] == "임시저장까지만",
+            completion_label=pref["publication_mode"], blocked_terms=pref["blocked_terms"],
+            duplicate_keyword_threshold=pref["duplicate_keyword_threshold"],
+            duplicate_title_threshold=pref["duplicate_title_threshold"],
+        )
+        result.setdefault("quality_checks", True)
+    if "blog_id" in saved:
+        result["blog_id"] = str(saved["blog_id"]).strip()
+    try:
+        hours = int(saved.get("auto_interval_hours", result.get("interval_hours", 1)))
+        if hours not in range(1, 7):
+            hours = 1
+    except (TypeError, ValueError, OverflowError):
+        hours = 1
+    result.update(interval_hours=hours, interval_seconds=hours * 3600)
+    result.setdefault("image_retry_limit", 2)
+    result.setdefault("google_reference_count", 4)
+    result.setdefault("editorial_mode", "natural")
+    return result
 
 
 def store_prompt(preferences: dict, identifier: str, name: str, text: str, *, create=False) -> dict:

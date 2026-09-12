@@ -2,9 +2,53 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import unicodedata
 from pathlib import Path
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont
+
+
+def _validated_caption(caption: str) -> str:
+    if not isinstance(caption, str):
+        raise ValueError("이미지 설명은 한글을 포함한 10자 이내의 한 줄이어야 합니다.")
+    if not caption:
+        return ""
+    caption = unicodedata.normalize("NFC", caption)
+    if (len(caption) > 10 or not re.search(r"[가-힣]", caption)
+            or any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in caption)
+            or re.search(r"[a-z][a-z0-9+.-]*://|www\.|[a-z0-9가-힣-]+\.(?:[a-z]{2,}|한국)", caption, re.IGNORECASE)):
+        raise ValueError("이미지 설명은 공백을 포함해 10자 이내이며 한글을 포함해야 합니다. 줄바꿈과 URL은 사용할 수 없습니다.")
+    return caption.strip()
+
+
+def _draw_caption(pixels: Image.Image, caption: str, font_path: str | Path | None = None) -> tuple[Image.Image, dict]:
+    """Add a separate top band; never cover or crop pixels from the reference photo."""
+    font_path = Path(font_path or "C:/Windows/Fonts/malgunbd.ttf")
+    if not font_path.is_file():
+        raise ValueError("이미지 한글 설명에 필요한 한글 글꼴을 찾지 못했습니다.")
+    width = pixels.width
+    padding = max(12, round(width * .016))
+    maximum_width = width - padding * 2
+    size = max(24, round(width * .045))
+    drawing = ImageDraw.Draw(pixels)
+    while size >= 16:
+        font = ImageFont.truetype(str(font_path), size)
+        bounds = drawing.textbbox((0, 0), caption, font=font)
+        text_width, text_height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+        if text_width <= maximum_width:
+            break
+        size -= 1
+    else:
+        raise ValueError("이미지 폭이 좁아 한글 설명을 읽기 쉬운 크기로 배치할 수 없습니다.")
+    band_height = text_height + padding * 2
+    background, color = "#0C161D", "#F8FAFC"
+    result = Image.new("RGB", (width, pixels.height + band_height), background)
+    result.paste(pixels, (0, band_height))
+    draw = ImageDraw.Draw(result)
+    draw.text(((width - text_width) // 2 - bounds[0], padding - bounds[1]), caption, font=font, fill=color)
+    return result, {"caption_band_height": band_height, "caption_text_color": color,
+                    "caption_background_color": background, "caption_font": font_path.name}
 
 
 def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None = None) -> tuple[Image.Image, str]:
@@ -48,10 +92,14 @@ def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None
 
 
 def clean_export(source: str | Path, destination: str | Path, *, target_long_side: int = 2048,
-                 headline: str = "", font_path: str | Path | None = None) -> dict:
+                 headline: str = "", font_path: str | Path | None = None, caption: str = "") -> dict:
     source, destination = Path(source).resolve(), Path(destination).resolve()
     if source == destination:
         raise ValueError("생성 원본과 업로드 사본 경로는 달라야 합니다.")
+    caption = _validated_caption(caption)
+    if headline and caption:
+        raise ValueError("첫 사진 후킹 문구와 참고 이미지 설명은 동시에 적용할 수 없습니다.")
+    caption_style = {"caption_band_height": 0, "caption_text_color": "", "caption_background_color": "", "caption_font": ""}
     with Image.open(source) as original:
         oriented = ImageOps.exif_transpose(original)
         if "A" in oriented.getbands():
@@ -69,6 +117,8 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
             left, top = (pixels.width - side) // 2, (pixels.height - side) // 2
             pixels = pixels.crop((left, top, left + side, top + side))
             pixels, cover_color = _draw_cover(pixels, headline, font_path)
+        if caption:
+            pixels, caption_style = _draw_caption(pixels, caption, font_path)
         # Retain the source file and generation history separately from the upload copy.
         clean = Image.frombytes("RGB", pixels.size, pixels.tobytes())
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -81,4 +131,7 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
             "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "metadata_stripped": True,
             "delivery_format": "JPEG", "image_style": "photorealistic",
             "cover_headline": headline, "cover_text_applied": bool(headline),
-            "cover_text_color": cover_color, "cover_aspect_ratio": "1:1" if headline else ""}
+            "cover_text_color": cover_color, "cover_aspect_ratio": "1:1" if headline else "",
+            "caption_text": caption, "caption_applied": bool(caption),
+            "caption_placement": "top" if caption else "", "caption_layout": "separate_band" if caption else "",
+            **caption_style}
