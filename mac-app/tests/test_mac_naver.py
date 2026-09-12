@@ -47,7 +47,7 @@ class MacNaverTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.bot = MacNaverAutomation(self.root, MagicMock())
         self.url = "https://storage.googleapis.com/chrome-for-testing-public/150.0.7871.20/mac-arm64/chromedriver-mac-arm64.zip"
         self.metadata = json.dumps({"builds": {"150.0.7871": {"downloads": {

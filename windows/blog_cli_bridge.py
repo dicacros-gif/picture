@@ -18,7 +18,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -82,10 +84,11 @@ def _run(command: list[str], cwd: Path, *, stdin: bytes = b"", timeout: float = 
         raise BlogCliError("cancelled", "CLI 요청을 취소했습니다.")
     if not command or Path(command[0]).suffix.lower() in {".cmd", ".bat", ".ps1"}:
         raise BlogCliError("unsafe_launcher", "네이티브 실행 파일 또는 Node.js CLI가 필요합니다.")
+    mac_group = sys.platform == "darwin"
     try:
         child = subprocess.Popen(command, cwd=str(cwd), env=_child_environment(), shell=False,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 creationflags=_flags())
+                                 creationflags=_flags(), **({"start_new_session": True} if mac_group else {}))
     except OSError as exc:
         raise BlogCliError("launch_failed", "CLI를 실행할 수 없습니다. 설치 경로를 확인하세요.") from exc
     started, first = time.monotonic(), True
@@ -101,7 +104,34 @@ def _run(command: list[str], cwd: Path, *, stdin: bytes = b"", timeout: float = 
             except subprocess.TimeoutExpired:
                 first = False
     finally:
-        if child.poll() is None:
+        if mac_group:
+            # npm launchers can exit while their native CLI descendants still
+            # hold our pipes open. Own a separate group and reap it even when
+            # the launcher has already exited. The Mac backend's SIGTERM
+            # handler sets cancel_event, reaching here within the 0.2s poll.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                if child.poll() is None:
+                    child.kill()
+            try:
+                child.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                # A detached external descendant may retain a pipe. Never
+                # turn cancellation or a bounded CLI timeout into an endless
+                # communicate() while waiting for that unrelated process.
+                for stream in (child.stdin, child.stdout, child.stderr):
+                    if stream is not None:
+                        stream.close()
+                if child.poll() is None:
+                    child.kill()
+                try:
+                    child.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        elif child.poll() is None:
             if os.name == "nt":
                 try:
                     subprocess.run(["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],

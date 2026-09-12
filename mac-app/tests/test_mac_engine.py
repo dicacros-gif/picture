@@ -73,7 +73,7 @@ class MacEngineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.cancel = threading.Event()
         self.bridge = MagicMock()
         self.bridge.check_accounts.return_value = {provider: {'installed': True, 'auth_status': 'available'}

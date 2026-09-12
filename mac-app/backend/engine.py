@@ -340,7 +340,19 @@ def main():
     try:
         configure_mac_environment()
         if args.command == 'self-test':
-            emit('result', result={'ok': True, 'platform': sys.platform, 'engine': 'shared-cli-workflow'})
+            # Exercise frozen Pillow codecs and the Mac Korean font, not just imports.
+            from PIL import Image
+            from image_delivery import clean_export
+            original = args.data_dir / 'self-test-original.png'
+            Image.new('RGB', (640, 480), (42, 83, 72)).save(original)
+            caption = clean_export(original, args.data_dir / 'self-test-caption.jpg',
+                                   caption='맥 한글 확인', target_long_side=640)
+            cover = clean_export(original, args.data_dir / 'self-test-cover.jpg',
+                                 headline='맥 블로그', target_long_side=640)
+            if not caption.get('caption_text') or not cover.get('cover_text_applied'):
+                raise RuntimeError('한국어 이미지 출력 검사를 통과하지 못했습니다.')
+            emit('result', result={'ok': True, 'platform': sys.platform, 'engine': 'shared-cli-workflow',
+                                  'korean_image_export': True})
             return 0
         raw = sys.stdin.buffer.read(2 * 1024 * 1024 + 1)
         if len(raw) > 2 * 1024 * 1024:

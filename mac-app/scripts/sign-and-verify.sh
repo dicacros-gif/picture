@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+/bin/zsh -n Install-Blog.command
+/bin/zsh -n Install-Picture-Cleaner.command
 APP_PATH="dist/mac-arm64/Blog.app"
 ENGINE_ROOT="$APP_PATH/Contents/Resources/blog-backend"
 test -f "$ENGINE_ROOT/BlogEngine"
