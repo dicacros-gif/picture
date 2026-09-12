@@ -448,6 +448,95 @@ def _apply_humanize_response(article, response):
                       'accepted_patch_numbers': accepted, 'rejected_patches': rejected, 'metadata_filtered': omitted}
 
 
+def _apply_fact_recovery_response(article, response, review, keywords):
+    """The validated fact ledger owns every change; a returned full copy does not."""
+    if not isinstance(response, dict):
+        raise WorkflowFormatError("최종 사실 수정 응답은 변경 장부 객체여야 합니다.")
+    if 'review' in response:
+        # A legacy rejected response must never gain approval by changing its
+        # output format. New ledger-only replies make no approval assertion.
+        _validate_text_review(response['review'])
+    patches, additions = response.get('fact_corrections'), response.get('fact_additions')
+    if not isinstance(patches, list) or len(patches) > 16 or not isinstance(additions, list) or len(additions) > 4:
+        raise WorkflowFormatError("최종 사실 수정은 최대 16개 교체·4개 추가 장부여야 합니다.")
+    references = {url for item in [*patches, *additions] if isinstance(item, dict)
+        and isinstance(item.get('source_urls'), list) for url in item['source_urls'] if isinstance(url, str)}
+    supplied_sources = response.get('sources')
+    discarded_sources = []
+    if isinstance(supplied_sources, list):
+        for source in supplied_sources:
+            if isinstance(source, dict) and (source.get('verified') is False or source.get('is_primary') is False):
+                if source.get('url') in references:
+                    raise WorkflowError("최종 사실 수정 장부에 연결한 출처의 직접 확인·1차 자료 요건이 거절되었습니다.")
+                discarded_sources.append(source)
+        supplied_sources = [source for source in supplied_sources if source not in discarded_sources]
+    issues = review.get('issues', [])
+    if not isinstance(issues, list):
+        raise WorkflowFormatError("유효한 최종 검수 지적 배열이 필요합니다.")
+    lengths = {}
+    for item in [*patches, *additions]:
+        if (not isinstance(item, dict) or type(item.get('issue_index')) is not int
+                or not 0 <= item['issue_index'] < max(1, min(16, len(issues)))):
+            raise WorkflowFormatError("최종 사실 수정에 실제 검수 지적 번호가 필요합니다.")
+    for item in patches:
+        index, old = item.get('index'), item.get('old')
+        if type(index) is not int or not 0 <= index < 8 or not isinstance(old, str):
+            raise WorkflowFormatError("최종 사실 수정의 구역과 원문이 올바르지 않습니다.")
+        lengths[index] = lengths.get(index, 0) + len(old)
+        if lengths[index] > len(article['paragraphs'][index]) // 2:
+            raise WorkflowFormatError("최종 사실 수정은 구역 원문의 절반 이내여야 합니다.")
+    result = copy.deepcopy(article)
+    result.update(fact_corrections=copy.deepcopy(patches), fact_additions=copy.deepcopy(additions),
+                  sources=copy.deepcopy(supplied_sources))
+    try:
+        for item in patches:
+            index = item['index']
+            result['paragraphs'][index] = result['paragraphs'][index].replace(item['old'], item['new'], 1)
+        for item in additions:
+            index, text = item['index'], item['text'].strip()
+            if type(index) is not int or not 0 <= index < 8:
+                raise ValueError("추가 사실의 구역 번호가 올바르지 않습니다.")
+            section = result['paragraphs'][index]
+            footer = re.search(r'(?m)^[ \t]*#[^\s#]+(?:[ \t]+#[^\s#]+){9,}[ \t]*$', section)
+            result['paragraphs'][index] = (section[:footer.start()] + text + '\n\n' + section[footer.start():]
+                if footer and index == 7 else section + '\n\n' + text)
+        # This is still the original strict old/index/source/length/ledger
+        # validator. Assembly never licenses a fuzzy match or a guessed index.
+        check_role_change('팩트·최신 정보 보강', article, result)
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as exc:
+        raise WorkflowFormatError(str(exc)) from exc
+    fields = ('bridge_sentences', 'subheading_keywords', 'bold_terms', 'bold_phrases', 'highlight_phrases')
+    for field in fields:
+        values = result.get(field)
+        if not isinstance(values, list):
+            continue
+        for item in patches:
+            values = [value.replace(item['old'], item['new'])
+                if isinstance(value, str) and (field not in {'bridge_sentences', 'subheading_keywords'} or index == item['index'])
+                else value for index, value in enumerate(values)]
+        result[field] = values
+    result, metadata = _apply_humanize_response(result, {'paragraph_patches': [],
+        **{field: response[field] for field in fields if field in response}})
+    discarded = [field for field in ('title', 'title_intent', 'image_prompts', 'cover_headline', 'google_captions')
+                 if field in response and response[field] != article.get(field)]
+    supplied = response.get('paragraphs')
+    differences = ([i for i, (expected, actual) in enumerate(zip(result['paragraphs'], supplied)) if expected != actual]
+        if isinstance(supplied, list) and len(supplied) == 8 else list(range(8)) if 'paragraphs' in response else [])
+    changes = response.get('changes', response.get('review', {}).get('changes', []))
+    if not isinstance(changes, list) or any(not isinstance(value, str) for value in changes):
+        raise WorkflowFormatError("최종 사실 수정 설명은 문자열 배열이어야 합니다.")
+    details = {'protocol': 'ledger-v1', 'correction_count': len(patches), 'addition_count': len(additions),
+               'discarded_body_sections': differences, 'discarded_fields': discarded,
+               'metadata_filtered': metadata['metadata_filtered'], 'changes': changes,
+               'discarded_unverified_source_count': len(discarded_sources)}
+    # The original stage review is retained as historical metadata only. The
+    # independently reviewed final-copy gate remains mandatory after assembly.
+    result['fact_recovery_protocol'] = 'ledger-v1'
+    result['fact_recovery_changes'] = details
+    _validate_article(result, keywords, require_visual_style=True)
+    return result, details
+
+
 def derive_bold_terms(article: dict, keywords: list[str]) -> list[str]:
     """Formatting metadata only; never insert markup or new visible claims."""
     body = "\n".join(article.get("paragraphs", []))
@@ -873,7 +962,7 @@ class BlogWorkflow:
             raise WorkflowError(f"보존된 최종 검수 원고를 확인할 수 없습니다: {exc}") from exc
 
     def _repair_final_findings(self, run_dir, article, audit, keywords, topic, base_prompt,
-                               route, models, name, feedback, editorial_mode):
+                               route, models, name, feedback, editorial_mode, on_response=None):
         review = audit["review"]
         issues = [str(value)[:600] for value in review.get("issues", [])][:16]
         prompt = ("FINAL_FACT_TARGETED_REPAIR\n최종 검수에서 지적한 주장만 현재 1차 자료로 다시 확인한다. "
@@ -884,41 +973,132 @@ class BlogWorkflow:
             "지적과 무관한 제목·이미지 계획·검색 의도는 유지한다. 최대 16개 fact_corrections와 "
             "4개 fact_additions만 허용하며 구역별 교체 원문 총량은 해당 구역의 절반 이내다. "
             "각 수정·추가에 issue_index(issues 배열의 지적 번호)를 넣는다. issues가 비었으면 "
-            "검증되지 않은 검수 항목 자체를 issues[0]으로 취급한다.\n"
-            + self._article_prompt(topic, keywords, base_prompt, article, editorial_mode=editorial_mode)
-            + role_prompt("팩트·최신 정보 보강", True)
-            + "\nBEGIN_UNTRUSTED_FINAL_FINDINGS_JSON\n"
-            + json.dumps({"issues": issues or ["미승인 항목: " + ", ".join(
+            "검증되지 않은 검수 항목 자체를 issues[0]으로 취급한다. "
+            "old는 지정 구역에 정확히 한 번 있는 5~250자 원문이고 new는 교체문이다. "
+            "원문 위치를 추측하지 말고 0부터의 index를 확인한다. reason과 직접 확인한 source_urls를 기록한다. "
+            "추가 정보는 fact_additions의 index/text/source_urls로만 반환한다. "
+            "CLI 자체 검색·브라우저 도구만 사용하고 API 키나 HTTP API 호출 코드는 사용하지 않는다. "
+            "sources에는 새 변경과 유지하는 본문 사실을 뒷받침하는 실제 1차 자료를 모두 기록한다. "
+            "확인하지 않은 자료에 verified=true를 쓰지 않는다. 공개 문체에는 도구명·출처·URL·가짜 체험을 넣지 않는다. "
+            "응답은 fact_corrections, fact_additions, sources, changes 네 필드의 JSON 객체만 반환한다. "
+            "title·paragraphs·review·이미지 계획이나 원고 전체를 중복 출력하지 않는다. "
+            "본문은 앱이 검증된 장부만 적용하며 최종 사실 승인도 별도 검수에서 받는다.\n"
+            + "BEGIN_UNTRUSTED_FACT_REPAIR_JSON\n"
+            + json.dumps({"topic": topic, "related_keywords": keywords, "writing_brief": base_prompt,
+                "article": article, "editorial_mode": editorial_mode,
+                "issues": issues or ["미승인 항목: " + ", ".join(
                 flag for flag in ("facts_verified", "sources_verified", "search_intent_satisfied", "natural_korean")
-                if review.get(flag) is not True)], "review": review, "feedback": feedback}, ensure_ascii=False)
-            + "\nEND_UNTRUSTED_FINAL_FINDINGS_JSON")
-        result = self._text_call(run_dir, name, route["provider"], prompt,
+                if review.get(flag) is not True)], "review": review, "feedback": feedback,
+                "response_schema": {"fact_corrections": [{"index": 0, "old": "정확한 원문", "new": "교체문",
+                    "reason": "지적된 사실을 수정하는 이유", "source_urls": ["직접 확인한 자료 URL"], "issue_index": 0}],
+                    "fact_additions": [{"index": 0, "text": "직접 확인한 추가 정보", "source_urls": ["확인한 URL"], "issue_index": 0}],
+                    "sources": [{"title": "자료 제목", "url": "https://기관의실제주소/자료", "verified": True,
+                                 "is_primary": True, "supports": ["이 자료로 직접 확인한 사실"]}], "changes": ["실제 변경 설명"]}}, ensure_ascii=False)
+            + "\nEND_UNTRUSTED_FACT_REPAIR_JSON")
+        response = self._text_call(run_dir, name, route["provider"], prompt,
             {**models, route["provider"]: route.get("model", "")}, retry_transient=False)
-        patches, additions = result.get("fact_corrections"), result.get("fact_additions")
-        if not isinstance(patches, list) or len(patches) > 16 or not isinstance(additions, list) or len(additions) > 4:
-            raise WorkflowFormatError("최종 사실 수정은 최대 16개 교체·4개 추가 장부여야 합니다.")
-        lengths = {}
-        for item in [*patches, *additions]:
-            if (not isinstance(item, dict) or type(item.get("issue_index")) is not int
-                    or not 0 <= item["issue_index"] < max(1, len(issues))):
-                raise WorkflowFormatError("최종 사실 수정에 실제 검수 지적 번호가 필요합니다.")
-        for item in patches:
-            index, old = item.get("index"), item.get("old")
-            if type(index) is not int or not 0 <= index < 8 or not isinstance(old, str):
-                raise WorkflowFormatError("최종 사실 수정의 구역과 원문이 올바르지 않습니다.")
-            lengths[index] = lengths.get(index, 0) + len(old)
-            if lengths[index] > len(article["paragraphs"][index]) // 2:
-                raise WorkflowFormatError("최종 사실 수정은 구역 원문의 절반 이내여야 합니다.")
-        for field in ("title", "title_intent", "image_prompts", "cover_headline", "google_captions"):
-            if result.get(field) != article.get(field):
-                raise WorkflowFormatError(f"최종 사실 수정이 기존 {field} 값을 변경했습니다.")
-        _canonical_fact_spacing("팩트·최신 정보 보강", article, result)
-        try:
-            check_role_change("팩트·최신 정보 보강", article, result)
-        except ValueError as exc:
-            raise WorkflowFormatError(str(exc)) from exc
-        _validate_article(result, keywords, require_visual_style=True)
+        if on_response:
+            on_response()
+        result, details = _apply_fact_recovery_response(article, response, review, keywords)
+        if details['discarded_body_sections'] or details['discarded_fields']:
+            self.log("최종 사실 수정 · 반환된 전체 원고의 미기록 변경을 제외하고 검증된 변경 장부만 적용합니다.")
         return result
+
+    def _recover_failed_fact_response(self, path, saved, keywords, topic, base_prompt, route):
+        """Reparse a completed formatting failure once, never solicit a new reply."""
+        if saved.get('status') != 'repair_failed' or saved.get('saved_response_recovery'):
+            return None
+        article, audit = saved['article'], saved['last_audit']
+        upstream = _json_hash(article)
+        if audit.get('content_sha256') != _json_hash({key: article[key] for key in ('title', 'paragraphs')}):
+            return None
+        attempts = saved['repair_attempts']
+        if any(item.get('error_category') == 'review' or str(item.get('error', '')).startswith('CLI 원고 검수')
+               for item in attempts):
+            return None
+        try:
+            request = json.loads((path.parent / 'request.json').read_text(encoding='utf-8'))
+            request_hash = _json_hash({key: request.get(key, '') if key == 'revision_feedback' else request.get(key)
+                for key in ('topic', 'keywords', 'base_prompt', 'steps', 'models', 'stage_configs',
+                            'editorial_mode', 'quality_topic', 'revision_feedback')})
+            if request_hash != saved['context']['request_sha256']:
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        checks = []
+        for attempt in reversed(attempts):
+            number = attempt.get('number')
+            if (type(number) is not int or number not in (1, 2) or attempt.get('status') != 'failed'
+                    or attempt.get('upstream_sha256') != upstream or _route_key(attempt) != _route_key(route)):
+                continue
+            category = attempt.get('error_category')
+            legacy_format = category is None and str(attempt.get('error', '')).startswith((
+                '팩트 보강 단계가 기존 제목·문단을 변경했습니다.', 'fact_corrections[', 'fact_additions[', '최종 사실 수정'))
+            if category != 'format' and not legacy_format:
+                continue
+            name = path.stem + f'-repair-{number}'
+            try:
+                contents, hashes = {}, {}
+                for suffix in ('.prompt.txt', '.response.txt', '.json'):
+                    candidate = (path.parent / (name + suffix)).resolve()
+                    if not candidate.is_relative_to(path.parent.resolve()):
+                        raise ValueError('저장 응답 경로가 회차 밖입니다.')
+                    raw = candidate.read_bytes()
+                    hashes[suffix] = hashlib.sha256(raw).hexdigest()
+                    contents[suffix] = raw.decode('utf-8')
+                if category is not None and (attempt.get('response_received') is not True
+                        or attempt.get('response_artifacts') != hashes):
+                    raise ValueError('완료 응답의 저장 지문이 일치하지 않습니다.')
+                response = json.loads(contents['.json'])
+                if response != _parse_json(contents['.response.txt']):
+                    raise ValueError('원시 응답과 저장 JSON이 다릅니다.')
+                # Windows text writes use CRLF. Hash original bytes, but parse
+                # protocol markers with the same universal-newline semantics as read_text.
+                prompt = contents['.prompt.txt'].replace('\r\n', '\n').replace('\r', '\n')
+                if not prompt.startswith('FINAL_FACT_TARGETED_REPAIR\n'):
+                    raise ValueError('최종 사실 수정 요청이 아닙니다.')
+                if 'BEGIN_UNTRUSTED_FACT_REPAIR_JSON\n' in prompt:
+                    payload = json.loads(prompt.split('BEGIN_UNTRUSTED_FACT_REPAIR_JSON\n', 1)[1]
+                        .split('\nEND_UNTRUSTED_FACT_REPAIR_JSON', 1)[0])
+                    same_prompt = (payload.get('article') == article and payload.get('writing_brief') == base_prompt
+                        and payload.get('review') == audit['review'])
+                else:
+                    payload = json.loads(prompt.split('BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n', 1)[1]
+                        .split('\nEND_UNTRUSTED_RESEARCH_DATA_JSON', 1)[0])
+                    findings = json.loads(prompt.split('BEGIN_UNTRUSTED_FINAL_FINDINGS_JSON\n', 1)[1]
+                        .split('\nEND_UNTRUSTED_FINAL_FINDINGS_JSON', 1)[0])
+                    same_prompt = (payload.get('previous_draft') == article and findings.get('review') == audit['review']
+                        and json.dumps({'writing_brief': base_prompt}, ensure_ascii=False) in prompt)
+                if not same_prompt or payload.get('topic') != topic or payload.get('related_keywords') != keywords:
+                    raise ValueError('저장 요청의 원고·주제·연관어·검수 지적이 다릅니다.')
+                result, details = _apply_fact_recovery_response(article, response, audit['review'], keywords)
+                for suffix, digest in hashes.items():
+                    if hashlib.sha256((path.parent / (name + suffix)).read_bytes()).hexdigest() != digest:
+                        raise ValueError('검증 중 저장 응답이 바뀌었습니다.')
+                recovery = {'protocol': 'ledger-v1', 'attempt_number': number, 'response_artifacts': hashes,
+                    'upstream_sha256': upstream, 'article_sha256': _json_hash(result), 'route': dict(route),
+                    'checks': checks, 'discarded_body_sections': details['discarded_body_sections']}
+                # Preserve both charged attempts and their original errors. This
+                # durable marker prevents replay after the new semantic audit.
+                saved.update(saved_response_recovery=recovery, article=result, article_sha256=_json_hash(result),
+                             status='awaiting_audit')
+                _save_json(path, saved)
+                self.log(f"완료된 사실 수정 {number}회차 응답 재검증 · 새 작성 요청 없이 유효 장부만 복구하고 같은 CLI 최종 검수를 받습니다.")
+                if details['discarded_body_sections']:
+                    self.log('저장 응답의 미기록 본문 변경 제외: ' + ', '.join(str(i + 1) for i in details['discarded_body_sections']) + '구역')
+                return result
+            except WorkflowError as exc:
+                if not isinstance(exc, WorkflowFormatError):
+                    # A source/fact rejection is not permission to pick an older
+                    # favorable response, even when an earlier format failed.
+                    return None
+                checks.append({'attempt_number': number, 'error': str(exc)})
+            except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+                checks.append({'attempt_number': number, 'error': str(exc)})
+        if checks:
+            saved['saved_response_checks'] = checks
+            _save_json(path, saved)
+        return None
 
     def _finish_pending_review(self, path, saved, keywords, topic, base_prompt, models, manifest,
                                feedback="", editorial_mode="strict"):
@@ -936,6 +1116,9 @@ class BlogWorkflow:
             saved["status"] = "awaiting_audit"
             _save_json(path, saved)
             self.log("최종 검수 응답 형식 보완 · 같은 CLI에서 검수만 재개합니다.")
+        recovered = self._recover_failed_fact_response(path, saved, keywords, topic, base_prompt, route)
+        if recovered is not None:
+            article = recovered
         if saved.get("status") in {"rejected", "repairing", "repair_failed"}:
             if len(saved["repair_attempts"]) >= 2:
                 raise WorkflowError("동일 최종 원고의 사실 부분 수정 2회를 사용했습니다. 원고와 검수 지적을 보존합니다.")
@@ -947,15 +1130,23 @@ class BlogWorkflow:
             saved["status"] = "repairing"
             _save_json(path, saved)  # Count the CLI request before starting it.
             self.log(f"최종 검수 지적 부분 수정 {number}/2 · 승인된 작성 단계와 다른 문장은 유지합니다.")
+            name = path.stem + f"-repair-{number}"
+            def remember_response():
+                attempt.update(response_received=True, response_protocol='ledger-v1', response_artifacts={
+                    suffix: hashlib.sha256((path.parent / (name + suffix)).read_bytes()).hexdigest()
+                    for suffix in ('.prompt.txt', '.response.txt', '.json')})
+                _save_json(path, saved)
             try:
                 article = self._repair_final_findings(path.parent, article, saved["last_audit"], keywords,
-                    topic, base_prompt, route, models, path.stem + f"-repair-{number}", feedback, editorial_mode)
+                    topic, base_prompt, route, models, name, feedback, editorial_mode, on_response=remember_response)
                 self._check_cancelled()
                 attempt.update(status="completed", article_sha256=_json_hash(article))
                 saved.update(article=article, article_sha256=_json_hash(article), status="awaiting_audit")
                 _save_json(path, saved)
             except Exception as exc:
-                attempt.update(status="failed", error=str(exc))
+                category = ('cancelled' if self.cancel_event.is_set() else 'format' if isinstance(exc, WorkflowFormatError)
+                            else 'review' if isinstance(exc, WorkflowError) and not getattr(exc, 'code', None) else 'transport')
+                attempt.update(status="failed", error=str(exc), error_category=category)
                 saved["status"] = "repair_failed"
                 _save_json(path, saved)
                 raise

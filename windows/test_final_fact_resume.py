@@ -33,13 +33,12 @@ class FinalFactResumeTests(unittest.TestCase):
                 if cancel_repair and self.repair_count == 1:
                     self.cancel.set()
                     raise WorkflowError('사용자가 작업을 중지했습니다.')
-                payload = prompt.split('BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n')[1].split('\nEND_UNTRUSTED_RESEARCH_DATA_JSON')[0]
-                result = json.loads(payload)['previous_draft']
-                result['fact_corrections'] = []
+                payload = prompt.split('BEGIN_UNTRUSTED_FACT_REPAIR_JSON\n')[1].split('\nEND_UNTRUSTED_FACT_REPAIR_JSON')[0]
+                article = json.loads(payload)['article']
+                result = {'fact_corrections': [], 'sources': article['sources'], 'changes': []}
                 addition = '현재 적용 대상은 기기별 공식 안내에서 확인할 수 있습니다.'
                 result['fact_additions'] = [{'index': 0, 'text': addition, 'issue_index': 0,
                                             'source_urls': [result['sources'][0]['url']]}]
-                result['paragraphs'][0] += '\n\n' + addition
                 return json.dumps(result)
             if prompt.startswith('FINAL_ARTICLE_REVIEW'):
                 self.audit_count += 1
