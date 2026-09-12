@@ -4,8 +4,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -61,6 +62,8 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_models = {key: StringVar(value=model) for key, model in pref["models"].items()}
         self.cli_google = BooleanVar(value=pref["include_google"])
         self.cli_publication = StringVar(value=pref["publication_mode"])
+        self.cli_duplicate_keywords = StringVar(value=str(pref["duplicate_keyword_threshold"]))
+        self.cli_duplicate_titles = StringVar(value=str(pref["duplicate_title_threshold"]))
         self.cli_capability_text = StringVar(value="CLI 연결 확인을 눌러 설치·로그인 상태를 확인하세요.")
         self.cli_article = None
         self.cli_runtime_selectors = []
@@ -68,6 +71,20 @@ class BlogWorkflowControls(UnattendedControls):
         self.topic_history = TopicHistory(self.cli_app_dir / "published-topic-history.json")
         self.topic_history.import_legacy(self.auto_history)
         self.keyword_db = self.topic_history.filter_keywords(self.keyword_db)
+        self._cleanup_stale_artifacts()
+
+    def _cleanup_stale_artifacts(self):
+        cutoff = datetime.now().timestamp() - timedelta(days=7).total_seconds()
+        for parent_name in ("blog-runs", "google-reference-candidates"):
+            parent = self.cli_app_dir / parent_name
+            if not parent.is_dir():
+                continue
+            for path in parent.iterdir():
+                try:
+                    if path.is_dir() and path.stat().st_mtime < cutoff:
+                        shutil.rmtree(path)
+                except OSError as exc:
+                    self._naver_log(f"7일 경과 산출물 정리 실패 · {path}: {exc}")
 
     def _cli_blog_ui(self):
         self.blog_tab.columnconfigure(0, weight=1)
@@ -124,6 +141,10 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_blocked_terms.bind("<FocusOut>", self._save_cli_selection)
         ttk.Button(blocked, text="차단어 저장", command=self._save_cli_selection).pack(side="left", padx=5)
         ttk.Button(blocked, text="기본값 복원", command=self._restore_blocked_terms).pack(side="left")
+        ttk.Label(blocked, text=" 연관어 중복").pack(side="left")
+        ttk.Entry(blocked, textvariable=self.cli_duplicate_keywords, width=5).pack(side="left")
+        ttk.Label(blocked, text=" 제목 유사도").pack(side="left")
+        ttk.Entry(blocked, textvariable=self.cli_duplicate_titles, width=5).pack(side="left")
         ttk.Label(self.blog_tab, text="연관 검색어의 질문 → 제목·8문단 → CLI 교차 검수 → Antigravity 4장 + ChatGPT 4장 → 검수 통과 6장", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
         panes = ttk.Panedwindow(self.blog_tab, orient="horizontal")
         panes.grid(row=2, column=0, sticky="nsew")
@@ -174,6 +195,8 @@ class BlogWorkflowControls(UnattendedControls):
             include_google=self.cli_google.get(), publication_mode=self.cli_publication.get(),
             auto_start_on_launch=self.auto_start_on_launch.get(),
             blocked_terms=normalize_blocked_terms(self.cli_blocked_terms.get("1.0", "end")),
+            duplicate_keyword_threshold=float(self.cli_duplicate_keywords.get()),
+            duplicate_title_threshold=float(self.cli_duplicate_titles.get()),
         )
         self._sync_cli_step_boxes()
         self._persist_cli_preferences()
@@ -212,7 +235,7 @@ class BlogWorkflowControls(UnattendedControls):
                 self.status.set(str(exc))
                 self._naver_log(str(exc))
             else:
-                messagebox.showinfo("Picture Cleaner PC", str(exc))
+                messagebox.showinfo("Blog", str(exc))
             return False
         return True
 
@@ -255,6 +278,8 @@ class BlogWorkflowControls(UnattendedControls):
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
                 "save_draft": pref["publication_mode"] == "임시저장까지만", "completion_label": pref["publication_mode"],
                 "blocked_terms": pref["blocked_terms"],
+                "duplicate_keyword_threshold": pref["duplicate_keyword_threshold"],
+                "duplicate_title_threshold": pref["duplicate_title_threshold"],
                 "blog_id": self.blog_id.get().strip(), "prompt_id": selected["id"]}
 
     def check_blog_cli(self):
@@ -280,7 +305,7 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _start_cli_job(self, label, work):
         if self._browser_task_busy():
-            messagebox.showinfo("Picture Cleaner PC", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
+            messagebox.showinfo("Blog", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
             return
         self.naver_task_active = True
         self._set_cli_runtime_controls(True)
@@ -323,10 +348,12 @@ class BlogWorkflowControls(UnattendedControls):
         self.events.put(("cli_preparing", topic))
         self._preflight_cli_accounts(config)
         google = []
+        google_folder = None
         if config["include_google"]:
             self._naver_log("Google 이미지 후보 1·2번의 화면과 출처를 확인합니다.")
             try:
                 folder = self.cli_app_dir / "google-reference-candidates" / datetime.now().strftime("%Y%m%d-%H%M%S")
+                google_folder = folder
                 google = self.naver_bot.capture_google_reference_candidates(topic, folder, count=2)
             except Exception as exc:
                 self._naver_log(f"Google 참고 이미지 생략: {exc}")
@@ -334,6 +361,7 @@ class BlogWorkflowControls(UnattendedControls):
         article = workflow.prepare(topic, keywords, config["base_prompt"], config["steps"],
                                    config["review_mode"], models=config["models"], google_candidates=google)
         article["blog_id"] = config["blog_id"]
+        article["auxiliary_dirs"] = [str(google_folder)] if google_folder else []
         self.events.put(("cli_article", article))
         return article
 
@@ -356,7 +384,7 @@ class BlogWorkflowControls(UnattendedControls):
                 raise ValueError("주제를 입력하거나 관심 주제 자동 선정을 실행하세요.")
             self._ensure_topic_allowed(topic, [], config)
         except (ValueError, WorkflowError) as exc:
-            messagebox.showinfo("Picture Cleaner PC", str(exc))
+            messagebox.showinfo("Blog", str(exc))
             return
         self._start_cli_job("글·이미지 생성과 교차 검수", lambda: self._prepare_manual_cli_worker(topic, entered_keywords, config))
 
@@ -402,9 +430,15 @@ class BlogWorkflowControls(UnattendedControls):
         self.events.put(("cli_publication", result))
         try:
             if hasattr(self, "topic_history") and article.get("topic"):
-                if self.topic_history.record_publication(article["topic"], result, article.get("run_dir", "")):
-                    self.events.put(("cli_topic_consumed", article["topic"]))
+                if self.topic_history.record_publication(article["topic"], result, article.get("run_dir", ""),
+                                                         article.get("keywords", []), article.get("title", "")):
+                    consumed = [article["topic"], *article.get("keywords", [])]
+                    from keyword_database import consume, load_database, save_database
+                    database_path = self.cli_app_dir / "keywords.json"
+                    save_database(database_path, consume(load_database(database_path), consumed))
+                    self.events.put(("cli_topic_consumed", article["topic"], consumed))
                     self._naver_log(f"발행 확인 · '{article['topic']}' 키워드를 후보 목록에서 제외했습니다.")
+                    self._cleanup_published_artifacts(article)
                 elif result.get("status") == "uncertain":
                     self.topic_history.record_uncertain(article["topic"], result, article.get("run_dir", ""))
         except TopicHistoryError as exc:
@@ -420,12 +454,29 @@ class BlogWorkflowControls(UnattendedControls):
             raise RuntimeError(result.get("message") or "임시저장 완료를 확인하지 못했습니다.")
         return result
 
+    def _cleanup_published_artifacts(self, article):
+        """Delete only per-run artifacts below app-owned roots after a confirmed receipt was recorded."""
+        root = self.cli_app_dir.resolve()
+        allowed = [(root / "blog-runs").resolve(), (root / "google-reference-candidates").resolve()]
+        for raw in [article.get("run_dir", ""), *article.get("auxiliary_dirs", [])]:
+            if not raw:
+                continue
+            path = Path(raw).resolve()
+            if path == root or not any(path != parent and parent in path.parents for parent in allowed):
+                self._naver_log(f"산출물 정리 경로 차단: {path}")
+                continue
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+            except OSError as exc:
+                self._naver_log(f"발행 산출물 정리 실패 · {path}: {exc}")
+
     def publish_cli_article(self):
         if not self.cli_article:
-            messagebox.showinfo("Picture Cleaner PC", "먼저 글·이미지 준비를 완료하세요.")
+            messagebox.showinfo("Blog", "먼저 글·이미지 준비를 완료하세요.")
             return
         if self.blog_result.get("1.0", "end").strip() != self.cli_article["text"].strip():
-            messagebox.showinfo("Picture Cleaner PC", "검수 후 본문이 변경되었습니다. 글·이미지 준비를 다시 실행하세요.")
+            messagebox.showinfo("Blog", "검수 후 본문이 변경되었습니다. 글·이미지 준비를 다시 실행하세요.")
             return
         try:
             config = self._cli_configuration()
@@ -444,7 +495,7 @@ class BlogWorkflowControls(UnattendedControls):
             if automatic:
                 self.status.set("현재 작업 종료를 기다리고 있습니다.")
             else:
-                messagebox.showinfo("Picture Cleaner PC", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
+                messagebox.showinfo("Blog", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
             return
         try:
             config = self._cli_configuration(silent=automatic)
@@ -457,7 +508,7 @@ class BlogWorkflowControls(UnattendedControls):
                 self.status.set(str(exc))
                 self._naver_log(f"자동 시작 중단: {exc}")
             else:
-                messagebox.showinfo("Picture Cleaner PC", str(exc))
+                messagebox.showinfo("Blog", str(exc))
             return
         self._launch_auto_pending = self._login_success_pending = False
         self.full_auto_active = self.naver_task_active = True
@@ -480,12 +531,26 @@ class BlogWorkflowControls(UnattendedControls):
             topic = candidate["topic"]
             self._naver_log(f"후보 {index}/3 · '{topic}' 선정·원고·이미지 검수 시작")
             try:
-                choice = selector.select_topic([candidate], provider=provider,
-                    model=config.get("models", {}).get(provider, ""), blocked_terms=config.get("blocked_terms"))
+                selection_options = {"provider": provider, "model": config.get("models", {}).get(provider, ""),
+                                     "blocked_terms": config.get("blocked_terms")}
+                recent = self.topic_history.recent_publications(30) if hasattr(self, "topic_history") else None
+                if isinstance(recent, list):
+                    selection_options["recent_publications"] = recent
+                choice = selector.select_topic([candidate], **selection_options)
                 topic, keywords = choice["topic"], choice["keywords"]
                 self._ensure_topic_allowed(topic, keywords, config)
                 self.events.put(("auto_topic", groups, topic, keywords, related_by_topic[topic]))
                 article = self._prepare_cli_worker(topic, keywords, config)
+                if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, article.get("title", ""),
+                        keyword_threshold=config.get("duplicate_keyword_threshold", .4),
+                        title_threshold=config.get("duplicate_title_threshold", .5)) is True:
+                    raise WorkflowError("발행 이력과 연관어 또는 제목이 유사해 이번 후보를 제외합니다.", Path(article["run_dir"]))
+                selection_value = choice.get("selection_run_dir", "")
+                selection_dir = Path(selection_value) if selection_value else None
+                if selection_dir is not None and selection_dir.is_dir():
+                    destination = Path(article["run_dir"]) / "topic-review"
+                    if destination.exists(): shutil.rmtree(destination)
+                    shutil.move(str(selection_dir), str(destination))
                 break
             except Exception as exc:
                 if self.full_auto_stop.is_set():
@@ -495,6 +560,9 @@ class BlogWorkflowControls(UnattendedControls):
                     raise problem from exc
                 attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),
                                  "run_dir": getattr(exc, "run_dir", "")})
+                failed_dir = Path(getattr(exc, "run_dir", ""))
+                if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir():
+                    shutil.rmtree(failed_dir, ignore_errors=True)
                 self._write_cycle_attempts(attempts)
                 self._naver_log(f"'{topic}' 이번 회차 제외: {exc}")
         if article is None:

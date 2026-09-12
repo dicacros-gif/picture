@@ -304,8 +304,9 @@ class BlogUiTests(unittest.TestCase):
                 app.events.put(("related_split", 7, "사진", "", {"네이버": ["사진정리", "사진 파일 이동"]}, {}))
                 app._poll()
                 saved = json.loads((Path(directory) / "keywords.json").read_text(encoding="utf-8"))
-                self.assertNotIn("사진정리", saved)
-                self.assertIn("사진 파일 이동", saved)
+                saved_words = [item["keyword"] for item in saved["keywords"]]
+                self.assertNotIn("사진정리", saved_words)
+                self.assertIn("사진 파일 이동", saved_words)
 
 
 class BrowserJobConcurrencyTests(unittest.TestCase):

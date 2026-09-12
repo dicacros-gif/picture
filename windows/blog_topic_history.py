@@ -21,7 +21,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 _PATH_LOCKS: dict[str, threading.RLock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
-_EMPTY = {"version": 1, "published": {}, "pending": {}}
+_EMPTY = {"version": 2, "published": {}, "pending": {}}
+_TITLE_STOP = frozenset(("은", "는", "이", "가", "을", "를", "의", "에", "에서", "로", "으로", "와", "과", "도", "만", "부터", "까지", "에게", "처럼", "보다", "하고", "하는", "하면", "할", "수", "있는", "있을", "무엇", "왜", "어떻게"))
 
 
 class TopicHistoryError(RuntimeError):
@@ -43,6 +44,25 @@ def topic_key(value: str) -> str:
     """
     return "".join(character for character in normalize_topic(value).casefold()
                    if not character.isspace() and unicodedata.category(character)[0] not in {"P", "Z"})
+
+
+def title_terms(value) -> list[str]:
+    """Return stable title terms with punctuation and common Korean function words removed."""
+    if isinstance(value, (list, tuple, set)):
+        tokens = [normalize_topic(item).casefold() for item in value]
+    else:
+        tokens = re.findall(r"[0-9A-Za-z가-힣]+", normalize_topic(value).casefold())
+    cleaned = []
+    for token in tokens:
+        if token.startswith(("무엇", "어떻게")):
+            continue
+        for suffix in ("에서", "으로", "부터", "까지", "에게", "처럼", "보다", "은", "는", "이", "가", "을", "를", "의", "에", "도", "만"):
+            if len(token) > len(suffix) + 1 and token.endswith(suffix):
+                token = token[:-len(suffix)]
+                break
+        if len(token) >= 2 and token not in _TITLE_STOP:
+            cleaned.append(token)
+    return list(dict.fromkeys(cleaned))
 
 
 def _published_url(value) -> str:
@@ -139,12 +159,12 @@ class TopicHistory:
 
     def _read(self) -> dict:
         if not self.path.exists():
-            return {"version": 1, "published": {}, "pending": {}}
+            return {"version": 2, "published": {}, "pending": {}}
         try:
             if self.path.stat().st_size > 16 * 1024 * 1024:
                 raise ValueError("History is too large")
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            if (not isinstance(data, dict) or data.get("version") != 1
+            if (not isinstance(data, dict) or data.get("version") not in {1, 2}
                     or not isinstance(data.get("published"), dict) or not isinstance(data.get("pending"), dict)):
                 raise ValueError("Unsupported history format")
             for state in ("published", "pending"):
@@ -153,6 +173,11 @@ class TopicHistory:
                         raise ValueError("Invalid keyword entry")
                     if state == "published" and not _published_url(entry.get("url")):
                         raise ValueError("Missing confirmed post URL")
+            if data.get("version") == 1:
+                for entry in data["published"].values():
+                    entry["keywords"] = []
+                    entry["title_terms"] = title_terms(entry.get("title", ""))
+                data["version"] = 2
             return data
         except (OSError, ValueError, TypeError) as exc:
             raise TopicHistoryError("발행 주제 이력을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다. 이력 파일을 확인하세요.") from exc
@@ -175,9 +200,11 @@ class TopicHistory:
                 temporary.unlink(missing_ok=True)
 
     @staticmethod
-    def _entry(topic: str, result: dict, run_dir: str = "") -> dict:
+    def _entry(topic: str, result: dict, run_dir: str = "", keywords=None, title="") -> dict:
+        clean_keywords = TopicHistory._filtered(keywords or [], set())
+        resolved_title = normalize_topic(title or result.get("title", ""))[:500]
         return {"topic": normalize_topic(topic), "url": _published_url(result.get("url")),
-                "title": normalize_topic(result.get("title", ""))[:500],
+                "keywords": clean_keywords, "title": resolved_title, "title_terms": title_terms(resolved_title),
                 "article_key": str(result.get("article_key", ""))[:160],
                 "submitted_at": str(result.get("submitted_at", ""))[:100],
                 "recorded_at": datetime.now(timezone.utc).isoformat(), "run_dir": str(run_dir)[:2000]}
@@ -198,7 +225,7 @@ class TopicHistory:
             combined = {**data["pending"], **data["published"]}
             return [entry["topic"] for entry in combined.values()]
 
-    def record_publication(self, topic: str, result: dict, run_dir: str = "") -> bool:
+    def record_publication(self, topic: str, result: dict, run_dir: str = "", keywords=None, title="") -> bool:
         """Return True only when a new keyword is consumed; repeat receipts are idempotent."""
         key = topic_key(topic)
         if not key or not _confirmed(result):
@@ -208,7 +235,7 @@ class TopicHistory:
             new = key not in data["published"]
             changed = new or key in data["pending"]
             if new:
-                data["published"][key] = self._entry(topic, result, run_dir)
+                data["published"][key] = self._entry(topic, result, run_dir, keywords, title)
             data["pending"].pop(key, None)
             if changed:
                 self._write(data)
@@ -256,7 +283,32 @@ class TopicHistory:
     def _excluded_keys(self, include_pending: bool) -> set[str]:
         with self._locked():
             data = self._read()
-            return set(data["published"]) | (set(data["pending"]) if include_pending else set())
+            excluded = set(data["published"])
+            for entry in data["published"].values():
+                excluded.update(topic_key(item) for item in entry.get("keywords", []) if topic_key(item))
+            return excluded | (set(data["pending"]) if include_pending else set())
+
+    def recent_publications(self, limit: int = 30) -> list[dict]:
+        with self._locked():
+            entries = list(self._read()["published"].values())
+        entries.sort(key=lambda item: item.get("recorded_at", ""), reverse=True)
+        return [{"title": item.get("title", ""), "topic": item.get("topic", ""),
+                 "keywords": list(item.get("keywords", []))} for item in entries[:max(0, limit)]]
+
+    def is_duplicate(self, topic: str, keywords=None, title="", *, keyword_threshold=.4, title_threshold=.5) -> bool:
+        candidate_keywords = {topic_key(item) for item in [topic, *(keywords or [])] if topic_key(item)}
+        candidate_title = set(title_terms(title or topic))
+        with self._locked():
+            entries = self._read()["published"].values()
+            for entry in entries:
+                old_keywords = {topic_key(item) for item in [entry.get("topic", ""), *entry.get("keywords", [])] if topic_key(item)}
+                overlap = len(candidate_keywords & old_keywords) / max(1, min(len(candidate_keywords), len(old_keywords)))
+                old_title = set(entry.get("title_terms") or title_terms(entry.get("title", "")))
+                union = candidate_title | old_title
+                similarity = len(candidate_title & old_title) / len(union) if union else 0
+                if overlap >= float(keyword_threshold) or similarity >= float(title_threshold):
+                    return True
+        return False
 
     @staticmethod
     def _filtered(values, excluded: set[str]) -> list[str]:

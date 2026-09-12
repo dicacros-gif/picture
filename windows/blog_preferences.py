@@ -85,6 +85,11 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
     models = value.get("models", {})
     if not isinstance(models, dict):
         models = {}
+    def threshold(name, default):
+        try:
+            return max(.1, min(1.0, float(value.get(name, default))))
+        except (TypeError, ValueError):
+            return default
     return {
         "prompts": presets, "selected_prompt_id": selected,
         "default_revision": str(value.get("default_revision", "")),
@@ -94,6 +99,8 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         "include_google": value.get("include_google", True) is True,
         "auto_start_on_launch": value.get("auto_start_on_launch", True) is True,
         "blocked_terms": normalize_blocked_terms(value.get("blocked_terms")),
+        "duplicate_keyword_threshold": threshold("duplicate_keyword_threshold", .4),
+        "duplicate_title_threshold": threshold("duplicate_title_threshold", .5),
         "publication_mode": {"발행": "자동 발행", "자동 발행": "자동 발행", "임시저장": "임시저장까지만",
                              "임시저장까지만": "임시저장까지만", "입력만": "편집기에 입력만",
                              "편집기에 입력만": "편집기에 입력만"}.get(value.get("publication_mode"), "자동 발행"),

@@ -29,7 +29,7 @@ from blog_runtime import access_error_from_exception, wait_for_restart_parent
 from naver_automation import NaverAutomation
 
 
-APP_NAME = "Picture Cleaner PC"
+APP_NAME = "Blog"
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "PictureCleanerPC"
 CONFIG_FILE = APP_DIR / "settings.json"
 DB_FILE = APP_DIR / "keywords.json"
@@ -621,7 +621,9 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.events: queue.Queue[tuple] = queue.Queue()
         self.settings = load_json(CONFIG_FILE, {})
         self.dark_mode = BooleanVar(value=self.settings.get("dark_mode", False))
-        self.keyword_db = load_json(DB_FILE, [])
+        from keyword_database import load_database, words
+        self.keyword_db_records = load_database(DB_FILE)
+        self.keyword_db = words(self.keyword_db_records)
         self.last_outputs: list[Path] = []
         self.preview_ref = None
         self.status = StringVar(value="준비됨")
@@ -1780,6 +1782,11 @@ class PictureCleanerApp(BlogWorkflowControls):
 
         ranked = BlogWorkflow.rank_topics({source: [word for word in words if normalize_keyword(word) in candidates] for source, words in groups.items()}, related_by_topic,
             exclude_topics=self.topic_history.blocked_topics(), blocked_terms=blocked_terms)
+        preferences = config if config is not None else self.cli_preferences
+        ranked = [candidate for candidate in ranked if self.topic_history.is_duplicate(
+            candidate["topic"], candidate.get("keywords", []), candidate["topic"],
+            keyword_threshold=preferences.get("duplicate_keyword_threshold", .4),
+            title_threshold=preferences.get("duplicate_title_threshold", .5)) is not True]
         for candidate, related in related_by_topic.items():
             hits = blocked_term_hits(related, blocked_terms)
             if hits:
@@ -1795,7 +1802,11 @@ class PictureCleanerApp(BlogWorkflowControls):
         provider = config["steps"][0] if config is not None else self.cli_preferences["order"][0]
         models = config["models"] if config is not None else self.cli_preferences["models"]
         blocked_terms = (config if config is not None else self.cli_preferences).get("blocked_terms")
-        choice = selector.select_topic(ranked[:12], provider=provider, model=models.get(provider, ""), blocked_terms=blocked_terms)
+        selection_options = {"provider": provider, "model": models.get(provider, ""), "blocked_terms": blocked_terms}
+        recent = self.topic_history.recent_publications(30)
+        if isinstance(recent, list):
+            selection_options["recent_publications"] = recent
+        choice = selector.select_topic(ranked[:12], **selection_options)
         topic, related = choice["topic"], choice["keywords"]
         self._naver_log(f"선정: {topic} · 예상 관심 점수 {choice['score']} · {choice['reason']} (실제 CTR 아님)")
 
@@ -2316,8 +2327,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                         self.keyword_text.insert("1.0", "\n".join(merged))
                     self.seed.set(seed)
                     self.topic.set(compose_related_topic(seed, merged))
-                    self.keyword_db = self.topic_history.filter_keywords(self.keyword_db + merged)[-500:]
-                    save_json(DB_FILE, self.keyword_db)
+                    from keyword_database import merge, consume, save_database, words
+                    allowed = self.topic_history.filter_keywords(merged)
+                    self.keyword_db_records = merge(merge({}, self.keyword_db), allowed)
+                    blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
+                    self.keyword_db_records = consume(self.keyword_db_records, blocked)
+                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db = words(self.keyword_db_records)
                     if merged and failed_sources:
                         self.status.set(
                             f"'{seed}' 연관 검색어 {len(merged)}개 · "
@@ -2368,8 +2384,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self.topic.set(
                         compose_related_topic(seed, combined_keywords)
                     )
-                    self.keyword_db = self.topic_history.filter_keywords(self.keyword_db + combined_keywords)[-500:]
-                    save_json(DB_FILE, self.keyword_db)
+                    from keyword_database import merge, consume, save_database, words
+                    allowed = self.topic_history.filter_keywords(combined_keywords)
+                    self.keyword_db_records = merge(merge({}, self.keyword_db), allowed)
+                    blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
+                    self.keyword_db_records = consume(self.keyword_db_records, blocked)
+                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db = words(self.keyword_db_records)
                     full_failed = [
                         source for source, words in full_result.items() if not words
                     ]
@@ -2475,8 +2496,11 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self._set_cli_runtime_controls(False)
                 elif kind == "cli_topic_consumed":
                     self.realtime_groups = self.topic_history.filter_groups(self.realtime_groups)
-                    self.keyword_db = self.topic_history.filter_keywords(self.keyword_db)
-                    save_json(DB_FILE, self.keyword_db)
+                    from keyword_database import consume, merge, save_database, words
+                    consumed = event[2] if len(event) > 2 else [event[1]]
+                    self.keyword_db_records = consume(merge({}, self.keyword_db), consumed)
+                    save_database(DB_FILE, self.keyword_db_records)
+                    self.keyword_db = words(self.keyword_db_records)
                     self._render_keyword_groups(self.realtime_groups)
                     self.status.set(f"발행한 키워드 '{event[1]}' 제거 완료 · 다음 회차에는 다른 키워드를 선택합니다.")
                 elif kind == "cli_preparing":

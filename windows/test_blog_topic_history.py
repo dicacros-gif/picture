@@ -10,7 +10,7 @@ import unicodedata
 import unittest
 from unittest.mock import patch
 
-from blog_topic_history import TopicHistory, TopicHistoryError, normalize_topic, topic_key
+from blog_topic_history import TopicHistory, TopicHistoryError, normalize_topic, topic_key, title_terms
 
 
 def confirmed(log_no="223123456789", **extra):
@@ -56,6 +56,23 @@ class TopicHistoryTests(unittest.TestCase):
         self.assertFalse(self.history.record_publication("사진-정리!", confirmed()))
         self.assertEqual(self.path.read_bytes(), initial)
         self.assertEqual(len(self.history.published_topics()), 1)
+
+    def test_consumes_related_keywords_and_detects_similar_titles(self):
+        self.history.record_publication("전기요금 절약", confirmed(), keywords=["전기요금 절약 방법", "에어컨 전기요금"],
+                                        title="전기요금 절약 방법은 무엇일까요?")
+        self.assertEqual(self.history.filter_keywords(["에어컨 전기요금", "새 주제"]), ["새 주제"])
+        self.assertTrue(self.history.is_duplicate("다른 표현", ["에어컨 전기요금", "전기요금 절약 방법"], "완전히 다른 제목"))
+        self.assertTrue(self.history.is_duplicate("다른 표현", ["새 연관어"], "전기요금 절약 방법"))
+        self.assertFalse(self.history.is_duplicate("사진 정리", ["사진 정리 방법"], "사진 정리 순서는 어떻게 정할까요?"))
+
+    def test_version_one_history_is_migrated_in_memory(self):
+        self.history.record_publication("기존", confirmed())
+        data = json.loads(self.path.read_text(encoding="utf-8")); data["version"] = 1
+        for entry in data["published"].values():
+            entry.pop("keywords", None); entry.pop("title_terms", None)
+        self.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        self.assertEqual(TopicHistory(self.path).recent_publications()[0]["keywords"], [])
+        self.assertTrue(title_terms("전기요금 절약 방법은 무엇일까요"))
 
     def test_draft_prepared_uncertain_and_failed_results_do_not_consume(self):
         for result in (
