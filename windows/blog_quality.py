@@ -5,6 +5,8 @@ import copy
 import re
 from difflib import SequenceMatcher
 
+from blog_numeric_claims import numeric_claim_issues, _numeric_value
+
 FORBIDDEN = ("질문", "소제목", "예를 들어", "예컨대", "또한", "결론적으로", "오늘은 알아보겠습니다")
 ATTRIBUTION = re.compile(r"(?:Antigravity|안티그래비티|ChatGPT|Claude|클로드|챗GPT|CLI|AI)(?:가|에서|로|를 통해|는)?\s*(?:직접\s*)?(?:확인|검증|검수|작성|생성)", re.I)
 PUBLIC_SOURCE = re.compile(r"https?\S*|www\.\S*|출처|참고\s*자료", re.I)
@@ -34,6 +36,7 @@ def inspect_article(article, keywords, topic, *, mode='strict'):
     if not isinstance(paragraphs, list) or len(paragraphs) != 8 or any(not isinstance(p, str) for p in paragraphs):
         add('sections', -1, '', '본문 구역은 정확히 8개 문자열이어야 합니다.')
         return issues
+    issues.extend(numeric_claim_issues(article))
     total = sum(len(p.replace('\n', '')) for p in paragraphs)
     if total < 4000:
         add('total_length', -1, '', f'본문 {total}자: 4000자 이상 필요')
@@ -140,6 +143,27 @@ def apply_patches(article, response, issues):
     for field in ('bridge_sentences', 'subheading_keywords', 'bold_terms', 'bold_phrases', 'highlight_phrases'):
         if field in response and isinstance(response[field], list) and all(isinstance(s, str) for s in response[field]):
             result[field] = response[field]
+    if 'numeric_claims' in response:
+        proposed = copy.deepcopy(response['numeric_claims'])
+        checked = {**result, 'numeric_claims': proposed}
+        invalid = [item for item in numeric_claim_issues(checked) if item['code'] == 'numeric_claim_metadata']
+        if invalid:
+            raise ValueError('수치 기록이 수정한 실제 본문과 일치하지 않습니다: ' + invalid[0]['detail'])
+        previous = article.get('numeric_claims', [])
+        for claim in previous if isinstance(previous, list) else []:
+            # Existing grounded evidence cannot disappear just by clearing a
+            # metadata array. Edited/removed quotes are checked against the new
+            # copy; the code never removes a sentence to match its metadata.
+            if numeric_claim_issues({'paragraphs': result['paragraphs'], 'numeric_claims': [claim]}):
+                continue
+            retained = any(new['section_index'] == claim['section_index']
+                and _numeric_value(new['value']) == _numeric_value(claim['value'])
+                and re.sub(r'\s+', ' ', new['unit']).strip().casefold() == re.sub(r'\s+', ' ', claim['unit']).strip().casefold()
+                and (new['quote'] in claim['quote'] or claim['quote'] in new['quote']) for new in proposed)
+            if not retained:
+                raise ValueError('본문에 남은 수치 기록을 메타데이터에서만 삭제할 수 없습니다. '
+                                 f"numeric_claims의 {claim['section_index'] + 1}번 구역 원문 기록을 유지하세요.")
+        result['numeric_claims'] = proposed
     return result
 
 

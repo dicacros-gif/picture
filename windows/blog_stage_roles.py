@@ -109,6 +109,16 @@ def check_role_change(role, previous, result):
                 raise ValueError(f'fact_corrections[{number}]: 팩트 부분 수정의 원문·구역·사유가 올바르지 않습니다. '
                                  'index는 유효한 0부터의 정수, old는 해당 구역에 한 번 있는 5~250자 원문, '
                                  'new는 문자열, reason은 비어 있지 않은 사유여야 합니다.')
+            if after == '':
+                paragraph = corrected[index]
+                position = paragraph.index(before)
+                prefix, suffix = paragraph[:position], paragraph[position + len(before):]
+                starts_sentence = position == 0 or prefix.endswith('\n') or bool(re.search(r'[.!?。]\s*$', prefix))
+                if (not starts_sentence or not re.search(r'[.!?。]$', before.strip())
+                        or (suffix and not suffix[0].isspace()) or before.lstrip().startswith(('❝', '─', '#'))):
+                    raise ValueError(f'fact_corrections[{number}] (index={index}): '
+                                     '불확실한 주장 제거는 완전한 문장 단위여야 합니다. '
+                                     '숫자·부정어·조건절만 삭제할 수 없습니다.')
             urls = patch.get('source_urls', [])
             source_error = _fact_source_error(urls, sources, verified) if after else ''
             if source_error:

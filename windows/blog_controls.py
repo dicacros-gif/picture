@@ -35,11 +35,11 @@ def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
 
 def _google_search_context_hash(topic, keywords, config):
     """Invalidate the optional-search receipt when its inputs or policy change."""
-    context = {"version": 2, "topic": topic, "keywords": keywords,
+    context = {"version": 3, "topic": topic, "keywords": keywords,
                "count": config.get("google_reference_count", 4),
                "steps": config.get("steps"), "models": config.get("models"),
                "stage_configs": config.get("stage_configs"),
-               "reuse_only": True, "english_only": True}
+               "reuse_only": True, "english_only": True, "allow_attribution": True}
     return hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -546,7 +546,7 @@ class BlogWorkflowControls(UnattendedControls):
                         # A later query can start with already captured photos.
                         # Scan a full bounded batch, then retain only the missing unique photos.
                         candidates = self.naver_bot.capture_google_reference_candidates(query, folder / f"query-{number}",
-                            count=goal, reuse_only=True, english_only=True)
+                            count=goal, reuse_only=True, english_only=True, allow_attribution=True)
                         # Returning normally includes a bounded scan with no eligible
                         # photo or unavailable previews. Exceptions remain retryable.
                         completed_queries += 1

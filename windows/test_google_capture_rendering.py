@@ -21,7 +21,8 @@ class GoogleCaptureRenderingTests(unittest.TestCase):
         self.assertEqual(self.driver.execute_cdp_cmd.call_args_list[-1].args,
                          ('Emulation.setFocusEmulationEnabled', {'enabled': False}))
         self.bot._capture_google_reference_candidates.assert_called_once_with(
-            self.driver, 'gas station photo', 'unused', 2, reuse_only=True, english_only=True)
+            self.driver, 'gas station photo', 'unused', 2, reuse_only=True, english_only=True,
+            allow_attribution=False)
 
     def test_failure_restores_capture_focus_without_hiding_original_error(self):
         self.bot._capture_google_reference_candidates.side_effect = RuntimeError('cancelled')

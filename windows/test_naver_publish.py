@@ -1036,7 +1036,7 @@ class ReferenceLicenseTests(unittest.TestCase):
         scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [3, 4], 4, 2, False, 0),
                      ([{}] * 61, [], 60, 4, False, 0),
                      ([reusable] * 12, list(range(1, 11)), 10, 20, False, 0),
-                     ([reusable], [62], 1, 1, False, 61),
+                     ([reusable], [1], 1, 1, False, 61),
                      ([{**reusable, "english_source_verified": False},
                        {**reusable, "english_source_verified": True, "source_language": "en"}], [2], 2, 1, True, 0)]
         for rights, expected_ranks, expected_checks, requested, english, small_count in scenarios:
@@ -1079,6 +1079,8 @@ class ReferenceLicenseTests(unittest.TestCase):
                 diagnostics = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
                 self.assertEqual(diagnostics["scanned_count"], expected_checks)
                 self.assertEqual(diagnostics["rejection_counts"].get("thumbnail_too_small", 0), small_count)
+                self.assertEqual(diagnostics["photo_candidates"][0]["rank"], 1)
+                self.assertEqual(diagnostics["photo_candidates"][0]["dom_index"], small_count + 1)
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
                 self.assertEqual(query["q"], [keyword + " site:commons.wikimedia.org"])
                 if english:
@@ -1206,8 +1208,9 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
                 record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
                 self.assertEqual(len(images), 0 if error == "always" else 1)
                 self.assertEqual(state["clicks"], 4 if error == "always" else 2)
-                attempts = [attempt for attempt in record["preview_attempts"] if attempt["rank"] == 2]
+                attempts = [attempt for attempt in record["preview_attempts"] if attempt["rank"] == 1]
                 self.assertEqual([attempt["attempt"] for attempt in attempts], [1, 2])
+                self.assertTrue(all(attempt['dom_index'] == 2 for attempt in attempts))
                 self.assertEqual([attempt["status"] for attempt in attempts], ["retry", "failed" if error == "always" else "ready"])
 
     def test_stop_during_loading_or_preview_never_retries_or_checks_license(self):

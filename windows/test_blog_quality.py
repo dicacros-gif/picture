@@ -13,6 +13,96 @@ import test_blog_controls as ui_tests
 
 
 class EditorialTests(unittest.TestCase):
+    def numeric_article(self):
+        article = valid_article()
+        article['numeric_claims'] = []
+        for index, value in ((1, 118), (7, 120)):
+            quote = f'현재 기준 휴일은 {value}일입니다.'
+            article['paragraphs'][index] += '\n\n' + quote
+            article['numeric_claims'].append({'subject': '현재 기준 실질 휴일', 'value': value,
+                'unit': '일', 'section_index': index, 'quote': quote})
+        return article
+
+    def test_numeric_conflicts_are_reported_in_both_editorial_modes(self):
+        article = self.numeric_article()
+        for mode in ('strict', 'natural'):
+            with self.subTest(mode=mode):
+                issues = inspect_article(article, KEYWORDS, TOPIC, mode=mode)
+                conflicts = [item for item in issues if item['code'] == 'numeric_claim_conflict']
+                self.assertEqual([item['index'] for item in conflicts], [1, 7])
+                self.assertEqual(conflicts[0]['text'], article['numeric_claims'][0]['quote'])
+
+    def test_legacy_articles_do_not_require_numeric_metadata(self):
+        issues = inspect_article(valid_article(), KEYWORDS, TOPIC)
+        self.assertFalse(any(item['code'].startswith('numeric_claim_') for item in issues))
+
+    def test_numeric_metadata_updates_are_checked_after_text_patches(self):
+        article = self.numeric_article()
+        claims = copy.deepcopy(article['numeric_claims'])
+        old, new = claims[0]['quote'], '초기 발표의 휴일은 118일입니다.'
+        claims[0].update(subject='초기 발표 기준 휴일', quote=new)
+        response = {'paragraph_patches': [{'index': 1, 'old': old, 'new': new}], 'numeric_claims': claims,
+                    'review': {'approved': False}, 'sources': []}
+        original = copy.deepcopy(article)
+        result = apply_patches(article, response, [{'index': 1, 'code': 'numeric_claim_conflict'}])
+        self.assertEqual(article, original)
+        self.assertEqual(result['review'], article['review'])
+        self.assertEqual(result['sources'], article['sources'])
+        self.assertEqual(result['numeric_claims'][0]['quote'], new)
+        self.assertFalse(any(i['code'].startswith('numeric_claim_') for i in inspect_article(result, KEYWORDS, TOPIC)))
+        response['numeric_claims'][0]['quote'] = '응답 객체의 나중 변경'
+        self.assertEqual(result['numeric_claims'][0]['quote'], new)
+
+    def test_false_numeric_metadata_does_not_rewrite_copy_or_create_truth(self):
+        for field, value in (('quote', '존재하지 않는 120일 문장'), ('value', 8), ('section_index', 0), ('unit', '회')):
+            with self.subTest(field=field):
+                article = self.numeric_article()
+                before = copy.deepcopy(article)
+                claims = copy.deepcopy(article['numeric_claims'])
+                claims[0][field] = value
+                with self.assertRaisesRegex(ValueError, '실제 본문'):
+                    apply_patches(article, {'paragraph_patches': [], 'numeric_claims': claims}, [])
+                self.assertEqual(article, before)
+
+    def test_grounded_conflicts_cannot_be_hidden_by_clearing_metadata(self):
+        article = self.numeric_article()
+        with self.assertRaisesRegex(ValueError, '메타데이터에서만 삭제'):
+            apply_patches(article, {'paragraph_patches': [], 'numeric_claims': []}, [])
+
+    def test_actual_removed_numeric_quote_can_be_removed_from_metadata(self):
+        article = self.numeric_article()
+        quote = article['numeric_claims'][0]['quote']
+        response = {'paragraph_patches': [{'index': 1, 'old': quote, 'new': '발표 기준의 적용 시점을 확인합니다.'}],
+                    'numeric_claims': copy.deepcopy(article['numeric_claims'][1:])}
+        result = apply_patches(article, response, [{'index': 1, 'code': 'numeric_claim_conflict'}])
+        self.assertNotIn(quote, result['paragraphs'][1])
+        self.assertEqual(result['numeric_claims'], response['numeric_claims'])
+
+    def test_period_disambiguation_can_change_subject_without_changing_numbers(self):
+        article = self.numeric_article()
+        claims = copy.deepcopy(article['numeric_claims'])
+        claims[0]['subject'] = '초기 발표 기준 실질 휴일'
+        result = apply_patches(article, {'numeric_claims': claims}, [])
+        self.assertEqual(result['paragraphs'], article['paragraphs'])
+        self.assertEqual(result['numeric_claims'], claims)
+
+    def test_grounded_conflicting_metadata_remains_visible_to_inspection(self):
+        article = self.numeric_article()
+        result = apply_patches(article, {'numeric_claims': copy.deepcopy(article['numeric_claims'])}, [])
+        self.assertIn('numeric_claim_conflict', {i['code'] for i in inspect_article(result, KEYWORDS, TOPIC)})
+
+    def test_local_cleanup_never_deletes_or_recalculates_numeric_findings(self):
+        article = self.numeric_article()
+        issues = [i for i in inspect_article(article, KEYWORDS, TOPIC) if i['code'].startswith('numeric_claim_')]
+        result, changes = local_cleanup(article, issues)
+        self.assertEqual(result, article)
+        self.assertEqual(changes, [])
+
+    def test_omitted_numeric_update_preserves_existing_evidence(self):
+        article = self.numeric_article()
+        result = apply_patches(article, {'paragraph_patches': []}, [])
+        self.assertEqual(result['numeric_claims'], article['numeric_claims'])
+
     def test_checks_report_structural_style_and_metadata_problems(self):
         article = valid_article()
         article['paragraphs'][0] += '\n있습니다. 있습니다. 있습니다.\nAntigravity가 검수했습니다.\n출처: https://example.com\n또한 확인해요.'

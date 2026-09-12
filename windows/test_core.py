@@ -1878,7 +1878,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("_redistribute_smarteditor_images(", method)
         self.assertIn("_copy_image_to_windows_clipboard", fallback)
         self.assertIn("ActionChains(driver)", fallback)
-        self.assertIn("Keys.CONTROL", fallback)
+        self.assertIn("self.EDITOR_MODIFIER", fallback)
 
     def test_draft_button_filter_never_returns_publish(self):
         class Element:

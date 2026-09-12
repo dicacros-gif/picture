@@ -12,6 +12,44 @@ from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _validate_a
 
 
 class RoleInvariantTests(unittest.TestCase):
+    def fact_deletion(self, paragraph, old):
+        previous = {'title': '삭제 경계 검사', 'paragraphs': [paragraph]}
+        result = copy.deepcopy(previous)
+        result['paragraphs'][0] = paragraph.replace(old, '', 1)
+        result.update(sources=[], fact_corrections=[{'index': 0, 'old': old, 'new': '',
+            'reason': '확인할 수 없는 주장 제거', 'source_urls': []}], fact_additions=[])
+        return previous, result
+
+    def test_fact_fragment_deletion_cannot_join_digits_into_a_new_amount(self):
+        previous, result = self.fact_deletion('한도는 100만원이 아닌 200만원입니다.', '만원이 아닌 2')
+        self.assertEqual(result['paragraphs'][0], '한도는 10000만원입니다.')
+        before = copy.deepcopy(previous)
+        with self.assertRaisesRegex(ValueError, '완전한 문장'):
+            check_role_change('팩트·최신 정보 보강', previous, result)
+        self.assertEqual(previous, before)
+
+    def test_fact_fragment_deletion_cannot_remove_negation_or_conditions(self):
+        for paragraph, old in (
+            ('이 제도는 지원하지 않는다고 합니다.', '않는다고 '),
+            ('한도는 조건을 충족하는 경우에만 적용됩니다.', '조건을 충족하는 경우에만 '),
+        ):
+            with self.subTest(old=old):
+                previous, result = self.fact_deletion(paragraph, old)
+                with self.assertRaisesRegex(ValueError, '완전한 문장'):
+                    check_role_change('팩트·최신 정보 보강', previous, result)
+
+    def test_fact_whole_sentence_deletion_without_invented_sources_is_allowed(self):
+        old = '확인되지 않은 한도는 200만원입니다.'
+        for paragraph in (old, old + ' 남은 안내를 읽습니다.',
+                          '먼저 안내를 읽습니다. ' + old + '\n다음 안내를 읽습니다.',
+                          '──────────────\n❝ 한도 확인\n\n' + old):
+            with self.subTest(paragraph=paragraph):
+                previous, result = self.fact_deletion(paragraph, old)
+                original = copy.deepcopy(result)
+                check_role_change('팩트·최신 정보 보강', previous, result)
+                self.assertEqual(result, original)
+                self.assertNotIn(old, result['paragraphs'][0])
+
     def fact_added_before_footer(self):
         previous = support.valid_article()
         result = copy.deepcopy(previous)

@@ -1766,7 +1766,7 @@ class NaverAutomation:
                 "license_verified": True,
                 "license_url": license_url,
                 "license": "CC0 1.0" if "/zero/" in license_path else (
-                    "Public Domain Mark 1.0" if public_domain else license_path.removeprefix("/licenses/").upper()
+                    "Public Domain Mark 1.0" if public_domain else "CC BY " + license_path.rsplit("/", 1)[-1]
                 ),
                 "commercial_use_allowed": True,
                 "modification_allowed": True,
@@ -1775,7 +1775,13 @@ class NaverAutomation:
                 "attribution": f"{file_name[1]} · {author or 'Wikimedia Commons'} · {source_url} · {license_url} · 크기 조정",
                 "share_alike": "/by-sa/" in license_path,
                 "attribution_required": by_license,
+                "source_title": file_name[1], "source_author": author,
             })
+            if by_license:
+                result.update(license_evidence_type="commons_file_cc_by_template",
+                              attribution_modifications="이미지 화면 캡처 및 크기 조정")
+                result["attribution"] = NaverAutomation.reference_attribution_text(
+                    {**result, "source_url": source_url, "image_url": image_url})
             break
         if not result["license_verified"]:
             for template in page.get("public_domain_templates", []):
@@ -1798,6 +1804,58 @@ class NaverAutomation:
                     "attribution": f"{file_name[1]} · {author or 'Wikimedia Commons'} · {source_url}",
                 })
                 break
+        return result
+
+    @staticmethod
+    def _commons_attribution_license_verified(item: dict) -> bool:
+        """Validate retained file-specific CC BY evidence before allowing credit reuse."""
+        source = urllib.parse.urlparse(str(item.get("source_url", "")))
+        original = urllib.parse.urlparse(str(item.get("image_url", "")))
+        license_url = urllib.parse.urlparse(str(item.get("license_url", "")))
+        file_name = urllib.parse.unquote(source.path).split("/wiki/File:", 1)
+        license_match = re.fullmatch(r"/licenses/by/(2\.0|2\.5|3\.0|4\.0)/?", license_url.path)
+        return bool(
+            item.get("license_verified") is True
+            and item.get("license_evidence_type") == "commons_file_cc_by_template"
+            and item.get("commercial_use_allowed") is True and item.get("modification_allowed") is True
+            and item.get("attribution_required") is True and item.get("share_alike") is False
+            and source.scheme in {"http", "https"} and source.hostname == "commons.wikimedia.org"
+            and not source.username and not source.password
+            and original.scheme in {"http", "https"} and original.hostname == "upload.wikimedia.org"
+            and len(file_name) == 2 and file_name[1]
+            and file_name[1].replace(" ", "_") in urllib.parse.unquote(original.path).split("/")
+            and item.get("license_evidence_url") == item.get("source_url")
+            and item.get("source_title") == file_name[1]
+            and isinstance(item.get("source_author"), str) and item["source_author"].strip()
+            and license_url.scheme == "https" and license_url.hostname == "creativecommons.org"
+            and not license_url.username and not license_url.password and license_match
+            and item.get("license") == "CC BY " + license_match.group(1)
+        )
+
+    @staticmethod
+    def reference_attribution_text(item: dict) -> str:
+        """Keep credit separate from the article; the publisher must render this text."""
+        if not NaverAutomation._commons_attribution_license_verified(item):
+            raise ValueError("출처 표시에 필요한 원본 파일·작가·CC BY 라이선스 근거가 없습니다.")
+        modifications = item.get("attribution_modifications", "")
+        if not isinstance(modifications, str) or not modifications.strip():
+            raise ValueError("참고 이미지의 변경 내용을 표시해야 합니다.")
+        return " · ".join((str(item["source_title"]), str(item["source_author"]), str(item["license"]),
+                           str(item["source_url"]), str(item["license_url"]), "변경: " + modifications.strip()))
+
+    @staticmethod
+    def _required_image_attributions(images: list[dict]) -> dict[str, str]:
+        """Derive exact public credit from verified image metadata, never article prose."""
+        result = {}
+        for index, item in enumerate(sorted(images, key=lambda value: value['paragraph_index'])):
+            if item.get('provider') != 'google' or item.get('attribution_required') is not True:
+                continue
+            if item.get('allow_attribution') is not True:
+                raise ValueError('출처 표시가 필요한 참고 이미지의 공개 표시 옵션이 필요합니다.')
+            credit = NaverAutomation.reference_attribution_text(item)
+            if item.get('attribution') != credit:
+                raise ValueError('참고 이미지의 작가·라이선스·변경 내역 출처 문구가 일치하지 않습니다.')
+            result[str(index)] = credit
         return result
 
     @staticmethod
@@ -1838,8 +1896,10 @@ class NaverAutomation:
         if english_only:
             unverified.update(source_language="", english_source_verified=False)
         source = urllib.parse.urlparse(source_url)
+        if not source_url:
+            return {**unverified, "source_inspection_status": "source_url_missing"}
         if source.hostname != "commons.wikimedia.org" or "/wiki/File:" not in source.path:
-            return unverified
+            return {**unverified, "source_inspection_status": "unsupported_license_source"}
         previous = driver.current_window_handle
         opened = None
         try:
@@ -1859,9 +1919,9 @@ class NaverAutomation:
             if english_only:
                 if (actual.scheme not in {"https", "http"} or actual.hostname != source.hostname
                         or urllib.parse.unquote(actual.path) != urllib.parse.unquote(source.path)):
-                    return unverified
+                    return {**unverified, "source_inspection_status": "source_redirect_mismatch"}
             elif driver.current_url.split("#", 1)[0] != source_url.split("#", 1)[0]:
-                return unverified
+                return {**unverified, "source_inspection_status": "source_redirect_mismatch"}
             page = driver.execute_script("""
                 const authorLabel = document.getElementById('fileinfotpl_aut');
                 const englishDescription=[...document.querySelectorAll(
@@ -1886,10 +1946,11 @@ class NaverAutomation:
             evidence = self._commons_license_evidence(source_url, image_url, page or {})
             if english_only:
                 evidence.update(self._reference_language_evidence(page or {}, driver.current_url))
+            evidence["source_inspection_status"] = "inspected"
             return evidence
         except Exception as exc:
             self.log(f"참고 이미지 원문 라이선스를 확인하지 못해 제외 대상으로 표시합니다: {exc}")
-            return unverified
+            return {**unverified, "source_inspection_status": "source_inspection_failed"}
         finally:
             if opened is not None:
                 try:
@@ -1933,7 +1994,8 @@ class NaverAutomation:
                     pass
 
     def capture_google_reference_candidates(
-        self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
+        self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False,
+        english_only: bool = False, allow_attribution: bool = False
     ) -> list[dict]:
         keyword = str(keyword or "").strip()
         if not keyword:
@@ -1945,17 +2007,20 @@ class NaverAutomation:
         # render without moving the user's windows or changing image CSS.
         with self._google_capture_rendering(driver):
             return self._capture_google_reference_candidates(
-                driver, keyword, output_dir, count, reuse_only=reuse_only, english_only=english_only)
+                driver, keyword, output_dir, count, reuse_only=reuse_only, english_only=english_only,
+                allow_attribution=allow_attribution)
 
     def _capture_google_reference_candidates(
-        self, driver, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
+        self, driver, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False,
+        english_only: bool = False, allow_attribution: bool = False
     ) -> list[dict]:
         """Capture up to ten eligible previews; licensing/vision gates stay explicit.
 
         Screenshots contain only the image element. Embedded text or watermarks
         are preserved and must be rejected by the later CLI visual review.
         reuse_only scans past ineligible results, accepting only file-specific
-        Commons licenses that permit reuse without a public attribution line.
+        Commons licenses permitting reuse; CC BY additionally requires explicit
+        allow_attribution and retained author/title/license/change credit data.
         english_only requires an English query and observed English source-page
         language, independently of Google's language filter.
         """
@@ -1982,6 +2047,7 @@ class NaverAutomation:
         termination_reason = ""
         consecutive_preview_failures = 0
         diagnostics = {"query": keyword, "english_only": english_only, "reuse_only": reuse_only,
+                       "allow_attribution": allow_attribution,
                        "requested_count": count, "selector": selector, "scan_limit": 60,
                        "candidate_time_budget_seconds": 90, "preview_failure_limit": 3,
                        "thumbnails_found": 0, "scanned_count": 0, "rejection_counts": {}, "rejections": [],
@@ -1991,6 +2057,8 @@ class NaverAutomation:
                 return ""
             return re.sub(r"https?://[^\s<>]+", lambda m: self._reference_diagnostic_url(m.group()), value)[:limit]
         def reject(rank, reason, **observed):
+            if rank in photo_dom_indices:
+                observed.setdefault("dom_index", photo_dom_indices[rank])
             counts = diagnostics["rejection_counts"]
             counts[reason] = counts.get(reason, 0) + 1
             for key in list(observed):
@@ -2015,6 +2083,7 @@ class NaverAutomation:
             self.log(f"Google 참고 이미지 진단 · 검색 요소 {diagnostics['thumbnails_found']}개 · "
                      f"검토 {diagnostics['scanned_count']}개 · 확보 {len(candidates)}/{count}장 · 제외: {counts}")
         latest_photos, latest_rejections = [], []
+        photo_dom_indices = {}
         previous_signature, stable_polls = None, 0
         def settled_photos(d):
             nonlocal latest_photos, latest_rejections, previous_signature, stable_polls
@@ -2062,7 +2131,11 @@ class NaverAutomation:
             finish("search_error")
             raise
         for rank, reason, observed in latest_rejections:
-            reject(rank, reason, **observed)
+            reject(0, reason, dom_index=rank, **observed)
+        # Rank photographs in their result order, independently of preceding
+        # suggestion chips and each card's tiny website icon.
+        photo_dom_indices = {rank: item[0] for rank, item in enumerate(eligible_thumbnails, 1)}
+        eligible_thumbnails = [(rank, item[1], item[2]) for rank, item in enumerate(eligible_thumbnails, 1)]
         diagnostics["eligible_thumbnails"] = len(eligible_thumbnails)
         if not eligible_thumbnails:
             reject(0, "search_results_missing")
@@ -2072,10 +2145,12 @@ class NaverAutomation:
         for rank, thumbnail, element_id in eligible_thumbnails[:60]:
             try:
                 diagnostics["photo_candidates"].append({"rank": rank, "id": safe_text(element_id, 120),
+                    "dom_index": photo_dom_indices[rank],
                     "alt": safe_text(thumbnail.get_attribute("alt")),
                     "src": self._reference_diagnostic_url(thumbnail.get_attribute("src"))})
             except StaleElementReferenceException:
-                diagnostics["photo_candidates"].append({"rank": rank, "id": safe_text(element_id, 120), "stale": True})
+                diagnostics["photo_candidates"].append({"rank": rank, "dom_index": photo_dom_indices[rank],
+                    "id": safe_text(element_id, 120), "stale": True})
         seen: set[str] = set()
         candidate_started = time.monotonic()
         # The scan budget applies to photographs, not icons preceding them.
@@ -2131,7 +2206,8 @@ class NaverAutomation:
                             viable.append((info["width"] * info["height"], element, info))
                     return max(viable, key=lambda value: value[0])[1:] if viable else None
                 for attempt in range(1, 3):
-                    attempt_record = {"rank": rank, "attempt": attempt, "selector_counts": {}}
+                    attempt_record = {"rank": rank, "dom_index": photo_dom_indices[rank],
+                                      "attempt": attempt, "selector_counts": {}}
                     diagnostics["preview_attempts"].append(attempt_record)
                     try:
                         if self.stop_event.is_set():
@@ -2171,22 +2247,36 @@ class NaverAutomation:
                 source_url = self._reference_source_url(links or [])
                 evidence = self._inspect_reference_license(driver, source_url, info["url"], english_only=True) if english_only else \
                     self._inspect_reference_license(driver, source_url, info["url"])
+                inspection = evidence.get("source_inspection_status")
+                if (english_only or reuse_only) and inspection in {
+                        "source_url_missing", "unsupported_license_source", "source_redirect_mismatch", "source_inspection_failed"}:
+                    seen.add(info["url"])
+                    reject(rank, inspection, source_url=source_url)
+                    reason = {"source_url_missing": "원문 주소를 찾지 못해",
+                              "unsupported_license_source": "이 원문 사이트의 이미지 사용 조건을 검증할 수 없어",
+                              "source_redirect_mismatch": "원문 이동 후 파일 주소가 달라",
+                              "source_inspection_failed": "원문 페이지를 열어 확인하지 못해"}[inspection]
+                    self.log(f"Google 참고 이미지 {rank}번 · {reason} 다음 후보를 확인합니다.")
+                    continue
                 if english_only and evidence.get("english_source_verified") is not True:
                     seen.add(info["url"])
                     reject(rank, "english_source_unverified", source_url=source_url,
                            source_language=evidence.get("source_language", ""))
                     self.log(f"Google 참고 이미지 {rank}번 · 영어 원문 페이지를 확인하지 못해 다음 후보를 확인합니다.")
                     continue
+                credited_reuse = (allow_attribution and self._commons_attribution_license_verified(
+                    {**evidence, "source_url": source_url, "image_url": info["url"]}))
                 if reuse_only and (evidence.get("license_verified") is not True
                         or evidence.get("commercial_use_allowed") is not True
                         or evidence.get("modification_allowed") is not True
-                        or evidence.get("attribution_required") is not False
+                        or not (evidence.get("attribution_required") is False or credited_reuse)
                         or evidence.get("share_alike") is not False):
                     seen.add(info["url"])
                     reject(rank, "reuse_rights_unverified", source_url=source_url,
                            license_verified=evidence.get("license_verified", False), license_url=evidence.get("license_url", ""),
                            attribution_required=evidence.get("attribution_required"))
-                    self.log(f"Google 참고 이미지 {rank}번 · 출처 표시 없는 재사용 권한을 확인하지 못해 다음 후보를 확인합니다.")
+                    required = "출처 표시와 재사용" if allow_attribution else "출처 표시 없는 재사용"
+                    self.log(f"Google 참고 이미지 {rank}번 · {required} 권한을 확인하지 못해 다음 후보를 확인합니다.")
                     continue
                 stage = "capture"
                 if self.stop_event.is_set():
@@ -2208,7 +2298,8 @@ class NaverAutomation:
                 candidate = {
                     "path": str(path.resolve()), "provider": "google", "query": keyword,
                     "capture_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                    "search_rank": rank, "source_url": source_url, "url": source_url,
+                    "search_rank": rank, "search_dom_index": photo_dom_indices[rank],
+                    "source_url": source_url, "url": source_url,
                     "image_url": info["url"], "width": image.width, "height": image.height,
                     "source_width": info["width"], "source_height": info["height"],
                     "capture_width": capture_size[0], "capture_height": capture_size[1],
@@ -2216,6 +2307,7 @@ class NaverAutomation:
                     "vision_reviewed": False, "license_filter": "Creative Commons (not proof)",
                     "reuse_only": reuse_only,
                     "english_only": english_only,
+                    "allow_attribution": allow_attribution,
                     "captured_at": datetime.now().isoformat(timespec="seconds"), **evidence,
                 }
                 candidates.append(candidate)
@@ -3311,14 +3403,19 @@ class NaverAutomation:
                     raise ValueError("Google 참고 이미지의 재사용 및 크기 조정 권한이 확인되지 않았습니다.")
                 if item.get("share_alike"):
                     raise ValueError("동일조건변경허락 참고 이미지는 자동 발행 대상에서 제외합니다.")
-                if item.get("attribution_required"):
-                    raise ValueError("공개 출처 표시가 필요한 참고 이미지는 이 글의 자동 발행 대상에서 제외합니다.")
+                credited = (item.get("attribution_required") is True
+                            and item.get("allow_attribution") is True
+                            and NaverAutomation._commons_attribution_license_verified(item))
+                if item.get("attribution_required") and not credited:
+                    raise ValueError("공개 출처 표시가 필요한 참고 이미지의 검증된 CC BY 근거와 표시 옵션이 없습니다.")
+                if credited and item.get('attribution') != NaverAutomation.reference_attribution_text(item):
+                    raise ValueError("참고 이미지의 공개 출처 문구가 원본·작가·라이선스·변경 내용과 다릅니다.")
                 license_parts = urllib.parse.urlparse(str(item["license_url"]))
                 cc_public_domain = (license_parts.scheme == "https" and license_parts.hostname == "creativecommons.org"
                                     and license_parts.path.rstrip("/") in {"/publicdomain/zero/1.0", "/publicdomain/mark/1.0"})
-                if (not (cc_public_domain or NaverAutomation._commons_public_domain_license_verified(item))
-                        or item.get("attribution_required") is not False):
-                    raise ValueError("참고 이미지에는 출처 표시가 필요 없는 CC0 또는 공개 도메인 라이선스 확인이 필요합니다.")
+                if not (credited or ((cc_public_domain or NaverAutomation._commons_public_domain_license_verified(item))
+                                     and item.get("attribution_required") is False)):
+                    raise ValueError("참고 이미지에는 CC0·공개 도메인 또는 출처 표시를 갖춘 CC BY 라이선스 확인이 필요합니다.")
             reviews = item.get("reviews")
             if item.get("approved") is not True or not isinstance(reviews, list) or not reviews or any(
                 not isinstance(review, dict) or review.get("approved") is not True for review in reviews
@@ -3420,6 +3517,7 @@ class NaverAutomation:
             base_style.pop(key, None)
         base_style["fontColor"] = BODY_TEXT_COLOR
         fresh_id = lambda: "SE-" + str(uuid.uuid4())
+        credit_map = cls._image_credit_map(visual_style)
         arranged = []
         for index, value in enumerate(paragraphs):
             component = json.loads(json.dumps(template))
@@ -3450,7 +3548,18 @@ class NaverAutomation:
                     arranged.append(part)
             else:
                 arranged.append(component)
-            arranged.extend(by_id[image_id] for image_id, position in zip(image_ids, positions) if position == index)
+            for image_index, (image_id, position) in enumerate(zip(image_ids, positions)):
+                if position != index:
+                    continue
+                arranged.append(by_id[image_id])
+                if str(image_index) in credit_map:
+                    credit = json.loads(json.dumps(template))
+                    credit.update(id=fresh_id(), value=[{
+                        'id': fresh_id(), '@ctype': 'paragraph',
+                        'style': paragraph_template.get('style', {'@ctype': 'paragraphStyle', 'align': 'left'}),
+                        'nodes': [{'id': fresh_id(), '@ctype': 'textNode',
+                                   'value': credit_map[str(image_index)], 'style': dict(base_style)}]}])
+                    arranged.append(credit)
         # Fresh writer only: unknown components are unsafe to silently keep in a new article.
         header = [item for item in components if item.get("@ctype") == "documentTitle"]
         allowed = {"documentTitle", "text", "image"} | ({"quotation"} if quote_layouts else set())
@@ -3458,6 +3567,44 @@ class NaverAutomation:
             raise RuntimeError("예상하지 못한 편집기 콘텐츠가 있어 발행을 중단했습니다.")
         document["document"]["components"] = header + arranged
         return document
+
+    @staticmethod
+    def _image_credit_map(visual_style) -> dict[str, str]:
+        credit_map = (visual_style or {}).get('image_attributions', {})
+        if not isinstance(credit_map, dict) or any(
+                not isinstance(key, str) or not re.fullmatch(r'0|[1-9][0-9]*', key)
+                or not isinstance(value, str) or not value.strip() or '\n' in value or '\r' in value
+                for key, value in credit_map.items()):
+            raise ValueError('참고 이미지 출처 표시 계획이 올바르지 않습니다.')
+        return credit_map
+
+    @classmethod
+    def _strip_image_credit_components(cls, data, image_ids, visual_style):
+        """Validate each credit immediately after its image before excluding it from body checks."""
+        credit_map = cls._image_credit_map(visual_style)
+        if not credit_map:
+            return data
+        expected = {image_ids[int(key)]: value for key, value in credit_map.items() if int(key) < len(image_ids)}
+        components = data.get('document', {}).get('components', [])
+        kept, consumed, cursor = [], set(), 0
+        while cursor < len(components):
+            part = components[cursor]
+            kept.append(part)
+            cursor += 1
+            if part.get('@ctype') != 'image' or part.get('id') not in expected:
+                continue
+            if part['id'] in consumed or cursor >= len(components):
+                raise ValueError('참고 이미지 출처 표시가 누락되거나 중복됐습니다.')
+            credit = components[cursor]
+            text = '\n'.join(''.join(str(node.get('value', '')) for node in row.get('nodes', []))
+                             for row in credit.get('value', []))
+            if credit.get('@ctype') != 'text' or text != expected[part['id']]:
+                raise ValueError('이미지 바로 아래의 출처 문구가 작가·라이선스·변경 내용과 다릅니다.')
+            consumed.add(part['id'])
+            cursor += 1
+        if consumed != set(expected):
+            raise ValueError('필수 이미지 출처 표시가 누락됐습니다.')
+        return {**data, 'document': {**data.get('document', {}), 'components': kept}}
 
     @classmethod
     def _read_article_document(cls, driver) -> dict:
@@ -3474,6 +3621,10 @@ class NaverAutomation:
         *, bold_terms: list[str] | None = None, bold_style: dict | None = None, visual_style: dict | None = None,
     ) -> bool:
         quote_layouts = (visual_style or {}).get("quote_layouts")
+        try:
+            data = cls._strip_image_credit_components(data, image_ids, visual_style)
+        except (ValueError, IndexError, TypeError, KeyError):
+            return False
         if quote_layouts:
             try:
                 data = cls._collapse_quoted_document(data, paragraphs, quote_layouts)
@@ -3630,8 +3781,11 @@ class NaverAutomation:
                      for line in section.split("\n")] for index, section in enumerate(paragraphs)]
         if not any(emphasized for section in expected for row in section for _value, emphasized in row):
             return True
-        rendered = driver.execute_script("""
+        rendered = driver.execute_script(r"""
+            const creditTexts=new Set(arguments[0]);
             return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"], .se-component.se-quotation')]
+              .filter(component=>!creditTexts.has([...component.querySelectorAll('.se-text-paragraph')]
+                .map(row=>(row.innerText||'').replace(/\u200b/g,'')).join('\n')))
               .map(component=>[...component.querySelectorAll(component.classList.contains('se-quotation') ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')].map(row=>{
                 const walk=document.createTreeWalker(row,NodeFilter.SHOW_TEXT), nodes=[];
                 while(walk.nextNode()) {
@@ -3640,7 +3794,7 @@ class NaverAutomation:
                 }
                 return nodes;
               }));
-        """)
+        """, list(cls._image_credit_map(visual_style).values()))
         if not isinstance(rendered, list):
             return False
         expected_rows, actual_rows = [r for section in expected for r in section], [r for section in rendered for r in section]
@@ -3659,8 +3813,11 @@ class NaverAutomation:
 
     @classmethod
     def _article_native_colors_rendered(cls, driver, paragraphs, bold_terms=None, visual_style=None, *, published=False) -> bool:
-        rendered = driver.execute_script("""
+        rendered = driver.execute_script(r"""
+            const creditTexts=new Set(arguments[0]);
             return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"], .se-component.se-quotation')]
+              .filter(component=>!creditTexts.has([...component.querySelectorAll('.se-text-paragraph')]
+                .map(row=>(row.innerText||'').replace(/\u200b/g,'')).join('\n')))
               .map(component=>[...component.querySelectorAll(component.classList.contains('se-quotation') ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')].map(row=>{
                 const walk=document.createTreeWalker(row,NodeFilter.SHOW_TEXT), nodes=[];
                 while(walk.nextNode()) {
@@ -3678,7 +3835,7 @@ class NaverAutomation:
                 }
                 return nodes;
               }));
-        """)
+        """, list(cls._image_credit_map(visual_style).values()))
         def rgb(value):
             return 'rgb(' + ', '.join(str(int(value[i:i+2], 16)) for i in (1, 3, 5)) + ')' if value else ''
         if not isinstance(rendered, list):
@@ -3710,6 +3867,52 @@ class NaverAutomation:
         return True
 
     @classmethod
+    def _article_attributions_rendered(cls, driver, visual_style) -> bool:
+        credit_map = cls._image_credit_map(visual_style)
+        if not credit_map:
+            return True
+        observed = driver.execute_script(r"""
+            const root=document.querySelector('.se-main-container')||document;
+            const visible=e=>{
+              if(!e.getClientRects().length) return false;
+              for(let node=e;node && node.nodeType===1;node=node.parentElement) {
+                const s=getComputedStyle(node);
+                if(s.display==='none'||s.visibility==='hidden'||s.visibility==='collapse'||Number(s.opacity)===0) return false;
+              }
+              return true;
+            };
+            return [...root.querySelectorAll('.se-component')].map(component=>({
+              type:component.matches('.se-image, [data-name="image"]')?'image':
+                component.matches('.se-text, [data-name="text"]')?'text':'other',
+              text:[...component.querySelectorAll('.se-text-paragraph')]
+                .map(row=>(row.innerText||'').replace(/\u200b/g,'')).join('\n'),
+              visible:visible(component)
+            }));
+        """)
+        return cls._image_credit_snapshot_matches(observed, credit_map)
+
+    @staticmethod
+    def _image_credit_snapshot_matches(observed, credit_map) -> bool:
+        if not isinstance(observed, list):
+            return False
+        found, image_index = set(), -1
+        for index, component in enumerate(observed):
+            if not isinstance(component, dict) or component.get('type') != 'image':
+                continue
+            image_index += 1
+            key = str(image_index)
+            if key not in credit_map:
+                continue
+            if index + 1 >= len(observed):
+                return False
+            credit = observed[index + 1]
+            if (not isinstance(credit, dict) or credit.get('type') != 'text'
+                    or credit.get('visible') is not True or credit.get('text') != credit_map[key]):
+                return False
+            found.add(key)
+        return found == set(credit_map)
+
+    @classmethod
     def _article_ready_to_publish(
         cls, driver, title: str, paragraphs: list[str], image_ids: list[str], positions: list[int],
         *, bold_terms: list[str] | None = None, bold_style: dict | None = None, visual_style: dict | None = None,
@@ -3721,6 +3924,7 @@ class NaverAutomation:
             return False
         return (cls._verify_article_document(cls._read_article_document(driver), paragraphs, image_ids, positions,
                                              bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style)
+                and cls._article_attributions_rendered(driver, visual_style)
                 and cls._article_native_bold_rendered(driver, paragraphs, bold_terms, visual_style)
                 and (not bold_style or cls._article_native_colors_rendered(driver, paragraphs, bold_terms, visual_style)))
 
@@ -3805,10 +4009,23 @@ class NaverAutomation:
         actual_sections = snapshot.get("sections", [])
         actual_images = snapshot.get("images", [])
         visual_style = article.get('visual_style')
+        try:
+            credits = self._required_image_attributions(images)
+        except (ValueError, KeyError, TypeError):
+            return {'verified': False, 'url': url, 'attributions_rendered': False,
+                    'message': '게시 이미지의 필수 출처 문구와 사용 조건 기록을 확인하지 못했습니다.'}
+        if credits:
+            visual_style = {**(visual_style or {}), 'image_attributions': credits}
+        if credits and 'components' not in snapshot:
+            return {'verified': False, 'url': url, 'attributions_rendered': False,
+                    'message': '게시 이미지 바로 아래의 필수 출처 표시를 확인하지 못했습니다.'}
         if visual_style and 'components' in snapshot:
             try:
-                collapsed = self._collapse_quoted_document({'document':{'components':snapshot['components']}},
-                                                            paragraphs, visual_style['quote_layouts'])
+                component_ids = [part.get('id') for part in snapshot['components'] if part.get('@ctype') == 'image']
+                collapsed = self._strip_image_credit_components(
+                    {'document': {'components': snapshot['components']}}, component_ids, visual_style)
+                if visual_style.get('quote_layouts'):
+                    collapsed = self._collapse_quoted_document(collapsed, paragraphs, visual_style['quote_layouts'])
                 actual_sections, actual_images = [], []
                 for part in collapsed['document']['components']:
                     if part['@ctype'] == 'text':
@@ -3816,7 +4033,8 @@ class NaverAutomation:
                     elif part['@ctype'] == 'image':
                         actual_images.append({'id':part['id'],'position':len(actual_sections)-1})
             except (ValueError, IndexError, KeyError, TypeError):
-                return {'verified':False,'url':url,'message':'인용구와 본문 구역 배치가 저장된 원고와 다릅니다.'}
+                return {'verified':False,'url':url,'attributions_rendered':False if credits else True,
+                        'message':'인용구·본문 구역 또는 이미지 출처 배치가 저장된 원고와 다릅니다.'}
         expected_positions = sorted(item["paragraph_index"] for item in images)
         text_matches = (len(actual_sections) == 8 and
                         [value.strip() for value in actual_sections] == [value.strip() for value in paragraphs])
@@ -3825,11 +4043,13 @@ class NaverAutomation:
                             [item.get("id") for item in actual_images] == expected_image_ids)
         bold_matches = self._article_native_bold_rendered(driver, paragraphs, article.get("bold_terms", []), visual_style)
         colors_match = not visual_style or self._article_native_colors_rendered(driver, paragraphs, article.get('bold_terms', []), visual_style, published=True)
-        verified = text_matches and position_matches and bold_matches and colors_match and identity_matches is not False
+        credit_matches = self._article_attributions_rendered(driver, visual_style)
+        verified = text_matches and position_matches and bold_matches and colors_match and credit_matches and identity_matches is not False
         return {"verified": bool(verified), "url": url, "title_matches": True,
                 "section_count": len(actual_sections), "sections_match": text_matches,
                 "image_count": len(actual_images), "image_positions_match": position_matches,
-                "image_identity_matches": identity_matches, "bold_rendered": bold_matches, "colors_rendered": colors_match}
+                "image_identity_matches": identity_matches, "bold_rendered": bold_matches, "colors_rendered": colors_match,
+                "attributions_rendered": credit_matches}
 
     @classmethod
     def _publication_key(cls, blog_id: str, article: dict) -> str:
@@ -4032,6 +4252,7 @@ class NaverAutomation:
             article["visual_style"] = visual_style
         if not isinstance(visual_style, dict) or len(visual_style.get("quote_layouts", [])) != len(paragraphs):
             raise ValueError("저장된 소제목 인용구 설정이 올바르지 않습니다.")
+        visual_style['image_attributions'] = self._required_image_attributions(images)
         # Reuse saved quote layouts and highlight colors when refreshing an
         # older prepared article. This changes presentation, never its text.
         visual_style['bold_phrases'] = supplement_bold_phrases(
@@ -4129,7 +4350,8 @@ class NaverAutomation:
                       "image_positions_match": "사진 수 또는 배치가 다릅니다.",
                       "image_identity_matches": "게시 사진의 식별 정보가 다릅니다.",
                       "bold_rendered": "중요 내용의 굵은 서식을 확인하지 못했습니다.",
-                      "colors_rendered": "본문 강조 색상을 확인하지 못했습니다."}
+                      "colors_rendered": "본문 강조 색상을 확인하지 못했습니다.",
+                      "attributions_rendered": "이미지의 필수 출처·작가·라이선스·변경 표시를 확인하지 못했습니다."}
             issues = [message for flag, message in labels.items() if snapshot.get(flag) is False]
             if isinstance(snapshot.get("message"), str) and snapshot["message"]:
                 issues.append(snapshot["message"])
