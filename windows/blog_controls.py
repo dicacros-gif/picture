@@ -17,7 +17,7 @@ from tkinter.scrolledtext import ScrolledText
 from blog_cli_bridge import BlogCliBridge
 from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLES, normalize_preferences,
                               store_prompt, normalize_blocked_terms, blocked_term_hits, atomic_json_write, save_settings_json)
-from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic
+from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic, _text_review_schema_valid
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
 
@@ -551,6 +551,8 @@ class BlogWorkflowControls(UnattendedControls):
         resume_options["editorial_mode"] = config.get("editorial_mode", "natural")
         if config.get("revision_feedback"):
             resume_options["revision_feedback"] = config["revision_feedback"]
+        if config.get("final_review_feedback"):
+            resume_options["final_review_feedback"] = config["final_review_feedback"]
         if config.get("stage_configs"):
             resume_options["stage_configs"] = config["stage_configs"]
         def remember_run(run_dir):
@@ -909,6 +911,8 @@ class BlogWorkflowControls(UnattendedControls):
             recovery_config["resume_run_dir"] = pending["resume_run_dir"]
         if pending.get("revision_feedback"):
             recovery_config["revision_feedback"] = pending["revision_feedback"]
+        if pending.get("final_review_feedback"):
+            recovery_config["final_review_feedback"] = pending["final_review_feedback"]
         topic, keywords = choice["topic"], choice["keywords"]
         if isinstance(pending.get("prepared_article"), dict):
             article = copy.deepcopy(pending["prepared_article"])
@@ -964,7 +968,7 @@ class BlogWorkflowControls(UnattendedControls):
                         failed = json.loads((Path(resume_dir) / "manifest.json").read_text(encoding="utf-8"))
                         flags = ("approved", "facts_verified", "sources_verified", "search_intent_satisfied", "natural_korean")
                         rejected = [item.get("review", {}) for item in failed.get("final_review_attempts", [])
-                            if isinstance(item, dict) and isinstance(item.get("review"), dict)
+                            if isinstance(item, dict) and _text_review_schema_valid(item.get("review"))
                             and (any(item["review"].get(flag) is not True for flag in flags) or item["review"].get("issues"))]
                     except (OSError, ValueError, TypeError, AttributeError):
                         rejected = []
@@ -976,7 +980,17 @@ class BlogWorkflowControls(UnattendedControls):
                             "확인되지 않은 사실을 단정하거나 검수 통과를 꾸미지 마세요. " + json.dumps({
                                 "revision": pending["revision_number"], "issues": issues, "unverified_checks": missing_flags,
                                 "title": str(failed.get("title", ""))[:120]}, ensure_ascii=False))
-                        pending["revision_feedback"] = recovery_config["revision_feedback"] = feedback
+                        try:
+                            preserved = json.loads((Path(resume_dir) / "editorial.pending.json").read_text(encoding="utf-8"))
+                            preserved_editorial = (preserved.get("context", {}).get("sequence") == "editorial"
+                                and preserved.get("status") in {"rejected", "repairing", "repair_failed", "awaiting_audit"})
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            preserved_editorial = False
+                        # Only the pre-image editorial path has a resumable final
+                        # copy. Keep the existing rewrite path for later audits,
+                        # whose changed text must also invalidate image context.
+                        key = "final_review_feedback" if preserved_editorial else "revision_feedback"
+                        pending[key] = recovery_config[key] = feedback
                         self._save_pending_topic(pending)
                         self._naver_log("최종 검수 지적을 같은 주제의 원고 수정에 반영합니다.")
                 attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),

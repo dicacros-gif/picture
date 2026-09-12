@@ -487,6 +487,56 @@ class BlogCliBridgeTests(unittest.TestCase):
         self.assertFalse(any("permission" in arg or "yolo" in arg for arg in args))
         self.assertIn(b"Do not retry command", runner.call_args_list[1].kwargs['stdin'])
 
+    def test_text_requests_provide_material_scope_without_local_discovery(self):
+        for provider in cli.PROVIDER_NAMES:
+            with self.subTest(provider=provider), \
+                 patch.object(self.bridge, "_provider", return_value=self.provider(provider)), \
+                 patch.object(self.bridge, "_record"), \
+                 patch.object(self.bridge, "_request", return_value=cli._Response(answer="reviewed")) as request:
+                result = self.bridge.run_text(provider, "원고와 검토 자료", model="chosen-model", timeout=123)
+                self.assertEqual(result, "reviewed")
+                instruction = request.call_args.args[1]
+                self.assertIn("All supplied article text and review materials are included in this message", instruction)
+                self.assertIn("do not list or explore the working directory, its parents, application-data", instruction)
+                self.assertIn("do not read local files", instruction)
+                self.assertIn("public primary sources using native web search and page-reading tools", instruction)
+                self.assertTrue(instruction.endswith("원고와 검토 자료"))
+                self.assertEqual(request.call_args.kwargs["model"], "chosen-model")
+                self.assertEqual(request.call_args.kwargs["timeout"], 123)
+
+    def test_image_review_keeps_selected_attachment_reads(self):
+        selected = self.image()
+        with patch.object(self.bridge, "_provider", return_value=self.provider("antigravity")), \
+             patch.object(self.bridge, "_record"), \
+             patch.object(self.bridge, "_request", return_value=cli._Response(answer="viewed")) as request:
+            self.assertEqual(self.bridge.run_text("antigravity", "이미지 검수", images=[selected]), "viewed")
+        instruction = request.call_args.args[1]
+        self.assertIn("inspect the actual attached images", instruction)
+        self.assertIn("Local reads are limited to the explicitly selected images", instruction)
+        self.assertNotIn("do not read local files", instruction)
+        self.assertEqual(request.call_args.kwargs["images"], [selected])
+
+    def test_local_directory_read_denial_is_not_retried_or_granted(self):
+        conversation = str(uuid.uuid4())
+        output = events({"event": "init", "conversation_id": conversation},
+            {"event": "step_update", "step_update": {"state": "ERROR", "tool_name": "list_dir",
+                "tool_info": {"parameters": {"DirectoryPath": str(self.root.parent)}}}},
+            {"event": "result", "result": {"status": "SUCCESS", "response": "partial",
+                "denied_actions": [{"action": "read_file"}]}})
+        with patch.object(cli.Path, "home", return_value=self.root), \
+             patch.object(self.bridge, "_provider", return_value=self.provider("antigravity")), \
+             patch.object(cli, "_run", return_value=(0, output, "")) as runner, \
+             patch.object(cli, "_write_public_read_project", wraps=cli._write_public_read_project) as write_project, \
+             self.assertRaises(cli.BlogCliError) as result:
+            self.bridge._request("antigravity", "Verify https://source.go.kr/page", self.root,
+                model="", images=None, image=False, timeout=30)
+        self.assertEqual(result.exception.code, "permission_required")
+        self.assertIn("read_file", str(result.exception))
+        self.assertEqual(runner.call_count, 1)
+        self.assertNotIn("--conversation", runner.call_args.args[0])
+        self.assertEqual(write_project.call_count, 1)
+        self.assertEqual(write_project.call_args.args[2], {"source.go.kr"})
+
     def test_scoped_project_is_removed_when_child_is_cancelled(self):
         with patch.object(cli.Path, "home", return_value=self.root), \
              patch.object(self.bridge, "_provider", return_value=self.provider("antigravity")), \

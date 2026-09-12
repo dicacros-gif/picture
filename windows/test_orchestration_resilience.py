@@ -98,7 +98,9 @@ class InterruptedPreparationTests(unittest.TestCase):
             workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
             run_dir = Path(folder) / 'blog-runs' / 'final-rejected'
             atomic_json_write(run_dir / 'manifest.json', {'title': 'A 제목',
-                'final_review_attempts': [{'review': {'approved': False, 'issues': ['확인되지 않은 금액 ' * 600]}}]})
+                'final_review_attempts': [{'review': {'approved': False, 'facts_verified': False,
+                    'sources_verified': False, 'search_intent_satisfied': True, 'natural_korean': True,
+                    'issues': ['확인되지 않은 금액 ' * 600]}}]})
             app._prepare_cli_worker.side_effect = [WorkflowError('최종 사실 거절', run_dir),
                 {'topic': 'A', 'run_dir': str(run_dir)}]
             app._cli_automation_cycle(config)
@@ -107,6 +109,44 @@ class InterruptedPreparationTests(unittest.TestCase):
             self.assertIn('확인되지 않은 금액', second['revision_feedback'])
             self.assertLessEqual(len(second['revision_feedback']), 4000)
             self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ['A', 'A'])
+            app._publish_cli_worker.assert_called_once()
+
+    def test_preserved_editorial_findings_do_not_replace_legacy_writing_identity(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            config['revision_feedback'] = '이전에 저장된 작성 지침'
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            run_dir = Path(folder) / 'blog-runs' / 'editorial-rejected'
+            atomic_json_write(run_dir / 'manifest.json', {'final_review_attempts': [
+                {'review': {'approved': False, 'facts_verified': False, 'sources_verified': False,
+                           'search_intent_satisfied': True, 'natural_korean': True, 'issues': ['최신 적용 대상 확인']}}]})
+            atomic_json_write(run_dir / 'editorial.pending.json', {
+                'context': {'sequence': 'editorial'}, 'status': 'rejected'})
+            app._prepare_cli_worker.side_effect = [WorkflowError('최종 사실 거절', run_dir),
+                {'topic': 'A', 'run_dir': str(run_dir)}]
+            app._cli_automation_cycle(config)
+            second = app._prepare_cli_worker.call_args.args[2]
+            self.assertEqual(second['revision_feedback'], '이전에 저장된 작성 지침')
+            self.assertIn('최신 적용 대상 확인', second['final_review_feedback'])
+            app._publish_cli_worker.assert_called_once()
+
+    def test_malformed_review_does_not_break_error_handler_or_add_fact_feedback(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            run_dir = Path(folder) / 'blog-runs' / 'malformed-audit'
+            atomic_json_write(run_dir / 'manifest.json', {'final_review_attempts': [
+                {'review': {'approved': False, 'facts_verified': False, 'sources_verified': False,
+                           'search_intent_satisfied': True, 'natural_korean': True, 'issues': None}}]})
+            atomic_json_write(run_dir / 'editorial.pending.json', {
+                'context': {'sequence': 'editorial'}, 'status': 'awaiting_audit'})
+            app._prepare_cli_worker.side_effect = [WorkflowError('검수 JSON 형식 오류', run_dir),
+                {'topic': 'A', 'run_dir': str(run_dir)}]
+            app._cli_automation_cycle(config)
+            second = app._prepare_cli_worker.call_args.args[2]
+            self.assertEqual(second['resume_run_dir'], str(run_dir))
+            self.assertNotIn('final_review_feedback', second)
+            self.assertNotIn('revision_feedback', second)
             app._publish_cli_worker.assert_called_once()
 
 

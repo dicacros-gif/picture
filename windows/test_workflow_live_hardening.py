@@ -111,7 +111,7 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
         self.assertEqual(failed['final_reviews'], [])
         self.assertFalse(failed['final_review_attempts'][0]['review']['approved'])
 
-    def test_approved_finish_checkpoint_reuses_and_tampered_fingerprint_rechecks(self):
+    def test_approved_finish_checkpoint_repairs_from_intact_pending_approval(self):
         calls = self.natural_bridge()
         self.bridge.bad_image_indices = {0}
         failed = self.assert_blocked('첫 사진', image_retry_limit=2, **self.natural_options())
@@ -125,7 +125,11 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
         checkpoint.write_text(json.dumps(saved), encoding='utf-8')
         with self.assertRaises(WorkflowError):
             self.workflow.resume(failed['run_dir'])
-        self.assertEqual(sum(call[1].startswith('EDITORIAL_NATURAL_FINISH') for call in calls), 2)
+        # The separate pending-review record still holds the exact approved
+        # style copy and its successful audit, so no fresh writing is needed.
+        self.assertEqual(sum(call[1].startswith('EDITORIAL_NATURAL_FINISH') for call in calls), 1)
+        restored = json.loads(checkpoint.read_text(encoding='utf-8'))
+        self.assertNotEqual(restored['editorial_quality']['humanization']['article_sha256'], '0' * 64)
         self.assertEqual(len(self.bridge.generations), 10)
 
     def test_run_created_callback_is_durable_and_precedes_every_cli_call(self):

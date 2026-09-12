@@ -1,5 +1,49 @@
 """Role constraints for CLI stages; private research never becomes public copy."""
 import re
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+
+from blog_diagnostics import redact_diagnostic
+
+
+def _source_url_label(url):
+    """Keep document identifiers in diagnostics, without credentials or sessions."""
+    try:
+        parts = urlsplit(url)
+        sensitive = {'code', 'access_token', 'refresh_token', 'id_token', 'token', 'api_key',
+                     'apikey', 'key', 'signature', 'sig', 'secret', 'password', 'authorization',
+                     'session', 'sessionid', 'jsessionid', 'credential'}
+        query = [(key, '[REDACTED]' if key.casefold() in sensitive
+                  or key.casefold().startswith(('x-amz-', 'x-goog-')) else redact_diagnostic(value))
+                 for key, value in parse_qsl(parts.query, keep_blank_values=True)]
+        host = '[REDACTED]@' + parts.netloc.rsplit('@', 1)[1] if '@' in parts.netloc else parts.netloc
+        path = re.sub(r'(?i)(;jsessionid=)[^/;]+', r'\1[REDACTED]', unquote(parts.path))
+        safe = urlunsplit((parts.scheme, host, redact_diagnostic(path), urlencode(query), ''))
+    except ValueError:
+        return '<올바르지 않은 URL>'
+    return safe[:240] + ('…' if len(safe) > 240 else '')
+
+
+def _fact_source_error(urls, sources, verified):
+    """Explain the first invalid reference; never infer or promote evidence."""
+    if not isinstance(urls, list):
+        return 'source_urls는 확인한 출처 URL 문자열의 배열이어야 합니다.'
+    if not urls:
+        return 'source_urls가 비어 있습니다. 직접 확인한 1차 자료 URL을 연결하세요.'
+    for number, url in enumerate(urls):
+        if not isinstance(url, str) or not url.strip():
+            return f'source_urls[{number}]는 비어 있지 않은 URL 문자열이어야 합니다.'
+        if url in verified:
+            continue
+        label = f'source_urls[{number}]={_source_url_label(url)}'
+        records = [(i, source) for i, source in enumerate(sources)
+                   if isinstance(source, dict) and source.get('url') == url]
+        if not records:
+            return f'{label}: sources에 같은 URL의 출처 기록이 없습니다. 직접 확인한 자료와 변경 근거를 연결하세요.'
+        index, source = records[0]
+        missing = [field + '=true' for field in ('verified', 'is_primary') if source.get(field) is not True]
+        return (f'{label}: sources[{index}]의 {", ".join(missing)} 요건이 충족되지 않았습니다. '
+                '검증값만 바꾸지 말고 직접 확인한 1차 자료에 근거해 수정하세요.')
+    return ''
 
 
 def role_prompt(role, has_draft):
@@ -55,27 +99,35 @@ def check_role_change(role, previous, result):
         patches, additions = result.get('fact_corrections', []), result.get('fact_additions', [])
         if not isinstance(patches, list) or not isinstance(additions, list):
             raise ValueError('팩트 부분 수정과 추가 정보는 각각 배열이어야 합니다.')
-        for patch in patches:
+        for number, patch in enumerate(patches):
             if not isinstance(patch, dict):
-                raise ValueError('팩트 부분 수정 항목은 객체여야 합니다.')
+                raise ValueError(f'fact_corrections[{number}]: 팩트 부분 수정 항목은 객체여야 합니다.')
             index, before, after = patch.get('index'), patch.get('old'), patch.get('new')
             if (type(index) is not int or not 0 <= index < len(corrected)
                     or not isinstance(before, str) or not 5 <= len(before) <= 250
                     or not isinstance(after, str) or corrected[index].count(before) != 1 or not patch.get('reason')):
-                raise ValueError('팩트 부분 수정의 원문·구역·사유가 올바르지 않습니다.')
+                raise ValueError(f'fact_corrections[{number}]: 팩트 부분 수정의 원문·구역·사유가 올바르지 않습니다. '
+                                 'index는 유효한 0부터의 정수, old는 해당 구역에 한 번 있는 5~250자 원문, '
+                                 'new는 문자열, reason은 비어 있지 않은 사유여야 합니다.')
             urls = patch.get('source_urls', [])
-            if after and (not isinstance(urls, list) or not urls or any(url not in verified for url in urls)):
-                raise ValueError('팩트 교체문에 확인된 1차 자료가 필요합니다.')
+            source_error = _fact_source_error(urls, sources, verified) if after else ''
+            if source_error:
+                raise ValueError(f'fact_corrections[{number}] (index={index}): '
+                                 f'팩트 교체문에 확인된 1차 자료가 필요합니다. {source_error}')
             corrected[index] = corrected[index].replace(before, after, 1)
-        for addition in additions:
+        for number, addition in enumerate(additions):
             if not isinstance(addition, dict):
-                raise ValueError('팩트 추가 항목은 객체여야 합니다.')
+                raise ValueError(f'fact_additions[{number}]: 팩트 추가 항목은 객체여야 합니다.')
             index, text = addition.get('index'), addition.get('text')
             urls = addition.get('source_urls')
             if (type(index) is not int or not 0 <= index < len(corrected) or not isinstance(text, str)
-                    or not text.strip() or not isinstance(urls, list) or not urls
-                    or any(url not in verified for url in urls)):
-                raise ValueError('추가 사실에 올바른 구역·문장·확인된 1차 자료가 필요합니다.')
+                    or not text.strip()):
+                raise ValueError(f'fact_additions[{number}]: 추가 사실에 올바른 구역·문장·확인된 1차 자료가 필요합니다. '
+                                 'index는 유효한 0부터의 정수이며 text는 비어 있지 않은 문자열이어야 합니다.')
+            source_error = _fact_source_error(urls, sources, verified)
+            if source_error:
+                raise ValueError(f'fact_additions[{number}] (index={index}): '
+                                 f'추가 사실에 올바른 구역·문장·확인된 1차 자료가 필요합니다. {source_error}')
             section = corrected[index]
             footer = re.search(r'(?m)^[ \t]*#[^\s#]+(?:[ \t]+#[^\s#]+){9,}[ \t]*$', section)
             if footer and index == len(corrected) - 1:
@@ -87,7 +139,13 @@ def check_role_change(role, previous, result):
         mismatch = (any(after != before for before, after in zip(corrected, new)) if 'fact_additions' in result else
                     any(not after.startswith(before) for before, after in zip(corrected, new)))
         if previous.get("title") != result.get("title") or mismatch:
-            raise ValueError("팩트 보강 단계가 기존 제목·문단을 변경했습니다. 기존 문장을 유지하고 확인된 정보만 덧붙여야 합니다.")
+            differences = (f'paragraphs[{index}]' for index, (before, after) in enumerate(zip(corrected, new))
+                           if (before != after if 'fact_additions' in result else not after.startswith(before)))
+            fields = [*(['title'] if previous.get('title') != result.get('title') else []), *differences]
+            location = ', '.join(fields[:8]) + (' 외 추가 구역' if len(fields) > 8 else '')
+            raise ValueError("팩트 보강 단계가 기존 제목·문단을 변경했습니다. 기존 문장을 유지하고 확인된 정보만 덧붙여야 합니다. "
+                             f"변경 기록과 불일치: {location}. fact_corrections·fact_additions에 이번 단계의 모든 변경을 "
+                             "정확히 기록하고 반환 paragraphs를 그 기록과 일치시키세요.")
     if role == "문체 다듬기":
         def numbers(text):
             values = re.findall(r"\d+(?:[.,]\d+)*(?:\s*(?:퍼센트|개월|만원|억원|시간|달러|킬로미터|원|년|월|일|주|분|초|회|번|명|개|배|%|kg|km|cm|mm))?", text)
