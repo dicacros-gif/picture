@@ -16,7 +16,7 @@ const response = (webSocketDebuggerUrl = endpoint) => ({ ok: true, json: async (
 
 function fixture({ owner, fetch: fetchImpl = async () => response(), firstInstance = true, smokeTest = false } = {}) {
   const files = new Map(), children = [], requests = [], sockets = [], timers = new Map();
-  const appEvents = new Map();
+  const appEvents = new Map(), handlers = new Map();
   const appCalls = { locks: 0, quits: 0, ready: 0, paths: [] };
   if (owner !== undefined) files.set(ownerFile, typeof owner === 'string' ? owner : JSON.stringify(owner));
   class Socket {
@@ -34,7 +34,7 @@ function fixture({ owner, fetch: fetchImpl = async () => response(), firstInstan
       whenReady: () => { appCalls.ready++; return { then() {} }; },
       on: (event, fn) => appEvents.set(event, fn), quit: () => { appCalls.quits++; }, isReady: () => false
     },
-    ipcMain: { handle() {} }
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) }
   };
   const mocks = {
     electron,
@@ -60,8 +60,8 @@ function fixture({ owner, fetch: fetchImpl = async () => response(), firstInstan
     setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.set(timer, timer); return timer; },
     clearTimeout: timer => timers.delete(timer)
   });
-  vm.runInContext(`${source}\nglobalThis.browserTests = { ensureWhale, CdpPage, openWhalePage, setWindow: value => { mainWindow = value; } };`, context);
-  return { ...context.browserTests, files, children, requests, sockets, timers, appEvents, appCalls };
+  vm.runInContext(`${source}\nglobalThis.browserTests = { ensureWhale, CdpPage, openWhalePage, setWindow: value => { mainWindow = value; }, setBackend: value => { backend = value; } };`, context);
+  return { ...context.browserTests, files, children, requests, sockets, timers, appEvents, appCalls, handlers };
 }
 
 test('existing browser with a matching profile and session is reused', async () => {
@@ -179,4 +179,29 @@ test('smoke tests use a separate temporary profile and do not acquire the live a
   assert.equal(f.appCalls.locks, 0);
   assert.equal(f.appCalls.ready, 1);
   assert.deepEqual(f.appCalls.paths, [['userData', '/tmp/blog-mac-smoke-123']]);
+});
+
+test('login IPC forwards an explicit ChatGPT device-code choice without changing ordinary login', async () => {
+  const f = fixture(), calls = [];
+  f.setBackend({ invoke: (...args) => { calls.push(args); return { status: 'login_opened' }; } });
+  const login = f.handlers.get('blog-cli-login');
+  for (const provider of ['chatgpt', 'claude', 'antigravity']) await login(null, provider);
+  await login(null, 'chatgpt', { deviceAuth: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ['login', { provider: 'chatgpt', deviceAuth: false }],
+    ['login', { provider: 'claude', deviceAuth: false }],
+    ['login', { provider: 'antigravity', deviceAuth: false }],
+    ['login', { provider: 'chatgpt', deviceAuth: true }]
+  ]);
+});
+
+test('login IPC rejects malformed and non-ChatGPT device-code requests before opening Terminal', () => {
+  const f = fixture(), calls = [];
+  f.setBackend({ invoke: (...args) => calls.push(args) });
+  const login = f.handlers.get('blog-cli-login');
+  for (const [provider, options] of [['claude', { deviceAuth: true }], ['antigravity', { deviceAuth: true }],
+    ['chatgpt', { deviceAuth: 'true' }], ['chatgpt', null], ['chatgpt', []], ['unknown', {}]]) {
+    assert.throws(() => login(null, provider, options), /ChatGPT CLI/);
+  }
+  assert.equal(calls.length, 0);
 });

@@ -63,7 +63,7 @@ h3{margin:0 0 12px;font-size:17px}
 .cli-account{border:1px solid #e1e8e3;border-radius:12px;padding:12px;min-width:0}
 .cli-account strong{font-size:13px}
 .cli-account p{font-size:12px;min-height:35px;margin:7px 0;overflow-wrap:anywhere}
-.cli-account button{font-size:12px;padding:8px 12px}
+.cli-account button{font-size:12px;padding:8px 12px;margin:0 6px 6px 0}
 .account-ready{color:#178348}.account-error{color:#aa6730}
 .naver-account{display:flex;align-items:flex-end;gap:10px;margin-top:8px}
 .naver-account>div{flex:1}.naver-account button{font-size:12px}

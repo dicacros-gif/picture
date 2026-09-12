@@ -23,7 +23,7 @@ contextBridge.exposeInMainWorld("picture", {
   setBlogAutomation: enabled => ipcRenderer.invoke("blog-automation", enabled),
   stopBlog: () => ipcRenderer.invoke("blog-stop"),
   getCliStatus: () => ipcRenderer.invoke("blog-cli-status"),
-  loginCli: provider => ipcRenderer.invoke("blog-cli-login", provider),
+  loginCli: (provider, options = {}) => ipcRenderer.invoke("blog-cli-login", provider, options),
   openBlogFolder: () => ipcRenderer.invoke("blog-open-folder"),
   onBlogProgress: callback => {
     const listener = (_event, value) => callback(value);

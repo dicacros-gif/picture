@@ -51,6 +51,22 @@ def public_accounts(records):
     return {'accounts': output}
 
 
+def open_cli_login(bridge, payload):
+    if not isinstance(payload, dict):
+        raise ValueError('CLI 로그인 요청을 확인하세요.')
+    provider = payload.get('provider')
+    device_auth = payload.get('deviceAuth', False)
+    if (not isinstance(provider, str) or provider not in {'chatgpt', 'claude', 'antigravity'}
+            or not isinstance(device_auth, bool) or (device_auth and provider != 'chatgpt')):
+        raise ValueError('기기 코드 로그인은 ChatGPT CLI에서만 선택할 수 있습니다.')
+    bridge.open_login(provider, device_auth=device_auth)
+    message = ('Terminal의 주소와 코드를 사용해 본인 ChatGPT 계정으로 로그인한 뒤 CLI 로그인 재확인을 누르세요. '
+               '기기 코드 로그인을 사용할 수 없으면 일반 로그인을 선택하세요.' if device_auth else
+               'Terminal에서 로그인한 뒤 CLI 로그인 재확인을 누르세요.')
+    return {'status': 'login_opened', 'provider': provider, 'deviceAuth': device_auth,
+            'message': message + ' 창을 열었다고 로그인 완료로 처리하지 않습니다.'}
+
+
 def validate_settings(saved):
     blog = copy.deepcopy(saved.get('blog', {}))
     stages = blog.get('stages', [])
@@ -362,10 +378,7 @@ def main():
         if args.command == 'status':
             result = public_accounts(bridge.check_accounts())
         elif args.command == 'login':
-            provider = payload.get('provider')
-            bridge.open_login(provider)
-            result = {'status': 'login_opened', 'provider': provider,
-                      'message': 'Terminal에서 로그인한 뒤 연결 다시 확인을 누르세요. 창을 열었다고 로그인 완료로 처리하지 않습니다.'}
+            result = open_cli_login(bridge, payload)
         elif args.command == 'naver-status':
             bot = MacNaverAutomation(args.data_dir, log, debug_port=9449)
             result = bot.check_login()

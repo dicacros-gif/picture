@@ -331,13 +331,24 @@ function createMainWindow() {
             automation: document.getElementById('blogAutomation').checked,
             mode: document.getElementById('blogMode').value,
             intervals: [...document.getElementById('blogInterval').options].map(option => option.value),
-            prompt: document.getElementById('blogPromptText').value.length
+            prompt: document.getElementById('blogPromptText').value.length,
+            loginButtons: [...document.querySelectorAll('.cli-login')].map(button =>
+              button.dataset.provider + ':' + button.dataset.deviceAuth),
+            deviceLoginLayout: (() => {
+              const buttons = [...document.querySelectorAll('.cli-login[data-provider="chatgpt"]')];
+              if (buttons.length !== 2) return false;
+              const [a, b] = buttons.map(button => button.getBoundingClientRect());
+              return a.width > 0 && b.width > 0 && (a.right <= b.left || b.right <= a.left
+                || a.bottom <= b.top || b.bottom <= a.top);
+            })()
           }))()`);
-          if (rendered.ready) break;
+          if (rendered.ready && rendered.loginButtons.length === 4) break;
           await wait(50);
         }
         if (!rendered.ready || rendered.automation || rendered.mode !== 'draft'
-            || rendered.intervals.join(',') !== '1,2,3,4,5,6' || rendered.prompt < 100) {
+            || rendered.intervals.join(',') !== '1,2,3,4,5,6' || rendered.prompt < 100
+            || rendered.loginButtons.join(',') !== 'chatgpt:false,chatgpt:true,claude:false,antigravity:false'
+            || !rendered.deviceLoginLayout) {
           throw new Error(`Mac UI initialization failed: ${JSON.stringify(rendered)}`);
         }
         const engine = await backend.invoke('self-test');
@@ -1755,7 +1766,14 @@ ipcMain.handle('blog-automation', (_event, enabled) => {
 });
 ipcMain.handle('blog-stop', () => blogController.stop());
 ipcMain.handle('blog-cli-status', () => backend.invoke('status'));
-ipcMain.handle('blog-cli-login', (_event, provider) => backend.invoke('login', { provider }));
+ipcMain.handle('blog-cli-login', (_event, provider, options = {}) => {
+  if (!['chatgpt', 'claude', 'antigravity'].includes(provider) || !options || typeof options !== 'object'
+      || Array.isArray(options) || (options.deviceAuth !== undefined && typeof options.deviceAuth !== 'boolean')
+      || (options.deviceAuth === true && provider !== 'chatgpt')) {
+    throw new Error('기기 코드 로그인은 ChatGPT CLI에서만 선택할 수 있습니다.');
+  }
+  return backend.invoke('login', { provider, deviceAuth: options.deviceAuth === true });
+});
 ipcMain.handle('blog-open-folder', async () => {
   const error = await shell.openPath(app.getPath('userData'));
   if (error) throw new Error(error);

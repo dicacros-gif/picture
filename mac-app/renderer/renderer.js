@@ -518,7 +518,7 @@ function collectBlogSettings() {
     stages: stageDrafts.slice(0, stageCount).map(stage => ({ ...stage })),
     imageRetryLimit: Number($("blogImageRetries").value),
     includeGoogle: $("blogIncludeGoogle").checked,
-    googleReferenceCount: Math.max(0, Math.min(12, Number($("blogGoogleCount").value) || 0)),
+    googleReferenceCount: Math.max(1, Math.min(10, Number($("blogGoogleCount").value) || 4)),
     progressHeight,
     progressCollapsed
   };
@@ -687,21 +687,28 @@ function renderCliAccounts(response = {}) {
     const detail = document.createElement("p");
     detail.textContent = [statuses[status] || status || "연결 확인 전", record.message || record.detail].filter(Boolean).join(" · ");
     detail.className = ready ? "account-ready" : "account-error";
-    const login = document.createElement("button");
-    login.type = "button";
-    login.className = "secondary cli-login";
-    login.dataset.provider = provider;
-    login.textContent = cliLoggingIn.has(provider) ? "로그인 여는 중…" : "로그인";
-    login.onclick = async () => {
-      cliLoggingIn.add(provider);
-      updateBlogButtons();
-      try {
-        const result = await window.picture.loginCli(provider);
-        appendProgress(result?.message || `${label} 로그인 창을 열었습니다. 로그인 완료 후 CLI 로그인 재확인을 눌러 주세요.`);
-      } catch (error) { showBlogError(error); }
-      finally { cliLoggingIn.delete(provider); updateBlogButtons(); }
+    const loginButton = (deviceAuth = false) => {
+      const login = document.createElement("button");
+      login.type = "button";
+      login.className = "secondary cli-login";
+      login.dataset.provider = provider;
+      login.dataset.deviceAuth = String(deviceAuth);
+      login.textContent = deviceAuth ? "기기 코드 로그인" : "로그인";
+      if (deviceAuth) login.title = "브라우저 로그인 후 앱으로 돌아오지 못할 때 사용합니다. Terminal에 표시된 안내를 따라 본인 계정으로 인증하세요.";
+      login.onclick = async () => {
+        if (cliLoggingIn.has(provider)) return;
+        cliLoggingIn.add(provider);
+        updateBlogButtons();
+        try {
+          const result = await window.picture.loginCli(provider, { deviceAuth });
+          appendProgress(result?.message || `${label} 로그인 창을 열었습니다. 로그인 완료 후 CLI 로그인 재확인을 눌러 주세요.`);
+        } catch (error) { showBlogError(error); }
+        finally { cliLoggingIn.delete(provider); updateBlogButtons(); }
+      };
+      return login;
     };
-    node.append(name, detail, login);
+    node.append(name, detail, loginButton());
+    if (provider === "chatgpt") node.append(loginButton(true));
     return node;
   }));
   updateBlogButtons();
