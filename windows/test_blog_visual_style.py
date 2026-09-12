@@ -1,6 +1,7 @@
 import copy
 import unittest
-from blog_visual_style import (QUOTE_LAYOUTS, HEADING_BACKGROUNDS, choose_visual_style, line_style_runs)
+from blog_visual_style import (BODY_TEXT_COLOR, QUOTE_LAYOUTS, HEADING_BACKGROUNDS,
+                               choose_visual_style, line_style_runs, supplement_bold_phrases, image_prompt)
 from naver_automation import NaverAutomation
 from test_naver_publish import document
 
@@ -89,5 +90,81 @@ class VisualStyleTests(unittest.TestCase):
         self.assertEqual(''.join(value for value,_ in runs),line)
         self.assertEqual(runs[0][0],'기부금 세액공제')
         self.assertNotEqual(runs[0][1]['fontColor'],runs[-1][1]['fontColor'])
+
+    def test_plain_body_is_black_even_when_writer_template_is_gray_and_bold(self):
+        template = document(image_ids=self.ids)
+        text = next(c for c in template['document']['components'] if c['@ctype'] == 'text')
+        text['value'][0]['nodes'][0]['style'] = {
+            'fontColor': '#888888', 'bold': True, 'underline': True, 'backgroundColor': '#ffff00'}
+        data = NaverAutomation._arrange_article_document(
+            template, self.sections, self.ids, self.positions, bold_terms=['기부단체', '세액공제'],
+            bold_style={'bold': True}, visual_style=self.options)
+        plain = [n for c in data['document']['components'] for row in c.get('value') or []
+                 for n in row['nodes'] if not n['style'].get('bold')]
+        self.assertTrue(plain)
+        self.assertTrue(all(n['style']['fontColor'] == BODY_TEXT_COLOR for n in plain))
+        self.assertTrue(self.verify(data))
+        plain[0]['style']['fontColor'] = '#333333'
+        self.assertFalse(self.verify(data))
+
+    def test_plain_article_does_not_inherit_template_color_without_bold_style(self):
+        sections = ['강조가 없는 검정 본문입니다.'] * 8
+        data = NaverAutomation._arrange_article_document(
+            document(image_ids=self.ids), sections, self.ids, self.positions)
+        self.assertTrue(all(n['style']['fontColor'] == BODY_TEXT_COLOR
+                            for c in data['document']['components'] for row in c.get('value') or []
+                            for n in row['nodes']))
+        self.assertTrue(NaverAutomation._verify_article_document(data, sections, self.ids, self.positions))
+        text = next(c for c in data['document']['components'] if c['@ctype'] == 'text')
+        text['value'][0]['nodes'][0]['style']['fontColor'] = '#333333'
+        self.assertFalse(NaverAutomation._verify_article_document(data, sections, self.ids, self.positions))
+
+    def test_supplementary_bold_spreads_useful_sentences_and_preserves_body(self):
+        sections = []
+        for index in range(8):
+            sections.append(f'❝ 구역 {index}의 소제목\n'
+                f'{index}번 기준은 신청하기 전에 대상 조건을 먼저 확인하는 것입니다.\n'
+                f'{index}번 선택에서는 상황이 달라지는 경우를 비교해야 합니다.\n'
+                f'{index}번 검색어의 차이와 신청 기준, 조건을 먼저 확인해야 합니다.\n'
+                + '창가에 놓인 서류를 천천히 읽으며 내용을 살펴봅니다. ' * 9)
+        before = copy.deepcopy(sections)
+        result = choose_visual_style(sections, [], [], enrich_body_bold=True, bold_terms=['검색어'])
+        selected = result['bold_phrases']
+        self.assertEqual(len(selected), 16)
+        self.assertTrue(all('검색어' not in phrase for phrase in selected))
+        self.assertEqual(sections, before)
+        self.assertTrue(all(sum(phrase in paragraph for phrase in selected) == 2 for paragraph in sections))
+        self.assertEqual(supplement_bold_phrases(sections, selected, [], ['검색어']), selected)
+
+    def test_supplement_does_not_duplicate_highlights_or_bold_whole_short_sections(self):
+        section = ('❝ 중요한 기준\n'
+                   '신청 조건은 원본 서류에서 먼저 확인해야 합니다.\n'
+                   '대상 기준이 달라지는 경우에는 별도의 절차가 필요합니다.\n'
+                   + '서류를 천천히 읽으며 내용을 살펴봅니다. ' * 8)
+        highlight = section.split('\n')[1]
+        selected = supplement_bold_phrases([section], [], [highlight])
+        self.assertNotIn(highlight, selected)
+        self.assertEqual(selected, [section.split('\n')[2]])
+        short = '신청 조건은 원본 서류에서 먼저 확인해야 합니다.'
+        self.assertEqual(supplement_bold_phrases([short]), [])
+
+    def test_metadata_validation_stays_filter_only_without_enrichment_opt_in(self):
+        self.assertEqual(choose_visual_style(self.sections, [], [])['bold_phrases'], [])
+        phrases = [f'{index}번 신청 조건을 먼저 확인해야 합니다.' for index in range(24)]
+        selected = choose_visual_style(['\n'.join(phrases)], phrases, [])['bold_phrases']
+        self.assertEqual(selected, phrases[:20])
+
+    def test_camera_prompts_keep_people_distant_and_cover_face_free(self):
+        normal = image_prompt('사람이 있는 공간', '본문', 1)
+        self.assertIn('fictional Korean adults', normal)
+        self.assertIn('medium-wide or wide environmental photograph', normal)
+        self.assertIn('No close-up faces', normal)
+        self.assertIn('noticeable fine organic 35mm film grain', normal)
+        self.assertIn('gentle optical halation', normal)
+        self.assertIn('No writing, letters, numbers, logos, watermarks', normal)
+        cover = image_prompt('사물 장면', '본문', 0)
+        self.assertIn('Show no human face', cover)
+        self.assertIn('central area calm and uncluttered', cover)
+        self.assertIn('1:1 square', cover)
 
 if __name__=='__main__': unittest.main()

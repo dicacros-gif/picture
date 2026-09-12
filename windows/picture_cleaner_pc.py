@@ -13,7 +13,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, StringVar, Tk, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -22,8 +22,8 @@ import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageTk
 from send2trash import send2trash
 from chatgpt_classic_automation import ChatGPTClassicAutomation
-from blog_controls import BlogWorkflowControls, next_cycle_tick
-from blog_workflow import BlogWorkflow
+from blog_controls import BlogWorkflowControls, next_cycle_tick, review_retry_after
+from blog_workflow import BlogWorkflow, WorkflowReviewRequired
 from blog_preferences import (atomic_json_write, automation_config_snapshot, blocked_term_hits,
                               load_settings_json, save_settings_json)
 from blog_runtime import ApplicationAlreadyRunning, application_instance_lock, access_error_from_exception, wait_for_restart_parent
@@ -1781,9 +1781,21 @@ class PictureCleanerApp(BlogWorkflowControls):
         try:
             while not self.full_auto_stop.is_set():
                 config = automation_config_snapshot(getattr(self, "settings", {}), config)
+                review_required = False
+                review_resume_at = None
                 try:
                     self._run_full_automation_cycle(config)
+                    self._last_review_hold_notice = None
+                except WorkflowReviewRequired as exc:
+                    review_required = True
+                    review_resume_at = review_retry_after(getattr(exc, 'retry_after', None))
+                    notice = (exc.run_dir, str(exc))
+                    if getattr(self, '_last_review_hold_notice', None) != notice:
+                        self._last_review_hold_notice = notice
+                        self._naver_log(f"원고 보완 대기 · 예약에 같은 원고의 수정을 이어갑니다: {exc}")
+                        self.events.put(("auto_error", f"원고 보완 대기: {exc}"))
                 except Exception as exc:
+                    self._last_review_hold_notice = None
                     access_problem = access_error_from_exception(exc)
                     if access_problem:
                         self._naver_log(str(access_problem))
@@ -1804,8 +1816,14 @@ class PictureCleanerApp(BlogWorkflowControls):
                     if latest["interval_hours"] != scheduled_hours:
                         scheduled_hours = latest["interval_hours"]
                         next_tick = next_cycle_tick(cycle_tick, finished_at, latest["interval_seconds"])
+                        if review_resume_at is not None:
+                            retry_delay = max(0, (review_resume_at - datetime.now(timezone.utc)).total_seconds())
+                            next_tick = max(next_tick, now + retry_delay)
                         expected = datetime.now() + timedelta(seconds=max(0, next_tick - now))
-                        self.events.put(("status", f"다음 회차 {expected:%m/%d %H:%M} · {scheduled_hours}시간마다 · {latest.get('completion_label', '자동 발행')}"))
+                        schedule = (f"원고 보완 대기 · 다음 보완 예정 {expected:%m/%d %H:%M} · {scheduled_hours}시간마다"
+                            if review_required else
+                            f"다음 회차 {expected:%m/%d %H:%M} · {scheduled_hours}시간마다 · {latest.get('completion_label', '자동 발행')}")
+                        self.events.put(("status", schedule))
                     remaining = next_tick - now
                     if remaining <= 0 or self.full_auto_stop.wait(min(1.0, remaining)):
                         break

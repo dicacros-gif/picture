@@ -1,12 +1,14 @@
 import copy
 import json
+import os
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import test_blog_workflow as support
 from blog_cli_bridge import BlogCliError
-from blog_workflow import WorkflowError, WorkflowFormatError, _json_hash
+from blog_workflow import WorkflowError, WorkflowFormatError, WorkflowReviewRequired, _json_hash, _fact_repair_retry_after
 
 
 class FinalFactResumeTests(unittest.TestCase):
@@ -81,7 +83,7 @@ class FinalFactResumeTests(unittest.TestCase):
         self.assertEqual(pending['article_sha256'], _json_hash(pending['article']))
         self.assertEqual(len(pending['repair_attempts']), 1)
 
-    def test_two_repairs_are_a_persistent_run_budget(self):
+    def test_two_repairs_are_a_persistent_hourly_budget(self):
         self.bridge_for_recovery(always_reject=True)
         run = self.fail_initial()
         for _ in range(3):
@@ -94,6 +96,80 @@ class FinalFactResumeTests(unittest.TestCase):
         saved = json.loads((run / 'editorial.pending.json').read_text(encoding='utf-8'))
         self.assertEqual(saved['status'], 'rejected')
         self.assertEqual(len(saved['repair_attempts']), 2)
+
+    def test_later_hour_resumes_same_reviewer_and_retains_all_charged_attempts(self):
+        self.bridge_for_recovery(always_reject=True)
+        started = time.time()
+        with patch('blog_workflow.time.time', return_value=started):
+            run = self.fail_initial()
+            for _ in range(2):
+                with self.assertRaises(WorkflowError):
+                    self.workflow.resume(run)
+            path = run / 'editorial.pending.json'
+            before = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(len(before['repair_attempts']), 2)
+            with self.assertRaises(WorkflowReviewRequired) as waiting:
+                self.workflow.resume(run)
+            self.assertTrue(waiting.exception.retry_after)
+        with patch('blog_workflow.time.time', return_value=started + 3601):
+            for _ in range(2):
+                with self.assertRaises(WorkflowError):
+                    self.workflow.resume(run)
+            with self.assertRaises(WorkflowReviewRequired):
+                self.workflow.resume(run)
+        after = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(after['repair_attempts'][:2], before['repair_attempts'])
+        self.assertEqual([a['number'] for a in after['repair_attempts']], [1, 2, 3, 4])
+        self.assertEqual(after['locked_route'], before['locked_route'])
+        self.assertEqual(self.repair_count, 4)
+        self.assertEqual(self.audit_count, 5)
+        self.assertFalse(self.bridge.generations)
+
+    def test_legacy_attempts_use_original_prompt_times_without_rewriting_history(self):
+        self.bridge_for_recovery(always_reject=True)
+        run = self.fail_initial()
+        path = run / 'editorial.pending.json'
+        saved = {'repair_attempts': [{'number': 1}, {'number': 2}]}
+        for number in (1, 2):
+            (run / f'editorial.pending-repair-{number}.prompt.txt').write_text('original', encoding='utf-8')
+        now = max((run / f'editorial.pending-repair-{n}.prompt.txt').stat().st_mtime for n in (1, 2))
+        original = copy.deepcopy(saved)
+        self.assertTrue(_fact_repair_retry_after(path, saved, now=now))
+        self.assertFalse(_fact_repair_retry_after(path, saved, now=now + 3601))
+        self.assertEqual(saved, original)
+
+    def test_missing_legacy_prompt_clock_is_frozen_across_checkpoint_rewrites(self):
+        self.bridge_for_recovery(always_reject=True)
+        run = self.fail_initial()
+        path = run / 'editorial.pending.json'
+        saved = json.loads(path.read_text(encoding='utf-8'))
+        saved['repair_attempts'] = [{'number': 1}, {'number': 2}]
+        now = time.time()
+        os.utime(path, (now, now))
+        deadline = _fact_repair_retry_after(path, saved, now=now)
+        stored = json.loads(path.read_text(encoding='utf-8'))
+        self.assertEqual(stored['legacy_repair_started_at'], saved['legacy_repair_started_at'])
+        os.utime(path, (now + 7200, now + 7200))
+        self.assertEqual(_fact_repair_retry_after(path, stored, now=now + 30), deadline)
+        self.assertFalse(_fact_repair_retry_after(path, stored, now=now + 3601))
+
+    def test_exhausted_review_is_nonretryable_and_survives_prepare_wrapper(self):
+        self.bridge_for_recovery(always_reject=True)
+        run = self.fail_initial()
+        with self.assertRaises(WorkflowError) as first:
+            self.workflow.resume(run)
+        self.assertNotIsInstance(first.exception, WorkflowReviewRequired)
+        with self.assertRaises(WorkflowReviewRequired) as exhausted:
+            self.workflow.resume(run)
+        self.assertEqual(exhausted.exception.run_dir, str(run))
+        self.assertFalse(exhausted.exception.retryable)
+        before = (run / 'editorial.pending.json').read_bytes()
+        with self.assertRaises(WorkflowReviewRequired):
+            self.workflow.resume(run)
+        self.assertEqual((run / 'editorial.pending.json').read_bytes(), before)
+        self.assertEqual(self.repair_count, 2)
+        self.assertEqual(self.audit_count, 3)
+        self.assertFalse(self.bridge.generations)
 
     def test_approved_fact_copy_and_style_are_reused_after_image_failure(self):
         self.bridge_for_recovery()

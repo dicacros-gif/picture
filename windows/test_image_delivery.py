@@ -75,7 +75,7 @@ class ImageDeliveryTests(unittest.TestCase):
                     rendered, color = _draw_cover(original, headline)
                     foreground = ImageColor.getrgb(color)
                     title_y, shadow_y = [], []
-                    for y in range(230):
+                    for y in range(250, 520):
                         for x in range(768):
                             pixel = rendered.getpixel((x, y))
                             if pixel == foreground:
@@ -85,8 +85,27 @@ class ImageDeliveryTests(unittest.TestCase):
                     self.assertTrue(title_y)
                     self.assertTrue(shadow_y)
                     self.assertGreaterEqual(max(shadow_y) - max(title_y), 7)
-                    self.assertEqual(rendered.crop((0, 240, 768, 768)).tobytes(),
-                                     original.crop((0, 240, 768, 768)).tobytes())
+                    self.assertEqual(rendered.crop((0, 0, 768, 240)).tobytes(),
+                                     original.crop((0, 0, 768, 240)).tobytes())
+                    self.assertEqual(rendered.crop((0, 530, 768, 768)).tobytes(),
+                                     original.crop((0, 530, 768, 768)).tobytes())
+
+    def test_cover_text_is_centered_on_translucent_black_panel(self):
+        original = Image.new('RGB', (512, 512), (100, 180, 240))
+        rendered, color = _draw_cover(original, '왜 다를까?')
+        foreground = ImageColor.getrgb(color)
+        points = [(x, y) for y in range(512) for x in range(512)
+                  if rendered.getpixel((x, y)) == foreground]
+        self.assertTrue(points)
+        left, right = min(x for x, _ in points), max(x for x, _ in points)
+        top, bottom = min(y for _, y in points), max(y for _, y in points)
+        self.assertLessEqual(abs((left + right) / 2 - 256), 3)
+        self.assertLessEqual(abs((top + bottom) / 2 - 256), 3)
+        # Padding behind the type must blend black with the actual photo,
+        # rather than replace it with an opaque gray or white rectangle.
+        panel_y = next(y for y in range(256) if rendered.getpixel((256, y)) != original.getpixel((256, y)))
+        self.assertEqual(rendered.getpixel((256, panel_y)), (45, 81, 108))
+        self.assertEqual(rendered.getpixel((0, 0)), original.getpixel((0, 0)))
 
     def test_render_version_identifies_only_cover_exports(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -95,6 +114,10 @@ class ImageDeliveryTests(unittest.TestCase):
             cover = clean_export(source, Path(directory) / 'cover.jpg', headline='물가지표의 밤')
             plain = clean_export(source, Path(directory) / 'plain.jpg')
             self.assertEqual(cover['cover_render_version'], COVER_RENDER_VERSION)
+            self.assertEqual(COVER_RENDER_VERSION, 'center-black-panel-v3')
+            self.assertEqual(cover['cover_text_alignment'], 'center')
+            self.assertEqual(cover['cover_panel_color'], '#000000')
+            self.assertAlmostEqual(cover['cover_panel_opacity'], 140 / 255)
             self.assertEqual(plain['cover_render_version'], '')
 
     def test_cover_is_center_cropped_to_exact_square(self):

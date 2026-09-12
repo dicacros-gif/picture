@@ -20,7 +20,7 @@ class PublishedHashtagColorTests(unittest.TestCase):
         self.driver.execute_script.return_value = self.rendered
 
     @staticmethod
-    def node(text, *, color="rgb(51, 51, 51)", native=False):
+    def node(text, *, color="rgb(0, 0, 0)", native=False):
         return {"value": text, "color": color, "background": "", "underline": False,
                 "native_hashtag": native}
 
@@ -72,6 +72,10 @@ class PublishedHashtagColorTests(unittest.TestCase):
 
     def test_native_footer_marker_never_allows_changed_text(self):
         self.rendered[7][1][0]["value"] = "#ABC"
+        self.assertFalse(self.check(published=True))
+
+    def test_plain_gray_text_is_rejected_after_publication(self):
+        self.rendered[0][0][0]['color'] = 'rgb(51, 51, 51)'
         self.assertFalse(self.check(published=True))
 
 

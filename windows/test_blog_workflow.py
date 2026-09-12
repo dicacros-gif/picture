@@ -386,9 +386,9 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(result['image_policy'], IMAGE_POLICY)
         for item in self.bridge.generations:
             self.assertIn('fictional Korean adults', item['prompt'])
-            self.assertIn('VERY SUBTLE fine film grain', item['prompt'])
+            self.assertIn('noticeable fine organic 35mm film grain', item['prompt'])
             self.assertIn('Avoid heavy noise', item['prompt'])
-        self.assertIn('upper 32 percent', self.bridge.generations[0]['prompt'])
+        self.assertIn('central area calm and uncluttered', self.bridge.generations[0]['prompt'])
         self.assertIn('1:1 square', self.bridge.generations[0]['prompt'])
         self.assertIn('Show no human face', self.bridge.generations[0]['prompt'])
         self.assertNotIn('upper 32 percent', self.bridge.generations[1]['prompt'])

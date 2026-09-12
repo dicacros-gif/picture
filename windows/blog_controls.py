@@ -9,7 +9,7 @@ import os
 import shutil
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -17,7 +17,8 @@ from tkinter.scrolledtext import ScrolledText
 from blog_cli_bridge import BlogCliBridge
 from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLES, normalize_preferences,
                               store_prompt, normalize_blocked_terms, blocked_term_hits, atomic_json_write, save_settings_json)
-from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic, _text_review_schema_valid
+from blog_workflow import (BlogWorkflow, REVIEW_MODES, WorkflowError, WorkflowReviewRequired,
+                           _related_to_topic, _text_review_schema_valid)
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
 
@@ -34,12 +35,45 @@ def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
 
 def _google_search_context_hash(topic, keywords, config):
     """Invalidate the optional-search receipt when its inputs or policy change."""
-    context = {"version": 1, "topic": topic, "keywords": keywords,
+    context = {"version": 2, "topic": topic, "keywords": keywords,
                "count": config.get("google_reference_count", 4),
                "steps": config.get("steps"), "models": config.get("models"),
                "stage_configs": config.get("stage_configs"),
                "reuse_only": True, "english_only": True}
     return hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _review_hold_signature(app_dir, pending, config):
+    """Recognize an unchanged held run without starting accounts or workers."""
+    try:
+        value = pending.get('resume_run_dir')
+        if not value:
+            return None
+        run = Path(value).resolve()
+        root = (Path(app_dir) / 'blog-runs').resolve()
+        if root not in run.parents:
+            return None
+        files = {}
+        for name in ('request.json', 'editorial.pending.json'):
+            path = (run / name).resolve()
+            if path.parent != run:
+                return None
+            files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        configuration = json.dumps({'config': config, 'choice': pending.get('choice')},
+                                   ensure_ascii=False, sort_keys=True)
+        return {'run_dir': str(run), 'files': files,
+                'configuration_sha256': hashlib.sha256(configuration.encode('utf-8')).hexdigest()}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def review_retry_after(value):
+    """Only an explicit timezone-bearing deadline may defer a retry."""
+    try:
+        deadline = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+        return deadline.astimezone(timezone.utc) if deadline.tzinfo is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 class BlogWorkflowControls(UnattendedControls):
@@ -850,6 +884,24 @@ class BlogWorkflowControls(UnattendedControls):
             pending["publication_started"] = False
             pending["phase"] = "prepared"
             self._save_pending_topic(pending)
+        if (pending.get('phase') == 'review_required' and not isinstance(pending.get('prepared_article'), dict)
+                and not pending.get('confirmed_receipt') and not pending.get('completion_result')):
+            hold = pending.get('review_hold')
+            signature = _review_hold_signature(self.cli_app_dir, pending, config)
+            deadline = review_retry_after(hold.get('retry_after')) if isinstance(hold, dict) else None
+            if (isinstance(hold, dict) and hold.get('version') == 1 and signature is not None
+                    and hold.get('signature') == signature and deadline is not None
+                    and datetime.now(timezone.utc) < deadline):
+                message = hold.get('message')
+                error = WorkflowReviewRequired(message if isinstance(message, str) and message else
+                    '원고 보완이 필요합니다. 저장한 원고와 최종 검수 지적을 확인하세요.', signature['run_dir'])
+                error.retry_after = deadline.isoformat()
+                raise error
+            # Changed evidence re-enters the normal workflow validators; this
+            # does not grant approval, reset a budget, or replace frozen settings.
+            pending.pop('review_hold', None)
+            pending['phase'] = 'preparing'
+            self._save_pending_topic(pending)
         if not isinstance(pending.get("prepared_article"), dict):
             self._preflight_cli_accounts(config)
         if pending.get("choice"):
@@ -963,6 +1015,19 @@ class BlogWorkflowControls(UnattendedControls):
                 problem = access_error_from_exception(exc)
                 if problem:
                     raise problem from exc
+                if isinstance(exc, WorkflowReviewRequired):
+                    pending.setdefault('config', copy.deepcopy(config))
+                    pending['phase'] = 'review_required'
+                    deadline = review_retry_after(getattr(exc, 'retry_after', None))
+                    pending['review_hold'] = {'version': 1, 'message': str(exc)[:4000],
+                        'signature': _review_hold_signature(self.cli_app_dir, pending, pending['config']),
+                        'retry_after': deadline.isoformat() if deadline else None,
+                        'created_at': datetime.now().isoformat(timespec='seconds')}
+                    self._save_pending_topic(pending)
+                    attempts.append({'topic': topic, 'stage': 'review_required', 'error': str(exc),
+                                     'run_dir': resume_dir})
+                    self._write_cycle_attempts(attempts)
+                    raise
                 if resume_dir:
                     try:
                         failed = json.loads((Path(resume_dir) / "manifest.json").read_text(encoding="utf-8"))

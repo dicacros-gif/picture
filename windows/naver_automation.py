@@ -24,7 +24,8 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable
-from blog_visual_style import IMAGE_POLICY, line_style_runs, cover_headline, quote_parts, choose_visual_style
+from blog_visual_style import (IMAGE_POLICY, BODY_TEXT_COLOR, line_style_runs, cover_headline,
+                               quote_parts, choose_visual_style, supplement_bold_phrases)
 
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -3413,11 +3414,11 @@ class NaverAutomation:
         base_style = dict(node_template.get("style", {"@ctype": "nodeStyle"}))
         for key in bold_style or {}:
             base_style.pop(key, None)
-        if bold_style:
-            # Clear inherited toolbar decorations before styling individual runs.
-            for key in ("backgroundColor", "underline"):
-                base_style.pop(key, None)
-            base_style["fontColor"] = "#333333"
+        # The toolbar/template may retain gray or an earlier emphasis. Every
+        # plain run starts black; only an explicit phrase gets decoration.
+        for key in ("bold", "backgroundColor", "underline"):
+            base_style.pop(key, None)
+        base_style["fontColor"] = BODY_TEXT_COLOR
         fresh_id = lambda: "SE-" + str(uuid.uuid4())
         arranged = []
         for index, value in enumerate(paragraphs):
@@ -3508,16 +3509,16 @@ class NaverAutomation:
                             actual_flags.extend([applied] * len(value))
                         if actual_flags != expected_flags:
                             return False
-                        expected_styles = [style for text, style in styled_runs for _ in text]
-                        actual_styles = [node.get("style", {}) for node, value in zip(row.get("nodes", []), values)
-                                         for _ in (value if line else "")]
-                        if len(actual_styles) != len(expected_styles):
+                    expected_styles = [style for text, style in styled_runs for _ in text]
+                    actual_styles = [node.get("style", {}) for node, value in zip(row.get("nodes", []), values)
+                                     for _ in (value if line else "")]
+                    if len(actual_styles) != len(expected_styles):
+                        return False
+                    for actual, expected in zip(actual_styles, expected_styles):
+                        if (actual.get("fontColor", "").lower() != expected.get("fontColor", BODY_TEXT_COLOR)
+                                or bool(actual.get("underline")) != bool(expected.get("underline"))
+                                or actual.get("backgroundColor", "").lower() != expected.get("backgroundColor", "")):
                             return False
-                        for actual, expected in zip(actual_styles, expected_styles):
-                            if (actual.get("fontColor", "").lower() != expected.get("fontColor", "#333333")
-                                    or bool(actual.get("underline")) != bool(expected.get("underline"))
-                                    or actual.get("backgroundColor", "").lower() != expected.get("backgroundColor", "")):
-                                return False
                     lines.append(line)
                 actual_paragraphs.append("\n".join(lines))
             elif kind == "image":
@@ -3690,7 +3691,7 @@ class NaverAutomation:
                             if expected_rows[row][0] == len(paragraphs) - 1
                             and re.fullmatch(r"#[^\s#]+(?:[ \t]+#[^\s#]+)*", expected_rows[row][1].strip())), None)
         for row_number, ((index, line), nodes) in enumerate(zip(expected_rows, actual_rows)):
-            expected = [(char, rgb(style.get('fontColor', '#333333')), rgb(style.get('backgroundColor', '')),
+            expected = [(char, rgb(style.get('fontColor', BODY_TEXT_COLOR)), rgb(style.get('backgroundColor', '')),
                          bool(style.get('underline'))) for text, style in line_style_runs(line, bold_terms, index, visual_style) for char in text]
             actual = [(char, node.get('color'), node.get('background', ''), bool(node.get('underline')), node.get('native_hashtag') is True)
                       for node in nodes for char in str(node.get('value', '')).replace('\u200b', '')]
@@ -3699,10 +3700,10 @@ class NaverAutomation:
             for wanted, observed in zip(expected, actual):
                 color = observed[1]
                 # Published Naver pages wrap plain footer hashtags in their own
-                # blue span. Only this observed tint may replace default gray;
+                # blue span. Only this observed tint may replace default black;
                 # explicit keyword colors and all other formatting remain exact.
                 if (published and row_number == hashtag_row and observed[4]
-                        and wanted[1] == 'rgb(51, 51, 51)' and color == 'rgb(56, 124, 187)'):
+                        and wanted[1] == 'rgb(0, 0, 0)' and color == 'rgb(56, 124, 187)'):
                     color = wanted[1]
                 if (observed[0], color, observed[2], observed[3]) != wanted:
                     return False
@@ -4025,10 +4026,16 @@ class NaverAutomation:
         bold_terms = article.get("bold_terms", [])
         visual_style = article.get("visual_style")
         if visual_style is None:
-            visual_style = choose_visual_style(paragraphs)
+            visual_style = choose_visual_style(paragraphs, article.get('bold_phrases'),
+                                               article.get('highlight_phrases'),
+                                               enrich_body_bold=True, bold_terms=bold_terms)
             article["visual_style"] = visual_style
         if not isinstance(visual_style, dict) or len(visual_style.get("quote_layouts", [])) != len(paragraphs):
             raise ValueError("저장된 소제목 인용구 설정이 올바르지 않습니다.")
+        # Reuse saved quote layouts and highlight colors when refreshing an
+        # older prepared article. This changes presentation, never its text.
+        visual_style['bold_phrases'] = supplement_bold_phrases(
+            paragraphs, visual_style.get('bold_phrases'), visual_style.get('highlight_phrases'), bold_terms)
         for paragraph, layout in zip(paragraphs, visual_style['quote_layouts']):
             quote_parts(paragraph, layout)
         image_ids = self._prepare_article_in_writer(driver, blog_id, title, paragraphs, images, bold_terms=bold_terms, visual_style=visual_style)
