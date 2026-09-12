@@ -3657,7 +3657,7 @@ class NaverAutomation:
         return True
 
     @classmethod
-    def _article_native_colors_rendered(cls, driver, paragraphs, bold_terms=None, visual_style=None) -> bool:
+    def _article_native_colors_rendered(cls, driver, paragraphs, bold_terms=None, visual_style=None, *, published=False) -> bool:
         rendered = driver.execute_script("""
             return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"], .se-component.se-quotation')]
               .map(component=>[...component.querySelectorAll(component.classList.contains('se-quotation') ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')].map(row=>{
@@ -3671,7 +3671,9 @@ class NaverAutomation:
                     if(s.textDecorationLine.includes('underline')) underline=true;
                     e=e.parentElement;
                   }
-                  nodes.push({value:node.nodeValue,color:style.color,background,underline});
+                  const hashtag=node.parentElement.closest('span.__se-hash-tag');
+                  nodes.push({value:node.nodeValue,color:style.color,background,underline,
+                    native_hashtag:Boolean(hashtag && row.contains(hashtag))});
                 }
                 return nodes;
               }));
@@ -3684,13 +3686,26 @@ class NaverAutomation:
         actual_rows = [row for section in rendered for row in section]
         if len(expected_rows) != len(actual_rows):
             return False
-        for (index, line), nodes in zip(expected_rows, actual_rows):
+        hashtag_row = next((row for row in range(len(expected_rows) - 1, -1, -1)
+                            if expected_rows[row][0] == len(paragraphs) - 1
+                            and re.fullmatch(r"#[^\s#]+(?:[ \t]+#[^\s#]+)*", expected_rows[row][1].strip())), None)
+        for row_number, ((index, line), nodes) in enumerate(zip(expected_rows, actual_rows)):
             expected = [(char, rgb(style.get('fontColor', '#333333')), rgb(style.get('backgroundColor', '')),
                          bool(style.get('underline'))) for text, style in line_style_runs(line, bold_terms, index, visual_style) for char in text]
-            actual = [(char, node.get('color'), node.get('background', ''), bool(node.get('underline')))
+            actual = [(char, node.get('color'), node.get('background', ''), bool(node.get('underline')), node.get('native_hashtag') is True)
                       for node in nodes for char in str(node.get('value', '')).replace('\u200b', '')]
-            if actual != expected:
+            if len(actual) != len(expected):
                 return False
+            for wanted, observed in zip(expected, actual):
+                color = observed[1]
+                # Published Naver pages wrap plain footer hashtags in their own
+                # blue span. Only this observed tint may replace default gray;
+                # explicit keyword colors and all other formatting remain exact.
+                if (published and row_number == hashtag_row and observed[4]
+                        and wanted[1] == 'rgb(51, 51, 51)' and color == 'rgb(56, 124, 187)'):
+                    color = wanted[1]
+                if (observed[0], color, observed[2], observed[3]) != wanted:
+                    return False
         return True
 
     @classmethod
@@ -3808,7 +3823,7 @@ class NaverAutomation:
         identity_matches = (None if expected_image_ids is None else
                             [item.get("id") for item in actual_images] == expected_image_ids)
         bold_matches = self._article_native_bold_rendered(driver, paragraphs, article.get("bold_terms", []), visual_style)
-        colors_match = not visual_style or self._article_native_colors_rendered(driver, paragraphs, article.get('bold_terms', []), visual_style)
+        colors_match = not visual_style or self._article_native_colors_rendered(driver, paragraphs, article.get('bold_terms', []), visual_style, published=True)
         verified = text_matches and position_matches and bold_matches and colors_match and identity_matches is not False
         return {"verified": bool(verified), "url": url, "title_matches": True,
                 "section_count": len(actual_sections), "sections_match": text_matches,
