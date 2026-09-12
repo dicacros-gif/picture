@@ -30,6 +30,7 @@ import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from selenium import webdriver
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -3993,6 +3994,9 @@ class NaverAutomation:
         for paragraph, layout in zip(paragraphs, visual_style['quote_layouts']):
             quote_parts(paragraph, layout)
         image_ids = self._prepare_article_in_writer(driver, blog_id, title, paragraphs, images, bold_terms=bold_terms, visual_style=visual_style)
+        # Naver can show its old-draft recovery prompt after image uploads have
+        # finished. Cancel only that known restore action, then verify our copy.
+        self._handle_writer_recovery_prompt(driver)
         bold_style = getattr(self, "_active_article_bold_style", None)
         positions = [item["paragraph_index"] for item in images]
         if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
@@ -4010,7 +4014,19 @@ class NaverAutomation:
         if self.stop_event.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
         opener = WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=False))
-        opener.click()
+        try:
+            opener.click()
+        except ElementClickInterceptedException:
+            # Only the settings opener may be retried. The final submission
+            # below always remains protected by its durable receipt.
+            self._handle_writer_recovery_prompt(driver)
+            if self.stop_event.is_set():
+                raise RuntimeError("사용자가 작업을 중지했습니다.")
+            if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
+                                                  bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
+                raise RuntimeError("안내창 처리 후 내용 검증에 실패하여 발행 설정을 다시 열지 않았습니다.")
+            opener = WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=False))
+            opener.click()
         try:
             WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=True))
         except TimeoutException as exc:
