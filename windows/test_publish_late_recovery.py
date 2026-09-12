@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from selenium.common.exceptions import ElementClickInterceptedException
+from selenium.common.exceptions import ElementClickInterceptedException, WebDriverException
 
 import test_naver_publish as support
 
@@ -28,6 +28,65 @@ class LateWriterRecoveryTests(unittest.TestCase):
     def assert_no_submission(self):
         self.final.click.assert_not_called()
         self.assertFalse((self.root / "publication_receipts").exists())
+
+    def test_writer_is_activated_before_dialog_lookup_and_native_cancel(self):
+        state, _dialog, cancel, _confirm = self.recovery_dialog()
+        events = []
+        self.driver.execute_cdp_cmd.side_effect = lambda *args: events.append("activate")
+        original_find = self.driver.find_elements.side_effect
+        def find(*args):
+            self.assertEqual(events[0], "activate")
+            events.append("find")
+            return original_find(*args)
+        self.driver.find_elements.side_effect = find
+        self.app.log = lambda _message: events.append("log")
+        def clicked():
+            self.assertEqual(events[-1], "log")
+            events.append("cancel")
+            state["visible"] = False
+        cancel.click.side_effect = clicked
+
+        self.app._handle_writer_recovery_prompt(self.driver)
+
+        self.driver.execute_cdp_cmd.assert_called_once_with("Page.bringToFront", {})
+        self.assertLess(events.index("activate"), events.index("find"))
+        self.assertLess(events.index("find"), events.index("cancel"))
+        self.driver.switch_to.window.assert_not_called()
+
+    def test_unsupported_cdp_activates_only_current_writer_handle(self):
+        state, _dialog, cancel, _confirm = self.recovery_dialog()
+        self.driver.current_window_handle = "existing-writer-handle"
+        self.driver.execute_cdp_cmd.side_effect = WebDriverException("CDP unsupported")
+        def clicked():
+            self.driver.switch_to.window.assert_called_once_with("existing-writer-handle")
+            state["visible"] = False
+        cancel.click.side_effect = clicked
+
+        self.app._handle_writer_recovery_prompt(self.driver)
+
+        cancel.click.assert_called_once()
+        self.driver.get.assert_not_called()
+        self.driver.execute_script.assert_not_called()
+
+    def test_activation_does_not_touch_other_pages(self):
+        for url in ("https://www.google.com/search?q=photo", "https://blog.naver.com/testblog/12345",
+                    "https://unrelated.example/testblog/postwrite", "https://blog.naver.com.evil.example/testblog/postwrite"):
+            with self.subTest(url=url):
+                self.driver.current_url = url
+                self.app._activate_writer_tab(self.driver)
+        self.driver.execute_cdp_cmd.assert_not_called()
+        self.driver.switch_to.window.assert_not_called()
+
+    def test_known_restore_dismissal_timeout_identifies_failed_action(self):
+        _state, _dialog, cancel, confirm = self.recovery_dialog()
+        cancel.click.side_effect = None
+
+        with self.assertRaisesRegex(RuntimeError, "취소 버튼을 눌렀지만 안내창이 닫히지"):
+            self.app._handle_writer_recovery_prompt(self.driver)
+
+        cancel.click.assert_called_once()
+        confirm.click.assert_not_called()
+        self.assert_no_submission()
 
     def test_delayed_restore_is_declined_before_content_validation_and_publish(self):
         state, _dialog, cancel, confirm = self.recovery_dialog()

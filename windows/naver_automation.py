@@ -2377,8 +2377,24 @@ class NaverAutomation:
         self._handle_writer_recovery_prompt(driver)
         return self._find_editor_fields(driver) or fields
 
+    @staticmethod
+    def _activate_writer_tab(driver) -> None:
+        """Activate only the writer already selected by this WebDriver session."""
+        url = urllib.parse.urlparse(str(driver.current_url or ""))
+        if (url.scheme not in {"http", "https"} or url.hostname != "blog.naver.com"
+                or not (re.fullmatch(r"/[^/]+/postwrite/?", url.path, re.I)
+                        or url.path.lower() == "/postwriteform.naver")):
+            return
+        try:
+            driver.execute_cdp_cmd("Page.bringToFront", {})
+        except (AttributeError, WebDriverException):
+            # A provider without CDP can still select its existing window. Do
+            # not enumerate or switch to unrelated tabs and never force clicks.
+            driver.switch_to.window(driver.current_window_handle)
+
     def _handle_writer_recovery_prompt(self, driver) -> None:
         """Decline only Naver's observed recovery prompt when opening a new article."""
+        self._activate_writer_tab(driver)
         def visible_dialogs():
             return [element for element in driver.find_elements(By.CSS_SELECTOR, ".se-popup, [role='dialog']")
                     if element.is_displayed()]
@@ -2395,13 +2411,20 @@ class NaverAutomation:
                       if button.is_displayed() and button.is_enabled() and self._normalized_text(button.text) == "취소"]
         if len(candidates) != 1:
             raise RuntimeError("이전 작성 내용 불러오기 취소 버튼을 고유하게 확인하지 못했습니다.")
+        self.log("이전 작성 내용 복원 안내를 확인했습니다. 현재 편집기에서 불러오기 취소를 누릅니다.")
         candidates[0].click()
         def dismissed(_driver):
             try:
                 return not dialog.is_displayed()
             except StaleElementReferenceException:
                 return True
-        WebDriverWait(driver, 8).until(dismissed)
+        try:
+            WebDriverWait(driver, 8).until(dismissed)
+        except TimeoutException as exc:
+            raise RuntimeError(
+                "이전 작성 내용 불러오기 취소 버튼을 눌렀지만 안내창이 닫히지 않았습니다. "
+                "편집기 내용을 유지했으며 발행·저장은 실행하지 않았습니다."
+            ) from exc
         self.log("새 글 작성을 위해 이전 작성 내용 불러오기를 취소했습니다. 저장된 임시글 삭제는 실행하지 않았습니다.")
 
     def open_blog_writer(self, blog_id: str):
