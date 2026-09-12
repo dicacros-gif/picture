@@ -29,6 +29,19 @@ class RoleInvariantTests(unittest.TestCase):
         _validate_article(result, support.KEYWORDS, require_visual_style=True)
         self.assertTrue(result["paragraphs"][7].endswith("뜻과 의미"))
 
+    def test_source_error_identifies_invalid_record_without_promoting_secondary_evidence(self):
+        article = support.valid_article()
+        secondary = copy.deepcopy(article["sources"][0])
+        secondary.update(url="https://secondary.example/reposted-guidance", is_primary=False)
+        article["sources"].append(secondary)
+        original = copy.deepcopy(article)
+        with self.assertRaises(WorkflowError) as error:
+            _validate_article(article, support.KEYWORDS)
+        self.assertIn("sources[1]", str(error.exception))
+        self.assertIn("is_primary=true", str(error.exception))
+        self.assertIn("검증값만 바꾸지 말고", str(error.exception))
+        self.assertEqual(article, original)
+
     def test_undocumented_footer_insertion_or_unverified_source_is_rejected(self):
         previous, result = self.fact_added_before_footer()
         result["fact_additions"][0]["source_urls"] = ["https://unverified.example/source"]
@@ -141,6 +154,82 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=self.routes())
         self.assertTrue(result["ready_to_publish"])
         self.assertEqual(result["paragraphs"][7], corrected["paragraphs"][7])
+
+    def test_rejected_fact_cache_and_format_retry_use_approved_upstream_as_ledger_base(self):
+        original = self.bridge.run_text
+        previous, corrected = RoleInvariantTests().fact_added_before_footer()
+        rejected = copy.deepcopy(corrected)
+        secondary = copy.deepcopy(rejected["sources"][0])
+        secondary.update(url="https://secondary.example/reposted-guidance", is_primary=False)
+        rejected["sources"].append(secondary)
+        resumed = False
+        prompts = []
+
+        def run(provider, prompt, **kwargs):
+            if kwargs.get("images") or prompt.startswith("FINAL_ARTICLE_REVIEW"):
+                return original(provider, prompt, **kwargs)
+            if provider == "antigravity" or "동일 주제 복구 단계" in prompt:
+                if not resumed:
+                    return json.dumps(rejected)
+                prompts.append(prompt)
+                response = copy.deepcopy(corrected)
+                if len(prompts) == 1:
+                    response["image_prompts"] = response["image_prompts"][:7]
+                return json.dumps(response)
+            return original(provider, prompt, **kwargs)
+
+        self.bridge.run_text = run
+        failed = self.assert_blocked("sources[1]", steps=["chatgpt", "antigravity"], stage_configs=self.routes())
+        self.assertFalse(self.bridge.generations)
+        resumed = True
+        result = self.workflow.resume(failed["run_dir"])
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("이전 응답의 구조 오류", prompts[1])
+        for prompt in prompts:
+            data = json.loads(prompt.split("BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n", 1)[1].split(
+                "\nEND_UNTRUSTED_RESEARCH_DATA_JSON", 1)[0])
+            self.assertEqual(data["previous_draft"], previous)
+            rejected_data = json.loads(prompt.split("BEGIN_UNTRUSTED_REJECTED_STAGE_JSON\n", 1)[1].split(
+                "\nEND_UNTRUSTED_REJECTED_STAGE_JSON", 1)[0])
+            self.assertIn("sources[1]", rejected_data["previous_error"])
+            self.assertEqual(rejected_data["fact_additions"], corrected["fact_additions"])
+            self.assertNotIn("paragraphs", rejected_data)
+        self.assertEqual(result["paragraphs"], corrected["paragraphs"])
+        self.assertEqual(result["paragraphs"][7].count(corrected["fact_additions"][0]["text"]), 1)
+
+    def test_rejected_style_cache_preserves_approved_numeric_baseline(self):
+        original = self.bridge.run_text
+        previous = copy.deepcopy(self.bridge.article)
+        revised = copy.deepcopy(previous)
+        revised["paragraphs"][0] = revised["paragraphs"][0].replace("눈에 보이는 숫자 하나로", "표시된 숫자 하나로")
+        rejected = copy.deepcopy(revised)
+        rejected["sources"][0]["is_primary"] = False
+        resumed = False
+        prompts = []
+
+        def run(provider, prompt, **kwargs):
+            if kwargs.get("images") or prompt.startswith("FINAL_ARTICLE_REVIEW"):
+                return original(provider, prompt, **kwargs)
+            if provider == "antigravity" or "동일 주제 복구 단계" in prompt:
+                if not resumed:
+                    return json.dumps(rejected)
+                prompts.append(prompt)
+                return json.dumps(revised)
+            return original(provider, prompt, **kwargs)
+
+        self.bridge.run_text = run
+        stages = self.routes()
+        stages[-1]["role"] = "문체 다듬기"
+        failed = self.assert_blocked("sources[0]", steps=["chatgpt", "antigravity"], stage_configs=stages)
+        resumed = True
+        result = self.workflow.resume(failed["run_dir"])
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(len(prompts), 1)
+        data = json.loads(prompts[0].split("BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n", 1)[1].split(
+            "\nEND_UNTRUSTED_RESEARCH_DATA_JSON", 1)[0])
+        self.assertEqual(data["previous_draft"], previous)
+        self.assertEqual(result["paragraphs"], revised["paragraphs"])
 
     def test_editorial_without_style_role_uses_last_successful_route(self):
         original = self.bridge.run_text

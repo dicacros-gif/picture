@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
 import io
 import hashlib
 import json
@@ -1908,8 +1909,44 @@ class NaverAutomation:
         except ValueError:
             return ""
 
+    @contextmanager
+    def _google_capture_rendering(self, driver):
+        """Keep this capture tab rendering when its window is minimized/occluded."""
+        enabled = False
+        command = getattr(driver, "execute_cdp_cmd", None)
+        if callable(command):
+            try:
+                command("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                enabled = True
+            except WebDriverException:
+                self.log("Google 캡처 탭의 배경 렌더링을 설정하지 못해 현재 화면 상태로 확인합니다.")
+        try:
+            yield
+        finally:
+            if enabled:
+                try:
+                    command("Emulation.setFocusEmulationEnabled", {"enabled": False})
+                except WebDriverException:
+                    # The user can close the capture tab while cancellation unwinds.
+                    pass
+
     def capture_google_reference_candidates(
         self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
+    ) -> list[dict]:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            raise ValueError("Google 참고 이미지 검색어가 없습니다.")
+        if english_only and (not keyword.isascii() or re.search(r"[A-Za-z]{2,}", keyword) is None):
+            raise ValueError("영어 이미지 검색에는 영문 단어로 번역된 검색어가 필요합니다.")
+        driver = self._driver()
+        # Native focus emulation makes the selected tab's lazy image viewer
+        # render without moving the user's windows or changing image CSS.
+        with self._google_capture_rendering(driver):
+            return self._capture_google_reference_candidates(
+                driver, keyword, output_dir, count, reuse_only=reuse_only, english_only=english_only)
+
+    def _capture_google_reference_candidates(
+        self, driver, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
     ) -> list[dict]:
         """Capture up to ten eligible previews; licensing/vision gates stay explicit.
 
@@ -1928,7 +1965,6 @@ class NaverAutomation:
         count = max(1, min(10, int(count)))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        driver = self._driver()
         search_options = {
             "tbm": "isch", "hl": "en" if english_only else "ko", "safe": "active", "tbs": "il:cl",
             "q": keyword + (" site:commons.wikimedia.org" if reuse_only else "")
