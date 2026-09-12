@@ -5,6 +5,7 @@ import io
 import tempfile
 import time
 import unittest
+import threading
 import llm_cli
 from contextlib import nullcontext
 from pathlib import Path
@@ -431,24 +432,29 @@ class CoreTests(unittest.TestCase):
         app.events = MagicMock()
         app.auto_history = []
         app._cli_realtime_groups = MagicMock(return_value={"구글": ["배터리 절약 방법"]})
-        app._select_longtail_topic = MagicMock(return_value=("배터리 절약 방법", ["배터리 절약 설정"], {}))
+        app._rank_longtail_topics = MagicMock(return_value=([
+            {"topic": "배터리 절약 방법", "keywords": ["배터리 절약 방법 설정"]}], {"배터리 절약 방법": {}}))
+        app._preflight_cli_accounts = MagicMock()
+        app.cli_bridge = MagicMock()
+        app.full_auto_stop = threading.Event()
         article = {"run_dir": "example-run", "ready_to_publish": True}
         app._prepare_cli_worker = MagicMock(return_value=article)
         app._publish_cli_worker = MagicMock(return_value={"published": True, "url": "https://example.test/post"})
         config = {"steps": ["chatgpt", "claude", "antigravity", "chatgpt"],
                   "publish": True, "interval_hours": 1}
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch("blog_controls.BlogWorkflow") as workflow:
+            workflow.return_value.select_topic.return_value = {"topic": "배터리 절약 방법", "keywords": ["배터리 절약 방법 설정"]}
             app.cli_app_dir = Path(directory)
             app._run_full_automation_cycle(config)
             app._publish_cli_worker.assert_called_once_with(article, config)
             self.assertEqual(app.auto_history[-1]["providers"], config["steps"])
             self.assertFalse(app.auto_history[-1]["draft_only"])
             self.assertTrue((Path(directory) / "automation-history.json").is_file())
-        app._publish_cli_worker.reset_mock()
-        app._prepare_cli_worker.side_effect = RuntimeError("image validation failed")
-        with self.assertRaisesRegex(RuntimeError, "image validation failed"):
-            app._run_full_automation_cycle(config)
-        app._publish_cli_worker.assert_not_called()
+            app._publish_cli_worker.reset_mock()
+            app._prepare_cli_worker.side_effect = RuntimeError("image validation failed")
+            with self.assertRaisesRegex(RuntimeError, "준비되지 않았습니다"):
+                app._run_full_automation_cycle(config)
+            app._publish_cli_worker.assert_not_called()
 
     def test_korean_keyword_is_translated_for_google_images(self):
         response = MagicMock()

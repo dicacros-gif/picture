@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import re
+import unicodedata
 import uuid
 
 PROVIDER_LABELS = {
@@ -10,6 +12,48 @@ PROVIDER_LABELS = {
     "antigravity": "Antigravity CLI",
 }
 DEFAULT_ORDER = ["chatgpt", "claude", "antigravity", "chatgpt"]
+SPORTS_BLOCKED_TERMS = [
+    "스포츠", "축구", "야구", "농구", "배구", "골프", "선수", "구단", "리그", "경기",
+    "올림픽", "월드컵", "KBO", "프리미어리그", "감독 경질", "테니스", "배드민턴",
+    "메달", "챔피언스", "플레이오프", "결승", "준결승", "프로야구", "MLB", "NBA", "FIFA",
+]
+DEATH_BLOCKED_TERMS = [
+    "사망", "죽음", "별세", "부고", "숨져", "숨진", "자살", "극단적 선택", "참사",
+    "사고사", "시신", "장례", "추모", "사망자", "유족", "운명하다", "타계",
+]
+DEFAULT_BLOCKED_TERMS = SPORTS_BLOCKED_TERMS + DEATH_BLOCKED_TERMS
+
+
+def normalize_blocked_terms(value=None) -> list[str]:
+    if value is None or not isinstance(value, (str, list, tuple)):
+        value = DEFAULT_BLOCKED_TERMS
+    if isinstance(value, str):
+        value = re.split(r"[,;\n\r]+", value)
+    terms, seen = [], set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = unicodedata.normalize("NFKC", item).strip()
+        key = re.sub(r"\s+", "", item).casefold()
+        if key and key not in seen:
+            terms.append(item)
+            seen.add(key)
+    return terms
+
+
+def blocked_term_hits(value, blocked_terms=None) -> list[str]:
+    """Case/spacing-insensitive substring blocking, including every related result."""
+    def strings(item):
+        if isinstance(item, str):
+            return [item]
+        if isinstance(item, dict):
+            return [text for part in item.values() for text in strings(part)]
+        if isinstance(item, (list, tuple)):
+            return [text for part in item for text in strings(part)]
+        return []
+    texts = [re.sub(r"\s+", "", unicodedata.normalize("NFKC", text)).casefold() for text in strings(value)]
+    return [term for term in normalize_blocked_terms(blocked_terms)
+            if any(re.sub(r"\s+", "", term).casefold() in text for text in texts)]
 
 
 def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt: str = "") -> dict:
@@ -48,6 +92,8 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         "review_mode": str(value.get("review_mode", "단계별 교차 검수")),
         "models": {key: str(models.get(key, "")).strip() for key in PROVIDER_LABELS},
         "include_google": value.get("include_google", True) is True,
+        "auto_start_on_launch": value.get("auto_start_on_launch", True) is True,
+        "blocked_terms": normalize_blocked_terms(value.get("blocked_terms")),
         "publication_mode": {"발행": "자동 발행", "자동 발행": "자동 발행", "임시저장": "임시저장까지만",
                              "임시저장까지만": "임시저장까지만", "입력만": "편집기에 입력만",
                              "편집기에 입력만": "편집기에 입력만"}.get(value.get("publication_mode"), "자동 발행"),

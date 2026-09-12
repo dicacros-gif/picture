@@ -24,6 +24,8 @@ from send2trash import send2trash
 from chatgpt_classic_automation import ChatGPTClassicAutomation
 from blog_controls import BlogWorkflowControls, next_cycle_tick
 from blog_workflow import BlogWorkflow
+from blog_preferences import blocked_term_hits
+from blog_runtime import access_error_from_exception, wait_for_restart_parent
 from naver_automation import NaverAutomation
 
 
@@ -613,7 +615,7 @@ def compose_related_topic(seed: str, keywords: list[str]) -> str:
 class PictureCleanerApp(BlogWorkflowControls):
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title(f"{APP_NAME} · CLI 블로그 2026-09-12")
+        self.root.title(f"{APP_NAME} · 무인 CLI 블로그 2026-09-12")
         self.root.geometry("1180x780")
         self.root.minsize(940, 650)
         self.events: queue.Queue[tuple] = queue.Queue()
@@ -694,7 +696,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         # 일부 Windows 환경은 최초 매핑 직후 창 상태를 다시 복원하므로 한 번 더 적용한다.
         self.root.after(500, self._maximize_window)
         self.root.after(100, self._poll)
-        self.root.after(300, self.run_realtime)
+        self.root.after(300, lambda: self.run_realtime(startup=True))
 
     def _style(self):
         style = ttk.Style()
@@ -969,6 +971,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             "base_text",
             "blog_result",
             "comment_log",
+            "cli_blocked_terms",
         ):
             widget = getattr(self, name, None)
             if widget:
@@ -1028,6 +1031,8 @@ class PictureCleanerApp(BlogWorkflowControls):
             style="Danger.TButton",
             command=self.stop_full_automation,
         ).pack(side="left", padx=(7, 12))
+        ttk.Checkbutton(topbar, text="시작 시 자동 실행", variable=self.auto_start_on_launch,
+                        command=self._save_launch_choice).pack(side="left", padx=(0, 10))
         ttk.Label(topbar, text="반복 간격").pack(side="left")
         interval_box = ttk.Combobox(topbar, textvariable=self.auto_interval_hours,
             values=["1", "2"], width=4, state="readonly")
@@ -1692,17 +1697,23 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.start_cli_automation()
 
     def stop_full_automation(self):
+        self._cancel_automatic_resume()
         self.full_auto_stop.set()
         self.naver_bot.stop_event.set()
         self.status.set("전체 자동화 중지를 요청했습니다.")
 
     def _full_automation_loop(self, config: dict):
         next_tick = time.monotonic()
+        access_problem = None
         try:
             while not self.full_auto_stop.is_set():
                 try:
                     self._run_full_automation_cycle(config)
                 except Exception as exc:
+                    access_problem = access_error_from_exception(exc)
+                    if access_problem:
+                        self._naver_log(str(access_problem))
+                        break
                     self._naver_log(f"전체 자동화 회차 실패: {exc}")
                     self.events.put(
                         ("auto_error", f"전체 자동화 회차 실패: {exc}")
@@ -1721,11 +1732,14 @@ class PictureCleanerApp(BlogWorkflowControls):
             self.full_auto_active = False
             self.naver_task_active = False
             self.events.put(("cli_idle",))
-            self.events.put(("status", "전체 자동화가 중지되었습니다."))
+            self.events.put(("status", "CLI 로그인 대기 중입니다." if access_problem else "전체 자동화가 중지되었습니다."))
+            if access_problem:
+                self.events.put(("cli_access_required", access_problem, True))
 
-    def _select_longtail_topic(
+    def _rank_longtail_topics(
         self, groups: dict[str, list[str]], config: dict | None = None
-    ) -> tuple[str, list[str], dict[str, list[str]]]:
+    ) -> tuple[list[dict], dict]:
+        blocked_terms = (config if config is not None else self.cli_preferences).get("blocked_terms")
         groups = self.topic_history.filter_groups(groups, include_pending=True)
         history_keys = {keyword_comparison_key(topic) for topic in self.topic_history.blocked_topics()}
         source_counts: dict[str, int] = {}
@@ -1733,6 +1747,10 @@ class PictureCleanerApp(BlogWorkflowControls):
         for words in groups.values():
             for word in words:
                 normalized = normalize_keyword(word)
+                hits = blocked_term_hits(normalized, blocked_terms)
+                if hits:
+                    self._naver_log(f"후보 차단 · {normalized}: {', '.join(hits)}")
+                    continue
                 key = keyword_comparison_key(normalized)
                 if (
                     key
@@ -1761,16 +1779,25 @@ class PictureCleanerApp(BlogWorkflowControls):
                     related_by_topic[topic] = {}
 
         ranked = BlogWorkflow.rank_topics({source: [word for word in words if normalize_keyword(word) in candidates] for source, words in groups.items()}, related_by_topic,
-            exclude_topics=self.topic_history.blocked_topics())
+            exclude_topics=self.topic_history.blocked_topics(), blocked_terms=blocked_terms)
+        for candidate, related in related_by_topic.items():
+            hits = blocked_term_hits(related, blocked_terms)
+            if hits:
+                self._naver_log(f"연관어 차단 · {candidate}: {', '.join(hits)}")
         if not ranked:
             raise RuntimeError("연관 검색어가 충분한 관심 주제를 찾지 못했습니다.")
+        self.events.put(("cli_ranking", ranked[:10]))
+        return ranked, related_by_topic
+
+    def _select_longtail_topic(self, groups, config=None):
+        ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
         selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         provider = config["steps"][0] if config is not None else self.cli_preferences["order"][0]
         models = config["models"] if config is not None else self.cli_preferences["models"]
-        choice = selector.select_topic(ranked[:12], provider=provider, model=models.get(provider, ""))
+        blocked_terms = (config if config is not None else self.cli_preferences).get("blocked_terms")
+        choice = selector.select_topic(ranked[:12], provider=provider, model=models.get(provider, ""), blocked_terms=blocked_terms)
         topic, related = choice["topic"], choice["keywords"]
         self._naver_log(f"선정: {topic} · 예상 관심 점수 {choice['score']} · {choice['reason']} (실제 CTR 아님)")
-        self.events.put(("cli_ranking", ranked[:10]))
 
         return topic, related, related_by_topic[topic]
 
@@ -2010,9 +2037,11 @@ class PictureCleanerApp(BlogWorkflowControls):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def run_realtime(self):
+    def run_realtime(self, *, startup=False):
         # Claim the shared Whale session on the Tk thread before the worker starts.
         if self._browser_task_busy():
+            if startup:
+                self._launch_auto_pending = False
             self.status.set("진행 중인 브라우저 작업이 있어 실시간 조회를 시작하지 않았습니다.")
             return False
         self.realtime_task_active = True
@@ -2028,11 +2057,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                 self.events.put(("status", f"실시간 검색어 조회 실패: {exc}"))
             finally:
                 self.realtime_task_active = False
+                self.events.put(("realtime_finished", startup))
 
         try:
             threading.Thread(target=work, daemon=True).start()
         except Exception:
             self.realtime_task_active = False
+            self.events.put(("realtime_finished", startup))
             raise
         return True
 
@@ -2257,6 +2288,8 @@ class PictureCleanerApp(BlogWorkflowControls):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
+                if self._handle_runtime_event(event):
+                    continue
                 if kind == "status":
                     self.status.set(event[1])
                 elif kind == "error":
@@ -2479,9 +2512,12 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self.topic.set(event[1])
         except queue.Empty:
             pass
+        self._maybe_launch_automation()
         self.root.after(100, self._poll)
 
     def close(self):
+        self._closing = True
+        self._cancel_automatic_resume()
         if hasattr(self, "cli_preferences"):
             # Save edited preset content and current choices before shutdown.
             current = next(p for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt)
@@ -2519,6 +2555,7 @@ class PictureCleanerApp(BlogWorkflowControls):
 
 
 def main():
+    wait_for_restart_parent(sys.argv[1:])
     APP_DIR.mkdir(parents=True, exist_ok=True)
     root = Tk()
     PictureCleanerApp(root)

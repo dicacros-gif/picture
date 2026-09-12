@@ -87,13 +87,13 @@ class BlogUiTests(unittest.TestCase):
             self.assertFalse(hasattr(restored, "api_key"))
 
     def test_default_migration_preserves_user_presets_with_colliding_name_and_id(self):
-        prompts = [{"id": "mine", "name": "사용자 기본 프롬프트", "text": "사용자 직접 작성한 문장"},
-                   {"id": "user-default-20260912", "name": "직접 저장한 옵션", "text": "보존할 두 번째 내용"}]
+        prompts = [{"id": "mine", "name": "사용자 기본 프롬프트 · 인용구 6종", "text": "사용자 직접 작성한 문장"},
+                   {"id": "user-default-20260912-visual-v2", "name": "직접 저장한 옵션", "text": "보존할 두 번째 내용"}]
         with tempfile.TemporaryDirectory() as directory:
             app = self.make_app(directory, {"cli_workflow": {"prompts": prompts}})
             saved = app.cli_preferences["prompts"]
             self.assertEqual(saved[1:], prompts)
-            self.assertEqual(saved[0]["name"], "사용자 기본 프롬프트 (2)")
+            self.assertEqual(saved[0]["name"], "사용자 기본 프롬프트 · 인용구 6종 (2)")
             self.assertNotEqual(saved[0]["id"], prompts[1]["id"])
             app._save_cli_selection()
             settings = json.loads((Path(directory) / "settings.json").read_text(encoding="utf-8"))
@@ -143,22 +143,44 @@ class BlogUiTests(unittest.TestCase):
             workflow.rank_topics.return_value = [{"topic": topic, "score": 10}]
             workflow.return_value.select_topic.return_value = {"topic": topic, "keywords": ["배터리 설정"], "score": 10, "reason": "관심"}
             app._select_longtail_topic(groups, config=config)
-            self.assertEqual(workflow.return_value.select_topic.call_args.kwargs, {"provider": "antigravity", "model": "saved-model"})
+            self.assertEqual(workflow.return_value.select_topic.call_args.kwargs, {"provider": "antigravity", "model": "saved-model", "blocked_terms": None})
             app._select_longtail_topic(groups)
-            self.assertEqual(workflow.return_value.select_topic.call_args.kwargs, {"provider": "claude", "model": "current-model"})
+            self.assertEqual(workflow.return_value.select_topic.call_args.kwargs, {"provider": "claude", "model": "current-model", "blocked_terms": None})
 
     def test_automatic_cycle_passes_same_snapshot_to_selection_and_preparation(self):
         app = object.__new__(PictureCleanerApp)
-        config = {"steps": ["antigravity"], "models": {"antigravity": "saved-model"}}
+        config = {"steps": ["antigravity"], "models": {"antigravity": "saved-model"}, "publish": True}
         groups = {"검색": ["주제"]}
+        app.full_auto_stop = threading.Event()
+        app.cli_bridge, app._naver_log = MagicMock(), MagicMock()
+        app._preflight_cli_accounts = MagicMock()
         app._cli_realtime_groups = MagicMock(return_value=groups)
-        app._select_longtail_topic = MagicMock(return_value=("주제", ["연관"], {}))
-        app._prepare_cli_worker = MagicMock(side_effect=RuntimeError("stop before generation"))
+        app._rank_longtail_topics = MagicMock(return_value=([{"topic": "주제", "keywords": ["주제 연관"]}], {"주제": {}}))
+        app._publish_cli_worker = MagicMock(return_value={"published": True})
+        app.auto_history = []
         app.events = MagicMock()
-        with self.assertRaisesRegex(RuntimeError, "stop before generation"):
+        with tempfile.TemporaryDirectory() as directory, patch("blog_controls.BlogWorkflow") as workflow:
+            app.cli_app_dir = Path(directory)
+            app._prepare_cli_worker = MagicMock(return_value={"run_dir": directory})
+            workflow.return_value.select_topic.return_value = {"topic": "주제", "keywords": ["주제 연관"]}
             app._cli_automation_cycle(config)
-        app._select_longtail_topic.assert_called_once_with(groups, config=config)
-        app._prepare_cli_worker.assert_called_once_with("주제", ["연관"], config)
+            self.assertEqual(workflow.return_value.select_topic.call_args.kwargs, {"provider": "antigravity", "model": "saved-model", "blocked_terms": None})
+        app._rank_longtail_topics.assert_called_once_with(groups, config=config)
+        app._prepare_cli_worker.assert_called_once_with("주제", ["주제 연관"], config)
+
+    def test_launch_checkbox_and_edited_blocked_terms_survive_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.make_app(directory, {})
+            self.assertTrue(app.auto_start_on_launch.get())
+            app.auto_start_on_launch.set(False)
+            app.cli_blocked_terms.delete("1.0", "end")
+            app.cli_blocked_terms.insert("1.0", "야구, 사망\n맞춤 금지어")
+            app._save_launch_choice()
+            settings = json.loads((Path(directory) / "settings.json").read_text(encoding="utf-8"))
+            restored = self.make_app(directory, settings)
+            self.assertFalse(restored.auto_start_on_launch.get())
+            self.assertFalse(restored._launch_auto_pending)
+            self.assertEqual(restored._cli_configuration()["blocked_terms"], ["야구", "사망", "맞춤 금지어"])
 
     def test_manual_topic_fetches_related_words_in_worker_even_when_tabs_are_empty(self):
         app = object.__new__(PictureCleanerApp)

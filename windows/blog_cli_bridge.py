@@ -531,13 +531,32 @@ class BlogCliBridge:
             record["checked_at"] = datetime.now(timezone.utc).isoformat()
             record.pop("launcher", None)
             self._observations[provider] = record
-            try:
-                self.data_dir.mkdir(parents=True, exist_ok=True)
-                temporary = self.data_dir / f".blog-cli-capabilities-{uuid.uuid4().hex}.tmp"
-                temporary.write_text(json.dumps(self._observations, ensure_ascii=False, indent=2), encoding="utf-8")
-                temporary.replace(self.data_dir / "blog-cli-capabilities.json")
-            except OSError:
-                self.log("CLI 기능 확인 결과를 저장하지 못했습니다.")
+            self._save_observations()
+
+    def _save_observations(self):
+        # Caller holds _lock.
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            temporary = self.data_dir / f".blog-cli-capabilities-{uuid.uuid4().hex}.tmp"
+            temporary.write_text(json.dumps(self._observations, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.data_dir / "blog-cli-capabilities.json")
+        except OSError:
+            self.log("CLI 기능 확인 결과를 저장하지 못했습니다.")
+
+    def login_console_closed(self, provider):
+        """agy has no auth-status command: allow a fresh native verification, never claim login success."""
+        if provider != "antigravity":
+            return
+        with self._lock:
+            record = self.status()[provider]
+            for capability in ("text", "image", "auth"):
+                if record.get(f"{capability}_status") == "authentication_required":
+                    record[f"{capability}_status"] = "not_checked"
+                    record[f"{capability}_available"] = False
+            record["message"] = "로그인 콘솔 종료. Antigravity 계정은 다음 실제 CLI 요청에서 확인합니다."
+            record.pop("launcher", None)
+            self._observations[provider] = record
+            self._save_observations()
 
     def _provider(self, provider: str) -> dict:
         if provider not in PROVIDER_NAMES:
@@ -679,7 +698,7 @@ class BlogCliBridge:
         launcher = self._provider(provider)["launcher"]
         return [*launcher, *({"chatgpt": ["login"], "claude": ["auth", "login"], "antigravity": []}[provider])]
 
-    def open_login(self, provider: str):
+    def open_login(self, provider: str, *, return_process=False):
         """Called only by an explicit user login button, never during generation."""
         workspace = self.data_dir / "blog-cli-login"
         workspace.mkdir(parents=True, exist_ok=True)
@@ -687,7 +706,7 @@ class BlogCliBridge:
         process = subprocess.Popen(command, cwd=str(workspace), env=_child_environment(), shell=False,
                                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
         self.log(f"{PROVIDER_NAMES[provider]} 로그인 창을 열었습니다. 본인 구독 계정으로 로그인하세요.")
-        return process.pid
+        return process if return_process else process.pid
 
     def run_text(self, provider: str, prompt: str, *, model: str = "", images=None,
                  timeout: int = 600, cancel_event=None) -> str:

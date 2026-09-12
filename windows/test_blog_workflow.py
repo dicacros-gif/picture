@@ -10,6 +10,7 @@ from unittest.mock import patch
 from PIL import Image
 
 from blog_workflow import BlogWorkflow, DEFAULT_STEPS, REVIEW_MODES, WorkflowError, _fingerprint, rank_topics
+from blog_visual_style import IMAGE_POLICY, cover_headline
 
 
 TOPIC = "노트북 배터리 관리"
@@ -27,11 +28,14 @@ def valid_article():
         ]
         sections.append(f"──────────────\n❝ 배터리의 숨은 변화 {index + 1}\n\n" + "\n\n".join(sentences))
     sections[-1] += "\n\n" + " ".join(f"#배터리관리{index}" for index in range(10)) + "\n\n노트북 사용 시간을 지키는 관리 기준 뜻과 의미"
+    important = '배터리의 실제 상태를 판단하려면 제조사에서 안내하는 해당 기기의 기준을 확인해야 해요.'
+    sections[0] += '\n\n' + important
     return {
         "title": "노트북 배터리 수명은 어떻게 확인하고 관리할까?",
         "title_intent": {"question": "배터리 수명을 확인하는 방법은 무엇인가?", "related_keywords": KEYWORDS[:1]},
         "paragraphs": sections,
         "image_prompts": [f"문단 {index + 1}의 내용을 표현하는 이름 없는 노트북과 깔끔한 작업 공간, 자연광, 글자 없는 독창적인 사진" for index in range(8)],
+        "highlight_phrases": [important], "bold_phrases": [important],
         "sources": [{"title": "Manufacturer battery guidance", "url": "https://support.example.com/battery",
                      "verified": True, "is_primary": True, "supports": ["기기별 지원 기능과 사용 조건이 다를 수 있다."]}],
         "review": {"approved": True, "facts_verified": True, "sources_verified": True,
@@ -72,6 +76,10 @@ class FakeBridge:
             assert path.is_file(), "Actual image files must be attached to the visual review."
             image_index = int(path.parent.name.split("-")[1]) - 1 if path.parent.name.startswith("image-") else 99
             result = valid_image_review()
+            context = json.loads(prompt.split('BEGIN_UNTRUSTED_IMAGE_CONTEXT_JSON\n')[1].split('\nEND_UNTRUSTED_IMAGE_CONTEXT_JSON')[0])
+            if context.get('expected_cover_headline'):
+                result.update(text_free=False, cover_text_exact=True, cover_text_legible=True, no_other_text=True,
+                              detected_text=context['expected_cover_headline'])
             result["quality_score"] = 80 + image_index % 10
             if image_index in self.bad_image_indices:
                 result.update({"approved": False, "text_free": False, "issues": ["깨진 글자 발견"]})
@@ -106,12 +114,13 @@ class BlogWorkflowTests(unittest.TestCase):
         self.bridge = FakeBridge()
         self.cancel = threading.Event()
         self.workflow = BlogWorkflow(self.bridge, self.root / "runs", lambda _: None, self.cancel)
-        def delivery(source, destination, target_long_side=2048):
+        def delivery(source, destination, target_long_side=2048, headline=""):
             with Image.open(source) as picture:
                 width, height = picture.size
                 picture.convert("RGB").save(destination, format="JPEG", quality=95)
             return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
-                    "metadata_stripped": True, "delivery_format": "JPEG", "image_style": "photorealistic"}
+                    "metadata_stripped": True, "delivery_format": "JPEG", "image_style": "photorealistic",
+                    "cover_headline": headline, "cover_text_applied": bool(headline)}
         self.export_patch = patch("blog_workflow.clean_export", side_effect=delivery)
         self.export_patch.start()
         self.addCleanup(self.export_patch.stop)
@@ -151,7 +160,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["image_candidates"]), 8)
         self.assertEqual([g["provider"] for g in self.bridge.generations], ["antigravity", "chatgpt"] * 4)
         self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 8)
-        self.assertEqual([image["paragraph_index"] for image in result["images"]], [2, 3, 4, 5, 6, 7])
+        self.assertEqual([image["paragraph_index"] for image in result["images"]], [0, 3, 4, 5, 6, 7])
         for image in result["images"]:
             self.assertNotEqual(image["sha256"], "not-trusted")
             self.assertTrue(image["approved"])
@@ -177,12 +186,12 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual({call["provider"] for call in self.bridge.calls if call["images"]}, {"antigravity"})
 
     def test_two_bad_images_are_discarded_and_six_valid_selected(self):
-        self.bridge.bad_image_indices = {0, 7}
+        self.bridge.bad_image_indices = {1, 7}
         result = self.prepare()
-        self.assertEqual([image["paragraph_index"] for image in result["images"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([image["paragraph_index"] for image in result["images"]], [0, 2, 3, 4, 5, 6])
 
     def test_three_bad_images_block_ready(self):
-        self.bridge.bad_image_indices = {0, 1, 2}
+        self.bridge.bad_image_indices = {1, 2, 3}
         self.assert_blocked("5장뿐")
 
     def test_one_missing_generation_blocks_even_when_six_other_files_exist(self):
@@ -271,7 +280,7 @@ class BlogWorkflowTests(unittest.TestCase):
 
     def test_malformed_quality_score_is_rejected_instead_of_crashing(self):
         self.bridge.image_callback = lambda review, index: review.pop("quality_score", None)
-        manifest = self.assert_blocked("0장뿐")
+        manifest = self.assert_blocked("첫 사진")
         self.assertEqual(manifest["image_candidates"][0]["quality_score"], 0)
 
     def test_structural_error_retries_current_provider_once_then_continues(self):
@@ -304,7 +313,43 @@ class BlogWorkflowTests(unittest.TestCase):
 
     def test_illustrated_images_fail_photorealistic_gate(self):
         self.bridge.image_callback = lambda review, index: review.update({"photorealistic": False})
-        self.assert_blocked("0장뿐")
+        self.assert_blocked("첫 사진")
+
+    def test_failed_cover_cannot_be_replaced_by_a_text_free_photo(self):
+        self.bridge.bad_image_indices = {0}
+        self.assert_blocked("첫 사진")
+
+    def test_missing_very_important_sentences_is_a_repairable_format_error(self):
+        self.bridge.article.pop('highlight_phrases')
+        self.assert_blocked('highlight_phrases')
+        self.assertEqual(len(self.bridge.calls),2)
+
+    def test_more_than_one_heading_per_section_fails_before_images(self):
+        self.bridge.article['paragraphs'][0]+='\n❝ 또 다른 기준인가요?'
+        self.assert_blocked('정확히 하나')
+        self.assertFalse(self.bridge.generations)
+
+    def test_cover_ocr_mismatch_blocks_even_when_cli_claims_approval(self):
+        def mismatch(review, index):
+            if index == 0:
+                review['detected_text'] = '다른 키워드 무엇부터 확인할까요?'
+        self.bridge.image_callback = mismatch
+        self.assert_blocked('첫 사진')
+
+    def test_camera_korean_grain_prompts_and_cover_metadata(self):
+        result = self.prepare()
+        self.assertEqual(result['image_policy'], IMAGE_POLICY)
+        for item in self.bridge.generations:
+            self.assertIn('fictional Korean adults', item['prompt'])
+            self.assertIn('VERY SUBTLE fine film grain', item['prompt'])
+            self.assertIn('Avoid heavy noise', item['prompt'])
+        self.assertIn('upper 30 percent', self.bridge.generations[0]['prompt'])
+        self.assertNotIn('upper 30 percent', self.bridge.generations[1]['prompt'])
+        self.assertTrue(result['images'][0]['cover_text_applied'])
+        self.assertEqual(result['images'][0]['cover_headline'], cover_headline(TOPIC))
+        self.assertTrue(all(not item['cover_text_applied'] for item in result['images'][1:]))
+        saved=json.loads(Path(result['run_dir'],'manifest.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['visual_style'],result['visual_style'])
 
     def test_semantic_selection_cannot_invent_related_keywords(self):
         self.bridge.raw_response = json.dumps({"selected": True, "topic": TOPIC, "keywords": ["다른 주제"],
@@ -373,7 +418,9 @@ class BlogWorkflowTests(unittest.TestCase):
             path = directory / "upload.jpg"
             make_image(path, 100 + index)
             seeds.append({"provider": provider, "paragraph_index": index, "path": str(path), "status": "generated",
-                          "metadata_stripped": True, "approved": False, **_fingerprint(path)})
+                          "metadata_stripped": True, "approved": False, "image_policy": IMAGE_POLICY,
+                          "cover_headline": cover_headline(TOPIC) if index == 0 else "",
+                          "cover_text_applied": index == 0, **_fingerprint(path)})
         (run / "provisional-images.json").write_text(json.dumps({"candidates": seeds}), encoding="utf-8")
         self.bridge.run_text = call
         result = self.workflow.resume(run)

@@ -40,6 +40,27 @@ class ImageDeliveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             clean_export("same.png", "same.png")
 
+    def test_korean_cover_copy_changes_only_delivery_pixels_and_has_no_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source,plain,cover=(Path(directory)/name for name in ('source.png','plain.jpg','cover.jpg'))
+            Image.new('RGB',(1024,1024),(87,102,96)).save(source)
+            original=source.read_bytes()
+            clean_export(source,plain)
+            result=clean_export(source,cover,headline='기부\n무엇부터 확인할까요?')
+            self.assertTrue(result['cover_text_applied'])
+            self.assertNotEqual(plain.read_bytes(),cover.read_bytes())
+            self.assertEqual(original,source.read_bytes())
+            with Image.open(cover) as picture:
+                self.assertFalse(picture.getexif())
+                self.assertEqual(picture.size,(2048,2048))
+
+    def test_missing_korean_font_is_an_error_instead_of_broken_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source,target=Path(directory)/'source.png',Path(directory)/'cover.jpg'
+            Image.new('RGB',(1024,1024),'white').save(source)
+            with self.assertRaisesRegex(ValueError,'한글 글꼴'):
+                clean_export(source,target,headline='기부',font_path=Path(directory)/'missing.ttf')
+
 
 if __name__ == "__main__":
     unittest.main()

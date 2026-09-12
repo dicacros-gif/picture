@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable
+from blog_visual_style import IMAGE_POLICY, line_style_runs, cover_headline, quote_parts, choose_visual_style
 
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -2913,6 +2914,22 @@ class NaverAutomation:
             checked.append({**item, "path": str(path), "sha256": digest})
         # Stable sort retains caller order when more than one picture shares a paragraph.
         checked.sort(key=lambda item: item["paragraph_index"])
+        if article.get("image_policy") == IMAGE_POLICY:
+            expected_headline = cover_headline(article.get("topic", ""))
+            if (not checked or checked[0].get("provider") == "google" or checked[0]["paragraph_index"] != 0
+                    or checked[0].get("cover_headline") != expected_headline or checked[0].get("cover_text_applied") is not True):
+                raise ValueError("첫 생성 사진의 한글 후킹 문구를 확인하지 못했습니다.")
+            for index, item in enumerate(checked):
+                if item.get("provider") != "google" and item.get("image_policy") != IMAGE_POLICY:
+                    raise ValueError("새 이미지 생성 규칙과 다른 사진이 포함되어 있습니다.")
+                for review in item["reviews"]:
+                    if index == 0:
+                        if (any(review.get(key) is not True for key in ("cover_text_exact", "cover_text_legible", "no_other_text"))
+                                or review.get("text_free") is not False
+                                or re.sub(r"\s+", "", str(review.get("detected_text", ""))) != re.sub(r"\s+", "", expected_headline)):
+                            raise ValueError("첫 사진의 한글 문구 정확성 검수가 필요합니다.")
+                    elif item.get("cover_headline") or item.get("cover_text_applied") or review.get("text_free") is not True:
+                        raise ValueError("두 번째 이후 사진에는 글자가 없어야 합니다.")
         return title, paragraphs, checked
 
     @staticmethod
@@ -2920,7 +2937,7 @@ class NaverAutomation:
         """Split only formatting runs; visible characters remain byte-for-byte intact."""
         if not line:
             return [("", False)]
-        if line.lstrip().startswith("❝"):
+        if line.lstrip("\ufeff \t").startswith("❝"):
             return [(line, True)]
         emphasized = [False] * len(line)
         for term in bold_terms or []:
@@ -2941,9 +2958,10 @@ class NaverAutomation:
     @classmethod
     def _arrange_article_document(
         cls, data: dict, paragraphs: list[str], image_ids: list[str], positions: list[int],
-        *, bold_terms: list[str] | None = None, bold_style: dict | None = None,
+        *, bold_terms: list[str] | None = None, bold_style: dict | None = None, visual_style: dict | None = None,
     ) -> dict:
         """Build eight semantic text components, preserving sentence spacing inside each."""
+        quote_layouts = (visual_style or {}).get("quote_layouts")
         document = json.loads(json.dumps(data))
         components = document.get("document", {}).get("components", [])
         texts = [item for item in components if item.get("@ctype") == "text"]
@@ -2959,6 +2977,11 @@ class NaverAutomation:
         base_style = dict(node_template.get("style", {"@ctype": "nodeStyle"}))
         for key in bold_style or {}:
             base_style.pop(key, None)
+        if bold_style:
+            # Clear inherited toolbar decorations before styling individual runs.
+            for key in ("backgroundColor", "underline"):
+                base_style.pop(key, None)
+            base_style["fontColor"] = "#333333"
         fresh_id = lambda: "SE-" + str(uuid.uuid4())
         arranged = []
         for index, value in enumerate(paragraphs):
@@ -2967,21 +2990,34 @@ class NaverAutomation:
             component["value"] = []
             for line in value.split("\n"):
                 nodes = []
-                for run, emphasized in cls._article_line_runs(line, bold_terms):
-                    if emphasized and not bold_style:
+                for run, run_style in line_style_runs(line, bold_terms, index, visual_style):
+                    if run_style and not bold_style:
                         raise RuntimeError("스마트에디터의 실제 굵게 서식을 확인하지 못했습니다.")
                     nodes.append({"id": fresh_id(), "@ctype": "textNode", "value": run or "\u200b",
-                                  "style": {**base_style, **(bold_style if emphasized else {})}})
+                                  "style": {**base_style, **(bold_style if run_style else {}), **run_style}})
                 component["value"].append({
                     "id": fresh_id(), "@ctype": "paragraph",
                     "style": paragraph_template.get("style", {"@ctype": "paragraphStyle", "align": "left"}),
                     "nodes": nodes,
                 })
-            arranged.append(component)
+            if quote_layouts:
+                if len(quote_layouts) != len(paragraphs):
+                    raise ValueError("인용구 모양 수가 본문 구역 수와 다릅니다.")
+                for kind, start, end in quote_parts(value, quote_layouts[index]):
+                    part = json.loads(json.dumps(component))
+                    part["id"] = fresh_id()
+                    part["value"] = part["value"][start:end]
+                    if kind == "quotation":
+                        part = {"@ctype": "quotation", "id": part["id"], "align": "center",
+                                "layout": quote_layouts[index], "source": None, "value": part["value"]}
+                    arranged.append(part)
+            else:
+                arranged.append(component)
             arranged.extend(by_id[image_id] for image_id, position in zip(image_ids, positions) if position == index)
         # Fresh writer only: unknown components are unsafe to silently keep in a new article.
         header = [item for item in components if item.get("@ctype") == "documentTitle"]
-        if any(item.get("@ctype") not in {"documentTitle", "text", "image"} for item in components):
+        allowed = {"documentTitle", "text", "image"} | ({"quotation"} if quote_layouts else set())
+        if any(item.get("@ctype") not in allowed for item in components):
             raise RuntimeError("예상하지 못한 편집기 콘텐츠가 있어 발행을 중단했습니다.")
         document["document"]["components"] = header + arranged
         return document
@@ -2998,8 +3034,14 @@ class NaverAutomation:
     @classmethod
     def _verify_article_document(
         cls, data: dict, paragraphs: list[str], image_ids: list[str], positions: list[int],
-        *, bold_terms: list[str] | None = None, bold_style: dict | None = None,
+        *, bold_terms: list[str] | None = None, bold_style: dict | None = None, visual_style: dict | None = None,
     ) -> bool:
+        quote_layouts = (visual_style or {}).get("quote_layouts")
+        if quote_layouts:
+            try:
+                data = cls._collapse_quoted_document(data, paragraphs, quote_layouts)
+            except (ValueError, IndexError, TypeError, KeyError):
+                return False
         components = data.get("document", {}).get("components", [])
         actual_paragraphs = []
         actual_images = []
@@ -3015,7 +3057,8 @@ class NaverAutomation:
                     line = "".join(values)
                     if line == "\u200b":
                         line = ""
-                    expected_runs = cls._article_line_runs(line, bold_terms)
+                    styled_runs = line_style_runs(line, bold_terms, len(actual_paragraphs), visual_style)
+                    expected_runs = [(value, bool(style.get('bold'))) for value, style in styled_runs]
                     if any(emphasized for _value, emphasized in expected_runs) and not bold_style:
                         return False
                     if bold_style:
@@ -3029,6 +3072,16 @@ class NaverAutomation:
                             actual_flags.extend([applied] * len(value))
                         if actual_flags != expected_flags:
                             return False
+                        expected_styles = [style for text, style in styled_runs for _ in text]
+                        actual_styles = [node.get("style", {}) for node, value in zip(row.get("nodes", []), values)
+                                         for _ in (value if line else "")]
+                        if len(actual_styles) != len(expected_styles):
+                            return False
+                        for actual, expected in zip(actual_styles, expected_styles):
+                            if (actual.get("fontColor", "").lower() != expected.get("fontColor", "#333333")
+                                    or bool(actual.get("underline")) != bool(expected.get("underline"))
+                                    or actual.get("backgroundColor", "").lower() != expected.get("backgroundColor", "")):
+                                return False
                     lines.append(line)
                 actual_paragraphs.append("\n".join(lines))
             elif kind == "image":
@@ -3036,6 +3089,31 @@ class NaverAutomation:
             elif kind != "documentTitle":
                 return False
         return actual_paragraphs == paragraphs and actual_images == list(zip(image_ids, positions))
+
+    @staticmethod
+    def _collapse_quoted_document(data, paragraphs, layouts):
+        """Validate exact physical component boundaries, then recover eight logical sections."""
+        if len(layouts) != len(paragraphs):
+            raise ValueError("인용구 수 불일치")
+        original = data.get("document", {}).get("components", [])
+        components = [c for c in original if c.get("@ctype") != "documentTitle"]
+        collapsed = [c for c in original if c.get("@ctype") == "documentTitle"]
+        cursor = 0
+        for paragraph, layout in zip(paragraphs, layouts):
+            rows = []
+            for kind, start, end in quote_parts(paragraph, layout):
+                part = components[cursor]; cursor += 1
+                if part.get("@ctype") != kind or len(part.get("value") or []) != end - start:
+                    raise ValueError("소제목과 본문 배치 불일치")
+                if kind == "quotation" and (part.get("layout") != layout or part.get("source")):
+                    raise ValueError("인용구 모양 또는 출처 불일치")
+                rows.extend(part["value"])
+            collapsed.append({"@ctype": "text", "value": rows})
+            while cursor < len(components) and components[cursor].get("@ctype") == "image":
+                collapsed.append(components[cursor]); cursor += 1
+        if cursor != len(components):
+            raise ValueError("예상 외 추가 문서 내용")
+        return {"document": {"components": collapsed}}
 
     @staticmethod
     def _set_article_document(driver, data: dict) -> None:
@@ -3067,7 +3145,7 @@ class NaverAutomation:
 
     def _prepare_article_in_writer(
         self, driver, blog_id: str, title: str, paragraphs: list[str], images: list[dict],
-        *, bold_terms: list[str] | None = None,
+        *, bold_terms: list[str] | None = None, visual_style: dict | None = None,
     ) -> list[str]:
         self._active_article_bold_style = None
         title_box, body_box = self._open_writer(driver, blog_id)
@@ -3078,8 +3156,8 @@ class NaverAutomation:
         initial = self._read_article_document(driver)
         if any(item.get("@ctype") == "image" for item in initial["document"].get("components", [])):
             raise RuntimeError("기존 사진이 있는 글에는 자동 발행하지 않습니다.")
-        if any(emphasized for section in paragraphs for line in section.split("\n")
-               for _value, emphasized in self._article_line_runs(line, bold_terms)):
+        if any(style.get('bold') for index, section in enumerate(paragraphs) for line in section.split("\n")
+               for _value, style in line_style_runs(line, bold_terms, index, visual_style)):
             # Observed from native Ctrl+B on SmartEditor ONE, 2026-09-12:
             # nodeStyle.bold=true renders as <b> inside the editor text node.
             self._active_article_bold_style = {"bold": True}
@@ -3101,22 +3179,23 @@ class NaverAutomation:
             image_ids.append(added[0])
             positions.append(image["paragraph_index"])
             arranged = self._arrange_article_document(current, paragraphs, image_ids, positions,
-                bold_terms=bold_terms, bold_style=self._active_article_bold_style)
+                bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style)
             self._set_article_document(driver, arranged)
             WebDriverWait(driver, 15).until(lambda d: self._verify_article_document(
                 self._read_article_document(d), paragraphs, image_ids, positions,
-                bold_terms=bold_terms, bold_style=self._active_article_bold_style,
+                bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style,
             ))
         return image_ids
 
     @classmethod
-    def _article_native_bold_rendered(cls, driver, paragraphs: list[str], bold_terms: list[str] | None = None) -> bool:
-        expected = [[cls._article_line_runs(line, bold_terms) for line in section.split("\n")] for section in paragraphs]
+    def _article_native_bold_rendered(cls, driver, paragraphs: list[str], bold_terms: list[str] | None = None, visual_style=None) -> bool:
+        expected = [[[(value, bool(style.get('bold'))) for value, style in line_style_runs(line, bold_terms, index, visual_style)]
+                     for line in section.split("\n")] for index, section in enumerate(paragraphs)]
         if not any(emphasized for section in expected for row in section for _value, emphasized in row):
             return True
         rendered = driver.execute_script("""
-            return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"]')]
-              .map(component=>[...component.querySelectorAll('.se-text-paragraph')].map(row=>{
+            return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"], .se-component.se-quotation')]
+              .map(component=>[...component.querySelectorAll(component.classList.contains('se-quotation') ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')].map(row=>{
                 const walk=document.createTreeWalker(row,NodeFilter.SHOW_TEXT), nodes=[];
                 while(walk.nextNode()) {
                   const node=walk.currentNode, weight=getComputedStyle(node.parentElement).fontWeight;
@@ -3125,26 +3204,63 @@ class NaverAutomation:
                 return nodes;
               }));
         """)
-        if not isinstance(rendered, list) or len(rendered) != len(expected):
+        if not isinstance(rendered, list):
             return False
-        for expected_section, actual_section in zip(expected, rendered):
-            if len(expected_section) != len(actual_section):
+        expected_rows, actual_rows = [r for section in expected for r in section], [r for section in rendered for r in section]
+        if len(expected_rows) != len(actual_rows):
+            return False
+        for expected_row, actual_row in zip(expected_rows, actual_rows):
+            expected_text = "".join(value for value, _bold in expected_row)
+            actual_text = "".join(str(node.get("value", "")) for node in actual_row).replace("\u200b", "")
+            if actual_text != expected_text:
                 return False
-            for expected_row, actual_row in zip(expected_section, actual_section):
-                expected_text = "".join(value for value, _bold in expected_row)
-                actual_text = "".join(str(node.get("value", "")) for node in actual_row).replace("\u200b", "")
-                if actual_text != expected_text:
-                    return False
-                expected_flags = [bold for value, bold in expected_row for _ in value]
-                actual_flags = [bool(node.get("bold")) for node in actual_row for _ in str(node.get("value", "")).replace("\u200b", "")]
-                if actual_flags != expected_flags:
-                    return False
+            expected_flags = [bold for value, bold in expected_row for _ in value]
+            actual_flags = [bool(node.get("bold")) for node in actual_row for _ in str(node.get("value", "")).replace("\u200b", "")]
+            if actual_flags != expected_flags:
+                return False
+        return True
+
+    @classmethod
+    def _article_native_colors_rendered(cls, driver, paragraphs, bold_terms=None, visual_style=None) -> bool:
+        rendered = driver.execute_script("""
+            return [...document.querySelectorAll('.se-component.se-text, .se-component[data-name="text"], .se-component.se-quotation')]
+              .map(component=>[...component.querySelectorAll(component.classList.contains('se-quotation') ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')].map(row=>{
+                const walk=document.createTreeWalker(row,NodeFilter.SHOW_TEXT), nodes=[];
+                while(walk.nextNode()) {
+                  const node=walk.currentNode, style=getComputedStyle(node.parentElement);
+                  let background='', underline=false, e=node.parentElement;
+                  while(e && row.contains(e)) {
+                    const s=getComputedStyle(e);
+                    if(!background && s.backgroundColor!=='rgba(0, 0, 0, 0)' && s.backgroundColor!=='transparent') background=s.backgroundColor;
+                    if(s.textDecorationLine.includes('underline')) underline=true;
+                    e=e.parentElement;
+                  }
+                  nodes.push({value:node.nodeValue,color:style.color,background,underline});
+                }
+                return nodes;
+              }));
+        """)
+        def rgb(value):
+            return 'rgb(' + ', '.join(str(int(value[i:i+2], 16)) for i in (1, 3, 5)) + ')' if value else ''
+        if not isinstance(rendered, list):
+            return False
+        expected_rows = [(index, line) for index, section in enumerate(paragraphs) for line in section.split('\n')]
+        actual_rows = [row for section in rendered for row in section]
+        if len(expected_rows) != len(actual_rows):
+            return False
+        for (index, line), nodes in zip(expected_rows, actual_rows):
+            expected = [(char, rgb(style.get('fontColor', '#333333')), rgb(style.get('backgroundColor', '')),
+                         bool(style.get('underline'))) for text, style in line_style_runs(line, bold_terms, index, visual_style) for char in text]
+            actual = [(char, node.get('color'), node.get('background', ''), bool(node.get('underline')))
+                      for node in nodes for char in str(node.get('value', '')).replace('\u200b', '')]
+            if actual != expected:
+                return False
         return True
 
     @classmethod
     def _article_ready_to_publish(
         cls, driver, title: str, paragraphs: list[str], image_ids: list[str], positions: list[int],
-        *, bold_terms: list[str] | None = None, bold_style: dict | None = None,
+        *, bold_terms: list[str] | None = None, bold_style: dict | None = None, visual_style: dict | None = None,
     ) -> bool:
         fields = cls._find_editor_fields(driver)
         if not fields or cls._normalized_text(cls._editor_text(fields[0])) != cls._normalized_text(title):
@@ -3152,8 +3268,9 @@ class NaverAutomation:
         if cls._image_component_count(driver) != len(image_ids):
             return False
         return (cls._verify_article_document(cls._read_article_document(driver), paragraphs, image_ids, positions,
-                                             bold_terms=bold_terms, bold_style=bold_style)
-                and cls._article_native_bold_rendered(driver, paragraphs, bold_terms))
+                                             bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style)
+                and cls._article_native_bold_rendered(driver, paragraphs, bold_terms, visual_style)
+                and (not bold_style or cls._article_native_colors_rendered(driver, paragraphs, bold_terms, visual_style)))
 
     @classmethod
     def _find_publish_control(cls, driver, final: bool = False):
@@ -3213,8 +3330,17 @@ class NaverAutomation:
         snapshot = driver.execute_script("""
             const root=document.querySelector('.se-main-container');
             if(!root) return null;
-            const sections=[], images=[];
+            const sections=[], images=[], components=[];
             for(const component of root.querySelectorAll('.se-component')) {
+              const isQuote=component.matches('.se-quotation');
+              if(component.matches('.se-text, [data-name="text"]') || isQuote) {
+                const rows=[...component.querySelectorAll(isQuote ? '.se-quote .se-text-paragraph' : '.se-text-paragraph')]
+                  .map(row=>({nodes:[{value:(row.innerText||'').replace(/\\u200b/g,'')}]}));
+                components.push({'@ctype':isQuote?'quotation':'text',value:rows,
+                  layout:isQuote?[...component.classList].find(c=>c.startsWith('se-l-'))?.slice(5):undefined});
+              } else if(component.matches('.se-image, [data-name="image"]')) {
+                components.push({'@ctype':'image',id:component.id});
+              }
               if(component.matches('.se-text, [data-name="text"]')) {
                 sections.push([...component.querySelectorAll('.se-text-paragraph')]
                   .map(row=>(row.innerText||'').replace(/\\u200b/g,'')) .join('\\n'));
@@ -3222,22 +3348,36 @@ class NaverAutomation:
                 images.push({id:component.id,position:sections.length-1});
               }
             }
-            return {sections,images};
+            return {sections,images,components};
         """) or {}
         actual_sections = snapshot.get("sections", [])
         actual_images = snapshot.get("images", [])
+        visual_style = article.get('visual_style')
+        if visual_style and 'components' in snapshot:
+            try:
+                collapsed = self._collapse_quoted_document({'document':{'components':snapshot['components']}},
+                                                            paragraphs, visual_style['quote_layouts'])
+                actual_sections, actual_images = [], []
+                for part in collapsed['document']['components']:
+                    if part['@ctype'] == 'text':
+                        actual_sections.append('\n'.join(''.join(n['value'] for n in row['nodes']) for row in part['value']))
+                    elif part['@ctype'] == 'image':
+                        actual_images.append({'id':part['id'],'position':len(actual_sections)-1})
+            except (ValueError, IndexError, KeyError, TypeError):
+                return {'verified':False,'url':url,'message':'인용구와 본문 구역 배치가 저장된 원고와 다릅니다.'}
         expected_positions = sorted(item["paragraph_index"] for item in images)
         text_matches = (len(actual_sections) == 8 and
                         [value.strip() for value in actual_sections] == [value.strip() for value in paragraphs])
         position_matches = [item.get("position") for item in actual_images] == expected_positions
         identity_matches = (None if expected_image_ids is None else
                             [item.get("id") for item in actual_images] == expected_image_ids)
-        bold_matches = self._article_native_bold_rendered(driver, paragraphs, article.get("bold_terms", []))
-        verified = text_matches and position_matches and bold_matches and identity_matches is not False
+        bold_matches = self._article_native_bold_rendered(driver, paragraphs, article.get("bold_terms", []), visual_style)
+        colors_match = not visual_style or self._article_native_colors_rendered(driver, paragraphs, article.get('bold_terms', []), visual_style)
+        verified = text_matches and position_matches and bold_matches and colors_match and identity_matches is not False
         return {"verified": bool(verified), "url": url, "title_matches": True,
                 "section_count": len(actual_sections), "sections_match": text_matches,
                 "image_count": len(actual_images), "image_positions_match": position_matches,
-                "image_identity_matches": identity_matches, "bold_rendered": bold_matches}
+                "image_identity_matches": identity_matches, "bold_rendered": bold_matches, "colors_rendered": colors_match}
 
     def _write_publication_receipt(self, path: Path, receipt: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3359,15 +3499,24 @@ class NaverAutomation:
             return {**prior, "reused_receipt": True}
         driver = self._driver()
         bold_terms = article.get("bold_terms", [])
-        image_ids = self._prepare_article_in_writer(driver, blog_id, title, paragraphs, images, bold_terms=bold_terms)
+        visual_style = article.get("visual_style")
+        if visual_style is None:
+            visual_style = choose_visual_style(paragraphs)
+            article["visual_style"] = visual_style
+        if not isinstance(visual_style, dict) or len(visual_style.get("quote_layouts", [])) != len(paragraphs):
+            raise ValueError("저장된 소제목 인용구 설정이 올바르지 않습니다.")
+        for paragraph, layout in zip(paragraphs, visual_style['quote_layouts']):
+            quote_parts(paragraph, layout)
+        image_ids = self._prepare_article_in_writer(driver, blog_id, title, paragraphs, images, bold_terms=bold_terms, visual_style=visual_style)
         bold_style = getattr(self, "_active_article_bold_style", None)
         positions = [item["paragraph_index"] for item in images]
         if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
-                                              bold_terms=bold_terms, bold_style=bold_style):
+                                              bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
             raise RuntimeError("제목, 8개 문단, 사진 수와 순서 검증에 실패하여 발행하지 않았습니다.")
         prepared = {"published": False, "saved": False, "status": "prepared", "url": "", "title": title,
                     "paragraph_count": 8, "image_count": len(images), "article_key": key,
                     "image_component_ids": image_ids, "image_positions": positions}
+        prepared["visual_style"] = visual_style
         if save_draft:
             return self._save_prepared_article_draft(driver, prepared)
         if not publish:
@@ -3386,7 +3535,7 @@ class NaverAutomation:
             ) from exc
         # Recheck after the panel opens; user edits or upload failures must not slip through.
         if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
-                                              bold_terms=bold_terms, bold_style=bold_style):
+                                              bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
             raise RuntimeError("발행 직전 내용 검증에 실패하여 최종 발행 버튼을 누르지 않았습니다.")
         final_button = self._find_publish_control(driver, final=True)
         if final_button is None or self.stop_event.is_set():

@@ -7,12 +7,14 @@ import os
 import threading
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, StringVar, Toplevel, messagebox, ttk
+from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from blog_cli_bridge import BlogCliBridge
-from blog_preferences import PROVIDER_LABELS, normalize_preferences, store_prompt
-from blog_workflow import BlogWorkflow, REVIEW_MODES, _related_to_topic
+from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, normalize_preferences,
+                              store_prompt, normalize_blocked_terms, blocked_term_hits)
+from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic
+from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError
 
 
@@ -26,10 +28,10 @@ def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
     return candidate
 
 
-class BlogWorkflowControls:
+class BlogWorkflowControls(UnattendedControls):
     def _browser_task_busy(self):
         return any(getattr(self, name, False) for name in
-                   ("naver_task_active", "full_auto_active", "realtime_task_active"))
+                   ("naver_task_active", "full_auto_active", "realtime_task_active", "cli_login_active"))
 
     def _init_cli_controls(self, config_path, app_dir, default_prompt):
         self.cli_config_path, self.cli_app_dir = Path(config_path), Path(app_dir)
@@ -37,9 +39,10 @@ class BlogWorkflowControls:
             self.settings.get("cli_workflow"), default_prompt, self.settings.get("blog_prompt", "")
         )
         pref = self.cli_preferences
-        if pref.get("default_revision") != "user-20260912":
+        self._init_unattended_controls(pref)
+        if pref.get("default_revision") != "user-20260912-visual-v2":
             if self.settings.get("cli_workflow"):
-                supplied = {"id": "user-default-20260912", "name": "사용자 기본 프롬프트", "text": default_prompt.strip()}
+                supplied = {"id": "user-default-20260912-visual-v2", "name": "사용자 기본 프롬프트 · 인용구 6종", "text": default_prompt.strip()}
                 for field in ("id", "name"):
                     original, suffix = supplied[field], 2
                     while any(p[field] == supplied[field] for p in pref["prompts"]):
@@ -47,7 +50,7 @@ class BlogWorkflowControls:
                         suffix += 1
                 pref["prompts"] = [supplied, *pref["prompts"]]
                 pref["selected_prompt_id"] = supplied["id"]
-            pref["default_revision"] = "user-20260912"
+            pref["default_revision"] = "user-20260912-visual-v2"
         self.cli_active_prompt = pref["selected_prompt_id"]
         selected = next(p for p in pref["prompts"] if p["id"] == self.cli_active_prompt)
         self.cli_preset_choice = StringVar(value=selected["name"])
@@ -102,6 +105,7 @@ class BlogWorkflowControls:
         mode.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Button(options, text="CLI 연결 확인", command=self.check_blog_cli).pack(side="left", padx=8)
         ttk.Button(options, text="CLI 로그인 안내", command=self.show_cli_login_help).pack(side="left")
+        ttk.Button(options, text="프로그램 다시 시작", command=self.restart_program).pack(side="left", padx=5)
         models = ttk.Frame(settings)
         models.grid(row=3, column=0, columnspan=7, sticky="ew", pady=(6, 0))
         for key, label in PROVIDER_LABELS.items():
@@ -111,6 +115,15 @@ class BlogWorkflowControls:
             entry.bind("<FocusOut>", self._save_cli_selection)
         ttk.Label(models, text="비우면 CLI 기본값", style="Sub.TLabel").pack(side="left", padx=7)
         ttk.Label(settings, textvariable=self.cli_capability_text, wraplength=1100, style="Sub.TLabel").grid(row=4, column=0, columnspan=7, sticky="w", pady=(6, 0))
+        blocked = ttk.Frame(settings)
+        blocked.grid(row=5, column=0, columnspan=7, sticky="ew", pady=(7, 0))
+        ttk.Label(blocked, text="스포츠·사망 차단어\n쉼표 또는 줄바꿈으로 구분").pack(side="left", padx=(0, 8))
+        self.cli_blocked_terms = ScrolledText(blocked, height=3, wrap="word", font=("맑은 고딕", 9))
+        self.cli_blocked_terms.pack(side="left", fill="x", expand=True)
+        self.cli_blocked_terms.insert("1.0", ", ".join(self.cli_preferences["blocked_terms"]))
+        self.cli_blocked_terms.bind("<FocusOut>", self._save_cli_selection)
+        ttk.Button(blocked, text="차단어 저장", command=self._save_cli_selection).pack(side="left", padx=5)
+        ttk.Button(blocked, text="기본값 복원", command=self._restore_blocked_terms).pack(side="left")
         ttk.Label(self.blog_tab, text="연관 검색어의 질문 → 제목·8문단 → CLI 교차 검수 → Antigravity 4장 + ChatGPT 4장 → 검수 통과 6장", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
         panes = ttk.Panedwindow(self.blog_tab, orient="horizontal")
         panes.grid(row=2, column=0, sticky="nsew")
@@ -159,9 +172,22 @@ class BlogWorkflowControls:
             step_count=int(self.cli_step_count.get()), review_mode=self.cli_review_mode.get(),
             models={key: value.get().strip() for key, value in self.cli_models.items()},
             include_google=self.cli_google.get(), publication_mode=self.cli_publication.get(),
+            auto_start_on_launch=self.auto_start_on_launch.get(),
+            blocked_terms=normalize_blocked_terms(self.cli_blocked_terms.get("1.0", "end")),
         )
         self._sync_cli_step_boxes()
         self._persist_cli_preferences()
+
+    def _restore_blocked_terms(self):
+        self.cli_blocked_terms.delete("1.0", "end")
+        self.cli_blocked_terms.insert("1.0", ", ".join(DEFAULT_BLOCKED_TERMS))
+        self._save_cli_selection()
+
+    @staticmethod
+    def _ensure_topic_allowed(topic, keywords, config):
+        hits = blocked_term_hits([topic, keywords], config.get("blocked_terms"))
+        if hits:
+            raise WorkflowError(f"'{topic}' 차단 · 주제 또는 연관어에 차단어 포함: {', '.join(hits)}")
 
     def _persist_cli_preferences(self):
         self.settings["cli_workflow"] = copy.deepcopy(self.cli_preferences)
@@ -172,7 +198,7 @@ class BlogWorkflowControls:
         temporary.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.cli_config_path)
 
-    def save_cli_prompt(self, *, create=False):
+    def save_cli_prompt(self, *, create=False, silent=False):
         try:
             self.cli_preferences = store_prompt(self.cli_preferences, self.cli_active_prompt,
                 self.cli_preset_name.get(), self.base_text.get("1.0", "end"), create=create)
@@ -181,8 +207,12 @@ class BlogWorkflowControls:
             self.cli_preset_box.configure(values=[p["name"] for p in self.cli_preferences["prompts"]])
             self._save_cli_selection()
             self.status.set("프롬프트와 CLI 실행 설정을 저장했습니다.")
-        except ValueError as exc:
-            messagebox.showinfo("Picture Cleaner PC", str(exc))
+        except (ValueError, OSError) as exc:
+            if silent:
+                self.status.set(str(exc))
+                self._naver_log(str(exc))
+            else:
+                messagebox.showinfo("Picture Cleaner PC", str(exc))
             return False
         return True
 
@@ -215,8 +245,8 @@ class BlogWorkflowControls:
         self.base_text.insert("1.0", selected["text"])
         self._save_cli_selection()
 
-    def _cli_configuration(self):
-        if not self.save_cli_prompt():
+    def _cli_configuration(self, *, silent=False):
+        if not self.save_cli_prompt(silent=silent):
             raise ValueError("프롬프트를 저장한 뒤 실행하세요.")
         pref = copy.deepcopy(self.cli_preferences)
         selected = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
@@ -224,12 +254,14 @@ class BlogWorkflowControls:
                 "models": pref["models"], "base_prompt": selected["text"],
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
                 "save_draft": pref["publication_mode"] == "임시저장까지만", "completion_label": pref["publication_mode"],
+                "blocked_terms": pref["blocked_terms"],
                 "blog_id": self.blog_id.get().strip(), "prompt_id": selected["id"]}
 
     def check_blog_cli(self):
         def work():
             try:
-                statuses = self.cli_bridge.check_accounts()
+                diagnostics = BlogCliBridge(self.cli_app_dir, self._naver_log, threading.Event())
+                statuses = diagnostics.check_accounts()
                 parts = []
                 labels = {"available": "사용 가능", "authenticated": "로그인 확인", "login_verified": "로그인 확인", "authentication_required": "로그인 필요",
                           "not_checked": "실행 시 확인", "account_not_checked": "실행 시 계정 확인", "installed": "설치 확인"}
@@ -244,21 +276,7 @@ class BlogWorkflowControls:
         threading.Thread(target=work, daemon=True).start()
 
     def show_cli_login_help(self):
-        window = Toplevel(self.root)
-        window.title("CLI 계정 로그인")
-        window.transient(self.root)
-        panel = ttk.Frame(window, padding=20)
-        panel.pack(fill="both", expand=True)
-        ttk.Label(panel, text="사용할 CLI의 로그인 창을 열어 계정으로 로그인하세요.\n완료 후 프로그램에서 CLI 연결 확인을 누르세요.").pack(anchor="w", pady=(0, 12))
-        for provider, label in PROVIDER_LABELS.items():
-            ttk.Button(panel, text=label + " 로그인 창", command=lambda chosen=provider: self._open_blog_cli_login(chosen)).pack(fill="x", pady=3)
-
-    def _open_blog_cli_login(self, provider):
-        try:
-            self.cli_bridge.open_login(provider)
-            self.status.set(f"{PROVIDER_LABELS[provider]} 콘솔에서 계정 로그인을 완료하세요.")
-        except Exception as exc:
-            messagebox.showerror("CLI 로그인", str(exc))
+        self.show_cli_login_required()
 
     def _start_cli_job(self, label, work):
         if self._browser_task_busy():
@@ -274,7 +292,8 @@ class BlogWorkflowControls:
                 work()
             except Exception as exc:
                 self._naver_log(f"{label} 실패: {exc}")
-                self.events.put(("error", f"{label}\n{exc}"))
+                problem = access_error_from_exception(exc)
+                self.events.put(("cli_access_required", problem, False) if problem else ("error", f"{label}\n{exc}"))
             finally:
                 self.naver_task_active = False
                 self.events.put(("cli_idle",))
@@ -300,6 +319,7 @@ class BlogWorkflowControls:
             selector.configure(state="disabled" if active else "readonly")
 
     def _prepare_cli_worker(self, topic, keywords, config):
+        self._ensure_topic_allowed(topic, keywords, config)
         self.events.put(("cli_preparing", topic))
         self._preflight_cli_accounts(config)
         google = []
@@ -319,22 +339,11 @@ class BlogWorkflowControls:
 
     def _preflight_cli_accounts(self, config):
         """Fail before image capture or generation when a required CLI cannot sign in."""
-        required = list(dict.fromkeys([*config["steps"], "chatgpt", "antigravity"]))
         statuses = self.cli_bridge.check_accounts()
-        failures = []
-        for provider in required:
-            status = statuses.get(provider, {})
-            label = PROVIDER_LABELS.get(provider, provider)
-            if not status.get("installed"):
-                failures.append(f"{label}: 실행 파일을 설치하거나 CLI 경로를 확인하세요.")
-            elif status.get("auth_status") == "authentication_required" or status.get("text_status") == "authentication_required":
-                failures.append(f"{label}: 본인 구독 계정 로그인이 필요합니다. 'CLI 로그인 안내'에서 로그인한 뒤 다시 실행하세요.")
-            elif status.get("auth_status") in {"launch_failed", "timeout"}:
-                failures.append(f"{label}: 연결 확인을 완료하지 못했습니다. CLI 연결 확인 후 다시 실행하세요.")
-        if failures:
-            message = "필수 CLI 사전 확인 실패 · " + " / ".join(failures)
-            self.events.put(("cli_status", message))
-            raise RuntimeError(message)
+        problem = account_problem(statuses, config["steps"])
+        if problem:
+            self.events.put(("cli_status", str(problem)))
+            raise problem
         self._naver_log("필수 CLI 설치·로그인 사전 확인 완료. Antigravity 계정은 실제 요청에서 확인합니다.")
         return statuses
 
@@ -345,7 +354,8 @@ class BlogWorkflowControls:
             entered_keywords = self._all_related_keywords()
             if not topic:
                 raise ValueError("주제를 입력하거나 관심 주제 자동 선정을 실행하세요.")
-        except ValueError as exc:
+            self._ensure_topic_allowed(topic, [], config)
+        except (ValueError, WorkflowError) as exc:
             messagebox.showinfo("Picture Cleaner PC", str(exc))
             return
         self._start_cli_job("글·이미지 생성과 교차 검수", lambda: self._prepare_manual_cli_worker(topic, entered_keywords, config))
@@ -356,11 +366,13 @@ class BlogWorkflowControls:
         from picture_cleaner_pc import fetch_autocomplete, keyword_comparison_key, normalize_keyword
         if self.full_auto_stop.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
+        self._ensure_topic_allowed(topic, [], config)
         self._naver_log(f"직접 입력한 주제 '{topic}'의 최신 연관 검색어를 조회합니다.")
         related = fetch_autocomplete(topic)
         if self.full_auto_stop.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
         actual = [word for words in related.values() if isinstance(words, list) for word in words]
+        self._ensure_topic_allowed(topic, actual, config)
         keywords, seen = [], {keyword_comparison_key(topic)}
         for word in [*actual, *entered_keywords]:
             if not isinstance(word, str):
@@ -378,6 +390,7 @@ class BlogWorkflowControls:
     def _publish_cli_worker(self, article, config):
         if self.full_auto_stop.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
+        self._ensure_topic_allowed(article.get("topic", ""), article.get("keywords", []), config)
         publish_payload = copy.deepcopy(article)
         if publish_payload.get("google_images"):
             publish_payload["images"] = [image for image in publish_payload["images"] if image.get("provider") != "google"] + publish_payload["google_images"]
@@ -426,19 +439,27 @@ class BlogWorkflowControls:
         folder.mkdir(parents=True, exist_ok=True)
         os.startfile(str(folder))
 
-    def start_cli_automation(self):
+    def start_cli_automation(self, *, automatic=False):
         if self._browser_task_busy():
-            messagebox.showinfo("Picture Cleaner PC", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
+            if automatic:
+                self.status.set("현재 작업 종료를 기다리고 있습니다.")
+            else:
+                messagebox.showinfo("Picture Cleaner PC", "진행 중인 작업을 완료하거나 중지한 뒤 실행하세요.")
             return
         try:
-            config = self._cli_configuration()
+            config = self._cli_configuration(silent=automatic)
             hours = int(self.auto_interval_hours.get())
             if hours not in {1, 2}:
                 raise ValueError("자동화 간격은 1시간 또는 2시간입니다.")
             config.update(interval_seconds=hours * 3600, interval_hours=hours)
         except ValueError as exc:
-            messagebox.showinfo("Picture Cleaner PC", str(exc))
+            if automatic:
+                self.status.set(str(exc))
+                self._naver_log(f"자동 시작 중단: {exc}")
+            else:
+                messagebox.showinfo("Picture Cleaner PC", str(exc))
             return
+        self._launch_auto_pending = self._login_success_pending = False
         self.full_auto_active = self.naver_task_active = True
         self._set_cli_runtime_controls(True)
         self.full_auto_stop.clear()
@@ -447,10 +468,38 @@ class BlogWorkflowControls:
         threading.Thread(target=self._full_automation_loop, args=(config,), daemon=True).start()
 
     def _cli_automation_cycle(self, config):
+        self._preflight_cli_accounts(config)
         groups = self._cli_realtime_groups()
-        topic, keywords, related = self._select_longtail_topic(groups, config=config)
-        self.events.put(("auto_topic", groups, topic, keywords, related))
-        article = self._prepare_cli_worker(topic, keywords, config)
+        ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
+        selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
+        provider = config["steps"][0]
+        attempts, article = [], None
+        for index, candidate in enumerate(ranked[:3], 1):
+            if self.full_auto_stop.is_set():
+                raise WorkflowError("사용자가 작업을 중지했습니다.")
+            topic = candidate["topic"]
+            self._naver_log(f"후보 {index}/3 · '{topic}' 선정·원고·이미지 검수 시작")
+            try:
+                choice = selector.select_topic([candidate], provider=provider,
+                    model=config.get("models", {}).get(provider, ""), blocked_terms=config.get("blocked_terms"))
+                topic, keywords = choice["topic"], choice["keywords"]
+                self._ensure_topic_allowed(topic, keywords, config)
+                self.events.put(("auto_topic", groups, topic, keywords, related_by_topic[topic]))
+                article = self._prepare_cli_worker(topic, keywords, config)
+                break
+            except Exception as exc:
+                if self.full_auto_stop.is_set():
+                    raise WorkflowError("사용자가 작업을 중지했습니다.") from exc
+                problem = access_error_from_exception(exc)
+                if problem:
+                    raise problem from exc
+                attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),
+                                 "run_dir": getattr(exc, "run_dir", "")})
+                self._write_cycle_attempts(attempts)
+                self._naver_log(f"'{topic}' 이번 회차 제외: {exc}")
+        if article is None:
+            raise WorkflowError(f"최대 3개 후보 중 {len(attempts)}개를 시도했지만 준비되지 않았습니다. 다음 예약 회차에 다시 조회합니다.")
+        # Browser publication/draft failures never enter the candidate retry loop.
         result = self._publish_cli_worker(article, config)
         if not result.get("published") and config["publish"]:
             raise RuntimeError("네이버 발행 완료를 확인하지 못했습니다.")
@@ -462,3 +511,11 @@ class BlogWorkflowControls:
         history = self.cli_app_dir / "automation-history.json"
         history.write_text(json.dumps(self.auto_history, ensure_ascii=False, indent=2), encoding="utf-8")
         self._naver_log(f"'{topic}' 회차 완료 · {config.get('completion_label', '자동 발행')}")
+
+    def _write_cycle_attempts(self, attempts):
+        path = self.cli_app_dir / "last-cycle-attempts.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"updated_at": datetime.now().isoformat(timespec="seconds"),
+                                         "attempts": attempts}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)

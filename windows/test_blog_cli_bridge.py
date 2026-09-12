@@ -51,6 +51,26 @@ class BlogCliBridgeTests(unittest.TestCase):
             self.assertEqual(result["SOME_OTHER_SETTING"], "keep")
             self.assertEqual(os.environ["OPENAI_API_KEY"], "do-not-forward")
 
+    def test_antigravity_login_console_clears_stale_auth_failure_without_claiming_success(self):
+        with patch.object(cli, "_discover", side_effect=lambda _path: {"antigravity": self.provider("antigravity")}):
+            self.bridge._record("antigravity", "auth", cli.BlogCliError("authentication_required", "old login failed"))
+            self.assertEqual(self.bridge.status()["antigravity"]["text_status"], "authentication_required")
+            self.bridge.login_console_closed("antigravity")
+            refreshed = cli.BlogCliBridge(self.root, lambda _: None).status()["antigravity"]
+            self.assertEqual(refreshed["auth_status"], "not_checked")
+            self.assertEqual(refreshed["text_status"], "not_checked")
+            self.assertFalse(refreshed["auth_available"])
+            self.assertFalse(refreshed["text_available"])
+
+    def test_login_console_returns_handle_for_monitor_or_legacy_pid_without_shell(self):
+        with patch.object(self.bridge, "login_command", return_value=[sys.executable, "login"]), \
+             patch.object(cli.subprocess, "Popen") as start:
+            start.return_value.pid = 123
+            self.assertIs(self.bridge.open_login("claude", return_process=True), start.return_value)
+            self.assertEqual(self.bridge.open_login("claude"), 123)
+        self.assertFalse(start.call_args.kwargs["shell"])
+        self.assertFalse(cli.API_ENV_KEYS.intersection(start.call_args.kwargs["env"]))
+
     def test_runner_preserves_stdin_shell_characters_and_unicode(self):
         value = '한글 prompt $(whoami) & | > "quoted" `literal`\nnext line'
         code, output, error = cli._run([sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"],
