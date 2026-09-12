@@ -130,6 +130,7 @@ class BlogWorkflowControls(UnattendedControls):
             entry = ttk.Entry(models, textvariable=self.cli_models[key], width=17)
             entry.pack(side="left")
             entry.bind("<FocusOut>", self._save_cli_selection)
+            entry.bind("<KeyRelease>", self._schedule_prompt_save)
         ttk.Label(models, text="비우면 CLI 기본값", style="Sub.TLabel").pack(side="left", padx=7)
         ttk.Label(settings, textvariable=self.cli_capability_text, wraplength=1100, style="Sub.TLabel").grid(row=4, column=0, columnspan=7, sticky="w", pady=(6, 0))
         blocked = ttk.Frame(settings)
@@ -139,12 +140,17 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_blocked_terms.pack(side="left", fill="x", expand=True)
         self.cli_blocked_terms.insert("1.0", ", ".join(self.cli_preferences["blocked_terms"]))
         self.cli_blocked_terms.bind("<FocusOut>", self._save_cli_selection)
+        self.cli_blocked_terms.bind("<KeyRelease>", self._schedule_prompt_save)
         ttk.Button(blocked, text="차단어 저장", command=self._save_cli_selection).pack(side="left", padx=5)
         ttk.Button(blocked, text="기본값 복원", command=self._restore_blocked_terms).pack(side="left")
         ttk.Label(blocked, text=" 연관어 중복").pack(side="left")
-        ttk.Entry(blocked, textvariable=self.cli_duplicate_keywords, width=5).pack(side="left")
+        duplicate_keywords = ttk.Entry(blocked, textvariable=self.cli_duplicate_keywords, width=5)
+        duplicate_keywords.pack(side="left")
         ttk.Label(blocked, text=" 제목 유사도").pack(side="left")
-        ttk.Entry(blocked, textvariable=self.cli_duplicate_titles, width=5).pack(side="left")
+        duplicate_titles = ttk.Entry(blocked, textvariable=self.cli_duplicate_titles, width=5)
+        duplicate_titles.pack(side="left")
+        duplicate_keywords.bind("<FocusOut>", self._save_cli_selection)
+        duplicate_titles.bind("<FocusOut>", self._save_cli_selection)
         ttk.Label(self.blog_tab, text="연관 검색어의 질문 → 제목·8문단 → CLI 교차 검수 → Antigravity 4장 + ChatGPT 4장 → 검수 통과 6장", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
         panes = ttk.Panedwindow(self.blog_tab, orient="horizontal")
         panes.grid(row=2, column=0, sticky="nsew")
@@ -166,6 +172,8 @@ class BlogWorkflowControls(UnattendedControls):
         self.base_text = ScrolledText(left, wrap="word", font=("맑은 고딕", 10), height=12)
         self.base_text.pack(fill="both", expand=True, padx=(0, 5))
         self.base_text.insert("1.0", next(p["text"] for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt))
+        self.base_text.bind("<KeyRelease>", self._schedule_prompt_save)
+        self.cli_preset_name.trace_add("write", lambda *_: self._schedule_prompt_save())
         ttk.Label(right, text="검수된 글 · 실행 기록").pack(anchor="w")
         self.blog_result = ScrolledText(right, wrap="word", font=("맑은 고딕", 10), height=12)
         self.blog_result.pack(fill="both", expand=True, padx=(5, 0))
@@ -200,6 +208,16 @@ class BlogWorkflowControls(UnattendedControls):
         )
         self._sync_cli_step_boxes()
         self._persist_cli_preferences()
+
+    def _schedule_prompt_save(self, _event=None):
+        pending = getattr(self, "_prompt_save_job", None)
+        if pending:
+            self.root.after_cancel(pending)
+        self._prompt_save_job = self.root.after(700, self._autosave_prompt)
+
+    def _autosave_prompt(self):
+        self._prompt_save_job = None
+        self.save_cli_prompt(silent=True)
 
     def _restore_blocked_terms(self):
         self.cli_blocked_terms.delete("1.0", "end")
@@ -524,28 +542,46 @@ class BlogWorkflowControls(UnattendedControls):
         ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
         selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         provider = config["steps"][0]
-        attempts, article = [], None
-        for index, candidate in enumerate(ranked[:3], 1):
+        attempts, article, choice = [], None, None
+        selection_options = {"provider": provider, "model": config.get("models", {}).get(provider, ""),
+                             "blocked_terms": config.get("blocked_terms")}
+        recent = self.topic_history.recent_publications(30) if hasattr(self, "topic_history") else None
+        if isinstance(recent, list): selection_options["recent_publications"] = recent
+        for offset in (0, 12):
+            batch = ranked[offset:offset + 12]
+            if not batch: break
+            try:
+                choice = selector.select_topic(batch, **selection_options)
+                break
+            except Exception as exc:
+                problem = access_error_from_exception(exc)
+                if problem: raise problem from exc
+                failed_dir = Path(getattr(exc, "run_dir", ""))
+                if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir(): shutil.rmtree(failed_dir, ignore_errors=True)
+                self._naver_log(f"후보 {offset + 1}~{offset + len(batch)} CLI 선정 거절: {exc}")
+        if choice is None:
+            fallback = ranked[0]
+            choice = {**fallback, "source_topic": fallback["topic"], "intent": "연관 검색어 기반 최고 점수 후보",
+                      "selection_run_dir": ""}
+            self._naver_log(f"CLI 선정 거절 2회 · 스포츠·사망이 아닌 최고 점수 후보 '{fallback['topic']}'로 진행합니다.")
+        selected_candidates = [choice, *(candidate for candidate in ranked if candidate["topic"] not in {choice.get("topic"), choice.get("source_topic")})]
+        for index, candidate in enumerate(selected_candidates[:3], 1):
             if self.full_auto_stop.is_set():
                 raise WorkflowError("사용자가 작업을 중지했습니다.")
             topic = candidate["topic"]
             self._naver_log(f"후보 {index}/3 · '{topic}' 선정·원고·이미지 검수 시작")
             try:
-                selection_options = {"provider": provider, "model": config.get("models", {}).get(provider, ""),
-                                     "blocked_terms": config.get("blocked_terms")}
-                recent = self.topic_history.recent_publications(30) if hasattr(self, "topic_history") else None
-                if isinstance(recent, list):
-                    selection_options["recent_publications"] = recent
-                choice = selector.select_topic([candidate], **selection_options)
-                topic, keywords = choice["topic"], choice["keywords"]
+                current = choice if index == 1 else candidate
+                topic, keywords = current["topic"], current["keywords"]
                 self._ensure_topic_allowed(topic, keywords, config)
-                self.events.put(("auto_topic", groups, topic, keywords, related_by_topic[topic]))
+                source_topic = current.get("source_topic", topic)
+                self.events.put(("auto_topic", groups, topic, keywords, related_by_topic.get(source_topic, {})))
                 article = self._prepare_cli_worker(topic, keywords, config)
                 if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, article.get("title", ""),
                         keyword_threshold=config.get("duplicate_keyword_threshold", .4),
                         title_threshold=config.get("duplicate_title_threshold", .5)) is True:
                     raise WorkflowError("발행 이력과 연관어 또는 제목이 유사해 이번 후보를 제외합니다.", Path(article["run_dir"]))
-                selection_value = choice.get("selection_run_dir", "")
+                selection_value = current.get("selection_run_dir", "")
                 selection_dir = Path(selection_value) if selection_value else None
                 if selection_dir is not None and selection_dir.is_dir():
                     destination = Path(article["run_dir"]) / "topic-review"

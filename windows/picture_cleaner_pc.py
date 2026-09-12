@@ -402,6 +402,8 @@ EPHEMERAL_PATTERNS = [
     r"몇\s*대\s*몇", r"득점\s*결과",
     r"(속보|긴급|현재|실시간).*(사고|상황|현황)",
     r"(경기|매치).*(오늘|내일|중계|시간)",
+    r"^[0-9A-Za-z가-힣]+\s+대\s+[0-9A-Za-z가-힣]+$",
+    r"\b(KIA|KT|롯데|키움|삼성|LG|한화|두산|SSG|NC|전북|서울|울산|포항|수원|KBO|K리그|프리미어리그|MLB|NBA)\b",
 ]
 
 LONGTAIL_INTENT_WORDS = {
@@ -1039,7 +1041,6 @@ class PictureCleanerApp(BlogWorkflowControls):
         interval_box = ttk.Combobox(topbar, textvariable=self.auto_interval_hours,
             values=["1", "2"], width=4, state="readonly")
         interval_box.pack(side="left", padx=5)
-        self.cli_runtime_selectors.append(interval_box)
         interval_box.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Label(topbar, text="시간마다").pack(side="left")
         ttk.Label(topbar, text="완료 동작").pack(side="left", padx=(12, 4))
@@ -1071,6 +1072,9 @@ class PictureCleanerApp(BlogWorkflowControls):
         self._comment_ui()
         # 프로그램 시작 화면은 실시간 연관 검색어로 고정한다.
         self.tabs.select(self.keyword_tab)
+        ttk.Label(outer, text="전체 진행 상황", style="Sub.TLabel").pack(anchor="w", pady=(8, 2))
+        self.global_progress_log = ScrolledText(outer, height=5, wrap="word", font=("맑은 고딕", 9), state="disabled")
+        self.global_progress_log.pack(fill="x")
         ttk.Separator(outer).pack(fill="x", pady=(12, 7))
         ttk.Label(outer, textvariable=self.status, style="Status.TLabel").pack(
             fill="x"
@@ -1722,6 +1726,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                     )
                 if self.full_auto_stop.is_set():
                     break
+                try:
+                    interval_hours = int(self.settings.get("auto_interval_hours", config.get("interval_hours", 1)))
+                    if interval_hours not in {1, 2}: interval_hours = 1
+                except (TypeError, ValueError):
+                    interval_hours = 1
+                config["interval_hours"] = interval_hours
+                config["interval_seconds"] = interval_hours * 3600
                 now = time.monotonic()
                 next_tick = next_cycle_tick(next_tick, now, config["interval_seconds"])
                 remaining = next_tick - now
@@ -1762,6 +1773,14 @@ class PictureCleanerApp(BlogWorkflowControls):
                     source_counts[key] = source_counts.get(key, 0) + 1
                     display_values.setdefault(key, normalized)
         candidates = list(display_values.values())
+        if len(candidates) < 3:
+            for stored in self.topic_history.filter_keywords(getattr(self, "keyword_db", []), include_pending=True):
+                normalized = normalize_keyword(stored)
+                key = keyword_comparison_key(normalized)
+                if key and key not in display_values and not is_ephemeral_keyword(normalized) and not blocked_term_hits(normalized, blocked_terms):
+                    display_values[key] = normalized
+                    candidates.append(normalized)
+                    if len(candidates) >= 3: break
         if not candidates:
             raise RuntimeError("반복되지 않은 롱테일 후보 검색어가 없습니다.")
 
@@ -2121,6 +2140,10 @@ class PictureCleanerApp(BlogWorkflowControls):
             except Exception as exc:
                 groups[source_name] = []
                 self._naver_log(f"크리에이터 어드바이저 {category} 조회 실패: {exc}")
+        blocked_terms = self.cli_preferences.get("blocked_terms") if hasattr(self, "cli_preferences") else None
+        for source, values in list(groups.items()):
+            groups[source] = [word for word in values if not is_ephemeral_keyword(word)
+                              and not blocked_term_hits(word, blocked_terms)]
         if not cancelled():
             self.events.put(("realtime_groups", groups))
 
@@ -2133,6 +2156,7 @@ class PictureCleanerApp(BlogWorkflowControls):
     def restore_default_blog_prompt(self):
         self.base_text.delete("1.0", "end")
         self.base_text.insert("1.0", DEFAULT_BLOG_PROMPT)
+        self._schedule_prompt_save()
         self.status.set("정리된 기본 블로그 프롬프트를 복원했습니다.")
 
     def save_blog_prompt(self):
@@ -2522,6 +2546,11 @@ class PictureCleanerApp(BlogWorkflowControls):
                         self.cli_log.insert("end", f"{rank}. {row['topic']} · {row['score']} · {row['reason']}\n")
                     self.cli_log.configure(state="disabled")
                 elif kind == "naver_log":
+                    if hasattr(self, "global_progress_log"):
+                        self.global_progress_log.configure(state="normal")
+                        self.global_progress_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")
+                        self.global_progress_log.see("end")
+                        self.global_progress_log.configure(state="disabled")
                     if hasattr(self, "cli_log"):
                         self.cli_log.configure(state="normal")
                         self.cli_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")

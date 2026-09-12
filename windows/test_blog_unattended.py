@@ -103,25 +103,35 @@ class CandidateRetryTests(unittest.TestCase):
     def test_reject_then_generation_failure_then_third_candidate_success(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
             app, config = self.make_cycle(folder)
-            workflow.return_value.select_topic.side_effect = [WorkflowError("의미 거절"),
-                {"topic": "B", "keywords": ["B 방법"]}, {"topic": "C", "keywords": ["C 방법"]}]
+            workflow.return_value.select_topic.side_effect = WorkflowError("의미 거절")
             app._prepare_cli_worker.side_effect = [WorkflowError("이미지 검수 실패"), {"run_dir": folder}]
             app._cli_automation_cycle(config)
             app._rank_longtail_topics.assert_called_once()
-            self.assertEqual(workflow.return_value.select_topic.call_count, 3)
-            self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ["B", "C"])
+            self.assertEqual(workflow.return_value.select_topic.call_count, 1)
+            self.assertEqual(len(workflow.return_value.select_topic.call_args.args[0]), 4)
+            self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ["A", "B"])
             app._publish_cli_worker.assert_called_once()
 
     def test_three_total_attempts_never_reach_fourth_candidate(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
             app, config = self.make_cycle(folder)
             workflow.return_value.select_topic.side_effect = WorkflowError("모두 거절")
-            with self.assertRaisesRegex(WorkflowError, "3개를 시도"):
-                app._cli_automation_cycle(config)
-            self.assertEqual(workflow.return_value.select_topic.call_count, 3)
-            attempted = json.loads((Path(folder) / "last-cycle-attempts.json").read_text(encoding="utf-8"))["attempts"]
-            self.assertEqual([item["topic"] for item in attempted], ["A", "B", "C"])
-            app._publish_cli_worker.assert_not_called()
+            app._cli_automation_cycle(config)
+            self.assertEqual(workflow.return_value.select_topic.call_count, 1)
+            app._prepare_cli_worker.assert_called_once_with("A", ["A 방법"], config)
+            app._publish_cli_worker.assert_called_once()
+
+    def test_selection_compares_twelve_then_next_twelve(self):
+        with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
+            app, config = self.make_cycle(folder)
+            ranked = [{"topic": f"T{i}", "keywords": [f"T{i} 방법"], "score": 30 - i, "reason": "의도"} for i in range(24)]
+            app._rank_longtail_topics.return_value = (ranked, {row["topic"]: {} for row in ranked})
+            workflow.return_value.select_topic.side_effect = [WorkflowError("첫 묶음 거절"),
+                {"topic": "T12", "keywords": ["T12 방법"]}]
+            app._cli_automation_cycle(config)
+            calls = workflow.return_value.select_topic.call_args_list
+            self.assertEqual([len(call.args[0]) for call in calls], [12, 12])
+            app._prepare_cli_worker.assert_called_once_with("T12", ["T12 방법"], config)
 
     def test_publication_failure_never_tries_another_candidate(self):
         for outcome in [RuntimeError("publish timeout"), {"published": False, "status": "uncertain"}]:

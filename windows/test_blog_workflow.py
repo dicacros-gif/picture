@@ -501,7 +501,7 @@ class TopicRankingTests(unittest.TestCase):
         self.assertEqual(result[0]["topic"], "기부")
         person = next(item for item in result if item["topic"] == "호시")
         self.assertNotIn("호식이 치킨 가격", person["keywords"])
-        self.assertEqual(person["image_risk"], "높음")
+        self.assertEqual(person["image_risk"], "개별 확인 필요")
 
     def test_latin_topic_matches_complete_english_token(self):
         ranked = rank_topics({"source": ["CPI"]}, {"CPI": ["CPI release date", "미국 CPI 발표", "cpifood 가격"]})
