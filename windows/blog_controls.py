@@ -32,6 +32,16 @@ def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
     return candidate
 
 
+def _google_search_context_hash(topic, keywords, config):
+    """Invalidate the optional-search receipt when its inputs or policy change."""
+    context = {"version": 1, "topic": topic, "keywords": keywords,
+               "count": config.get("google_reference_count", 4),
+               "steps": config.get("steps"), "models": config.get("models"),
+               "stage_configs": config.get("stage_configs"),
+               "reuse_only": True, "english_only": True}
+    return hashlib.sha256(json.dumps(context, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 class BlogWorkflowControls(UnattendedControls):
     def _browser_task_busy(self):
         return any(getattr(self, name, False) for name in
@@ -447,6 +457,9 @@ class BlogWorkflowControls(UnattendedControls):
         google = []
         google_folder = None
         search_folder = None
+        google_search_completed = False
+        google_queries = []
+        google_context = _google_search_context_hash(topic, keywords, config)
         if config["include_google"] and config.get("resume_run_dir"):
             run_dir = Path(config["resume_run_dir"]).resolve()
             if (self.cli_app_dir / "blog-runs").resolve() in run_dir.parents:
@@ -464,13 +477,28 @@ class BlogWorkflowControls(UnattendedControls):
                         self._naver_log(f"같은 회차의 영어 원문 확인을 마친 Google 후보 {len(google)}장 재사용")
                 except (OSError, ValueError, TypeError, AttributeError):
                     google = []
-        if config["include_google"] and not google:
+                if not google:
+                    try:
+                        receipt = json.loads((run_dir / "google-search-checkpoint.json").read_text(encoding="utf-8"))
+                        google_search_completed = (receipt.get("version") == 1
+                            and receipt.get("run_dir") == str(run_dir)
+                            and receipt.get("context_sha256") == google_context
+                            and receipt.get("status") == "completed"
+                            and type(receipt.get("candidate_count")) is int and receipt["candidate_count"] == 0)
+                        if google_search_completed:
+                            google_queries = receipt.get("queries", [])[:3]
+                            self._naver_log("같은 회차에서 Google 검색을 마쳤으나 사용 가능한 후보가 없어 생성 이미지 작업을 이어갑니다.")
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        google_search_completed = False
+        if config["include_google"] and not google and not google_search_completed:
             self._naver_log(f"Google 캡처 후보 최대 {config.get('google_reference_count', 4)}장의 화면과 사용 조건을 확인합니다.")
             try:
                 search = workflow.plan_google_image_search(topic, keywords, config["steps"],
                     config["models"], stage_configs=config.get("stage_configs"))
                 search_folder = search.get("run_dir")
                 queries = list(dict.fromkeys([search["query"], *search.get("queries", [])]))[:3]
+                google_queries = queries
+                completed_queries = 0
                 folder = self.cli_app_dir / "google-reference-candidates" / (
                     datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
                 google_folder = folder
@@ -485,6 +513,9 @@ class BlogWorkflowControls(UnattendedControls):
                         # Scan a full bounded batch, then retain only the missing unique photos.
                         candidates = self.naver_bot.capture_google_reference_candidates(query, folder / f"query-{number}",
                             count=goal, reuse_only=True, english_only=True)
+                        # Returning normally includes a bounded scan with no eligible
+                        # photo or unavailable previews. Exceptions remain retryable.
+                        completed_queries += 1
                     except Exception as exc:
                         if self.full_auto_stop.is_set():
                             raise
@@ -508,6 +539,7 @@ class BlogWorkflowControls(UnattendedControls):
                         break
                     if number < len(queries):
                         self._naver_log(f"Google 후보 {len(google)}/{goal}장 확보 · 같은 주제의 다음 영어 검색어로 보충합니다.")
+                google_search_completed = completed_queries == len(queries)
             except Exception as exc:
                 if self.full_auto_stop.is_set():
                     raise WorkflowError("사용자가 작업을 중지했습니다.") from exc
@@ -521,7 +553,20 @@ class BlogWorkflowControls(UnattendedControls):
             resume_options["revision_feedback"] = config["revision_feedback"]
         if config.get("stage_configs"):
             resume_options["stage_configs"] = config["stage_configs"]
-        resume_options["on_run_created"] = lambda run_dir: self._remember_preparing_run(topic, run_dir)
+        def remember_run(run_dir):
+            self._remember_preparing_run(topic, run_dir)
+            if config["include_google"] and google_search_completed and not google:
+                # Store beside the request so a later article/image failure does
+                # not repeat this completed optional search on the same run.
+                path = Path(run_dir).resolve()
+                try:
+                    atomic_json_write(path / "google-search-checkpoint.json", {
+                        "version": 1, "run_dir": str(path), "context_sha256": google_context,
+                        "status": "completed", "candidate_count": 0, "queries": google_queries,
+                        "completed_at": datetime.now().isoformat(timespec="seconds")})
+                except OSError as exc:
+                    self._naver_log(f"Google 검색 완료 기록 저장 실패 · 다음 재개 시 재확인합니다: {exc}")
+        resume_options["on_run_created"] = remember_run
         brief = config["base_prompt"]
         if config.get("selection_intent") or config.get("selection_question"):
             brief += "\n확정된 검색 의도(주제를 바꾸지 말고 이 궁금증에 답한다): " + json.dumps({

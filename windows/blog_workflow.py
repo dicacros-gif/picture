@@ -18,7 +18,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from PIL import Image, ImageOps
-from image_delivery import clean_export
+from image_delivery import COVER_RENDER_VERSION, clean_export
 from blog_preferences import blocked_term_hits, normalize_blocked_terms
 from blog_stage_roles import role_prompt, check_role_change
 from blog_quality import inspect_article, apply_patches, local_cleanup
@@ -989,6 +989,58 @@ class BlogWorkflow:
         article["google_captions"] = values
         return values
 
+    def _refresh_rejected_cover(self, run_dir, article, candidate):
+        """Upgrade a rejected local overlay once without charging for a new photograph."""
+        if (candidate.get("paragraph_index") != 0 or candidate.get("approved") is not False
+                or candidate.get("cover_render_version") == COVER_RENDER_VERSION
+                or not any(isinstance(review, dict) and review.get("approved") is False
+                           for review in candidate.get("reviews", []))
+                or candidate.get("error") or candidate.get("cover_text_applied") is not True
+                or candidate.get("provider") != "antigravity"
+                or candidate.get("image_policy") != IMAGE_POLICY
+                or candidate.get("metadata_stripped") is not True
+                or candidate.get("image_context_sha256") != _image_context_hash(article, 0)
+                or candidate.get("cover_headline") != cover_headline(article["cover_headline"])):
+            return candidate
+        output_dir = (run_dir / "image-1-antigravity").resolve()
+        try:
+            source = Path(candidate.get("original_path", "")).resolve()
+            previous_path = Path(candidate.get("path", "")).resolve()
+            if (not source.is_relative_to(output_dir) or not previous_path.is_relative_to(output_dir)
+                    or source == previous_path
+                    or _fingerprint(previous_path)["sha256"] != candidate.get("sha256")):
+                return candidate
+            original = _fingerprint(source)
+            if (original["pixel_hash"] != candidate.get("original_pixel_hash")
+                    or original["dhash"] != candidate.get("original_dhash")):
+                return candidate
+            self._check_cancelled()
+            destination = output_dir / f"upload-cover-{COVER_RENDER_VERSION}.jpg"
+            delivery = clean_export(source, destination, target_long_side=2048,
+                                    headline=candidate["cover_headline"])
+            if (Path(delivery["path"]).resolve() != destination
+                    or delivery.get("cover_render_version") != COVER_RENDER_VERSION):
+                raise WorkflowError("첫 사진의 수정된 글자 배치 버전을 확인하지 못했습니다.")
+            fingerprint = _fingerprint(destination)
+            if fingerprint["width"] != fingerprint["height"]:
+                raise WorkflowError("첫 사진의 수정된 글자 배치가 1:1 비율이 아닙니다.")
+        except (OSError, ValueError, WorkflowError) as exc:
+            self._check_cancelled()
+            self.log(f"첫 사진 글자 배치 복구 보류 · 기존 파일 유지: {exc}")
+            return candidate
+        updated = copy.deepcopy(candidate)
+        updated.setdefault("previous_cover_renders", []).append({
+            key: candidate.get(key) for key in ("path", "sha256", "cover_render_version", "reviews",
+                "quality_score", "vision_review_plan_sha256", "reviewed_paragraph_sha256")})
+        updated.update(delivery)
+        updated.update(fingerprint)
+        updated.update(approved=False, vision_reviewed=False, reviews=[], quality_score=0,
+                       requires_final_semantic_review=True)
+        for key in ("vision_review_plan_sha256", "reviewed_paragraph_sha256", "rejection_reason"):
+            updated.pop(key, None)
+        self.log("첫 사진 · 기존 원본의 한글 그림자 배치만 복구 · 추가 생성 없이 실제 파일 재검수")
+        return updated
+
     def _generate_candidate(self, run_dir, article, index, models, manifest, previous=None):
         """One charged attempt. Save the counter before invoking the native CLI."""
         provider = "antigravity" if index % 2 == 0 else "chatgpt"
@@ -1451,6 +1503,8 @@ class BlogWorkflow:
                 output_dir = run_dir / name
                 output_dir.mkdir(exist_ok=True)
                 old_image = reusable_images.get(paragraph_index)
+                if paragraph_index == 0 and old_image:
+                    old_image = self._refresh_rejected_cover(run_dir, article, old_image)
                 if old_image and old_image.get("provider") == provider and old_image.get("path") and not old_image.get("error"):
                     try:
                         old_path = Path(old_image["path"]).resolve()
@@ -1496,8 +1550,11 @@ class BlogWorkflow:
                     self._check_cancelled()
                     if not candidate.get("error") and not candidate.get("reviews"):
                         self.log(f"이미지 {index + 1}/8 · 실제 파일 CLI 검수")
+                        review_name = f"image-{index + 1}-attempt-{candidate.get('generation_attempts', 1)}"
+                        if candidate.get("previous_cover_renders"):
+                            review_name += f"-render-{candidate.get('cover_render_version', '')}"
                         self._review_image(run_dir, candidate, article["paragraphs"], steps, review_mode, models,
-                                           f"image-{index + 1}-attempt-{candidate.get('generation_attempts', 1)}", effective_stages)
+                                           review_name, effective_stages)
                     if candidate.get("approved") and image_retry_limit and any(_duplicate(candidate, prior) for prior in approved_images):
                         candidate.update(approved=False, rejection_reason="이미 검수한 이미지와 시각적으로 중복됩니다.")
                     _save_json(run_dir / "manifest.json", manifest)

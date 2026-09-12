@@ -12,6 +12,8 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 
+COVER_RENDER_VERSION = "contrast-shadow-v2"
+
 
 def _default_korean_font() -> Path:
     if sys.platform == "darwin":
@@ -96,8 +98,16 @@ def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None
     overlay = Image.new("RGBA", pixels.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     panel_height = text_height + margin * 2
-    draw.rectangle((0, 0, width, panel_height), fill=(12, 22, 29, 150))
     text_color = "#8CE88C" if int(hashlib.sha256(headline.encode("utf-8")).hexdigest(), 16) % 2 == 0 else "#EF3340"
+    # A nearly black panel hid the dark outline, and an outline alone is not
+    # a drop shadow. Keep enough panel contrast to see the displaced shadow
+    # even when the generated photograph is dark.
+    panel_color = (64, 78, 88, 235) if text_color == "#8CE88C" else (238, 241, 237, 235)
+    draw.rectangle((0, 0, width, panel_height), fill=panel_color)
+    shadow_x, shadow_y = max(3, round(size * .075)), max(5, round(size * .12))
+    draw.multiline_text((margin + shadow_x, margin - bounds[1] + shadow_y), text,
+                        font=font, spacing=spacing, fill=(5, 9, 12, 255),
+                        stroke_width=max(1, round(size * .018)), stroke_fill=(5, 9, 12, 255))
     draw.multiline_text((margin, margin - bounds[1]), text, font=font, spacing=spacing,
                         fill=text_color, stroke_width=max(2, round(size * .035)), stroke_fill=(20, 25, 30, 210))
     return Image.alpha_composite(pixels.convert("RGBA"), overlay).convert("RGB"), text_color
@@ -163,6 +173,7 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
             "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "metadata_stripped": True,
             "delivery_format": "JPEG", "image_style": "photorealistic",
             "cover_headline": headline, "cover_text_applied": bool(headline),
+            "cover_render_version": COVER_RENDER_VERSION if headline else "",
             "cover_text_color": cover_color, "cover_aspect_ratio": "1:1" if headline else "",
             "caption_text": caption, "caption_applied": bool(caption),
             "caption_placement": "top" if caption else "", "caption_layout": "separate_band" if caption else "",

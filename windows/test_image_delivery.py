@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, PngImagePlugin
-from image_delivery import clean_export
+from PIL import Image, ImageColor, PngImagePlugin
+from image_delivery import COVER_RENDER_VERSION, _draw_cover, clean_export
 
 
 class ImageDeliveryTests(unittest.TestCase):
@@ -64,6 +64,38 @@ class ImageDeliveryTests(unittest.TestCase):
             Image.new('RGB',(1024,1024),'white').save(source)
             with self.assertRaisesRegex(ValueError,'한글 글꼴'):
                 clean_export(source,target,headline='기부',font_path=Path(directory)/'missing.ttf')
+
+    def test_cover_has_visible_displaced_shadow_on_dark_and_light_photos(self):
+        # Inspect delivered pixels, not draw calls: a centered outline must
+        # not pass as the requested shadow below the title.
+        for headline in ('물가지표의 밤', '기부의 기준'):
+            for background in ('black', 'white'):
+                with self.subTest(headline=headline, background=background):
+                    original = Image.new('RGB', (768, 768), background)
+                    rendered, color = _draw_cover(original, headline)
+                    foreground = ImageColor.getrgb(color)
+                    title_y, shadow_y = [], []
+                    for y in range(230):
+                        for x in range(768):
+                            pixel = rendered.getpixel((x, y))
+                            if pixel == foreground:
+                                title_y.append(y)
+                            if pixel == (5, 9, 12):
+                                shadow_y.append(y)
+                    self.assertTrue(title_y)
+                    self.assertTrue(shadow_y)
+                    self.assertGreaterEqual(max(shadow_y) - max(title_y), 7)
+                    self.assertEqual(rendered.crop((0, 240, 768, 768)).tobytes(),
+                                     original.crop((0, 240, 768, 768)).tobytes())
+
+    def test_render_version_identifies_only_cover_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.png'
+            Image.new('RGB', (256, 256), 'black').save(source)
+            cover = clean_export(source, Path(directory) / 'cover.jpg', headline='물가지표의 밤')
+            plain = clean_export(source, Path(directory) / 'plain.jpg')
+            self.assertEqual(cover['cover_render_version'], COVER_RENDER_VERSION)
+            self.assertEqual(plain['cover_render_version'], '')
 
     def test_cover_is_center_cropped_to_exact_square(self):
         with tempfile.TemporaryDirectory() as directory:
