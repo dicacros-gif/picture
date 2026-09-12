@@ -133,6 +133,34 @@ def _npm_launcher(root: Path, package_name: str, command: str, node: str) -> lis
     return []
 
 
+def _codex_desktop_executable(path: Path) -> bool:
+    """The desktop app and its Windows alias are not account CLI launchers."""
+    try:
+        path = path.resolve()
+    except OSError:
+        pass
+    parts = tuple(part.casefold() for part in path.parts)
+    if not parts or parts[-1] != "codex.exe":
+        return False
+    return (len(parts) >= 3 and parts[-2] == "app" and parts[-3].startswith("openai.codex_")) or (
+        len(parts) >= 3 and parts[-3:-1] == ("microsoft", "windowsapps"))
+
+
+def _codex_native_candidates(localapp: Path) -> list[Path]:
+    """Version directories are hashes, so lexical order does not mean newest."""
+    candidates = []
+    try:
+        for path in (localapp / "OpenAI/Codex/bin").glob("*/codex.exe"):
+            try:
+                if path.is_file():
+                    candidates.append((path.stat().st_mtime_ns, str(path).casefold(), path))
+            except OSError:
+                continue  # An app update may remove an older version during discovery.
+    except OSError:
+        pass
+    return [item[2] for item in sorted(candidates, reverse=True)]
+
+
 def _discover(data_dir: Path) -> dict[str, dict]:
     """Do not execute wrapper scripts or restore launch commands from JSON."""
     node = shutil.which("node") or ""
@@ -150,7 +178,13 @@ def _discover(data_dir: Path) -> dict[str, dict]:
         candidates += [data_dir / "cli-tools" / f"{command}.exe", appdata / "npm" / f"{command}.exe",
                        Path.home() / ".local/bin" / f"{command}.exe"]
         if provider == "chatgpt":
-            candidates += sorted((localapp / "OpenAI/Codex/bin").glob("*/codex.exe"), reverse=True)
+            # Explorer/frozen launches can inherit the desktop app directory first
+            # on PATH. Prefer installed native CLI versions while preserving an
+            # explicit native override, and never launch the GUI as a CLI.
+            candidates = ([Path(override)] if override else []) + _codex_native_candidates(localapp) + [
+                data_dir / "cli-tools" / "codex.exe", appdata / "npm" / "codex.exe",
+                Path.home() / ".local/bin" / "codex.exe"] + ([Path(located)] if located else [])
+            candidates = [path for path in candidates if not _codex_desktop_executable(path)]
         elif provider == "claude":
             candidates += [Path("D:/claude/cli/.cli/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
                            Path.home() / ".claude/local/claude.exe", Path.home() / ".claude/bin/claude.exe"]

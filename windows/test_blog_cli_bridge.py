@@ -112,6 +112,61 @@ class BlogCliBridgeTests(unittest.TestCase):
         (package / "package.json").write_text(json.dumps({"bin": {"codex": "cli.js"}}), encoding="utf-8")
         self.assertEqual(cli._npm_launcher(self.root, "@openai/codex", "codex", "node.exe"), ["node.exe", str(entry)])
 
+    def discovery_file(self, relative):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test executable; must never launch")
+        return path
+
+    def discover_chatgpt(self, located=None, override="", node=None):
+        environment = {"LOCALAPPDATA": str(self.root / "localapp"), "APPDATA": str(self.root / "appdata"),
+                       "PICTURE_CLEANER_CHATGPT_CLI": str(override)}
+        with patch.dict(os.environ, environment), patch.object(Path, "home", return_value=self.root / "home"), \
+             patch.object(cli.shutil, "which", side_effect=lambda name: {"codex": str(located) if located else None,
+                                                                        "node": node}.get(name)), \
+             patch.object(cli.subprocess, "Popen") as start:
+            result = cli._discover(self.root)["chatgpt"]
+            start.assert_not_called()
+            return result
+
+    def test_discovery_prefers_native_codex_over_desktop_path(self):
+        gui = self.discovery_file("WindowsApps/OpenAI.Codex_26.901_x64/app/Codex.exe")
+        native = self.discovery_file("localapp/OpenAI/Codex/bin/native-version/codex.exe")
+        result = self.discover_chatgpt(gui)
+        self.assertEqual(result["launcher"], [str(native.resolve())])
+        self.assertTrue(result["installed"])
+
+    def test_discovery_orders_native_hash_versions_by_file_modification_time(self):
+        older = self.discovery_file("localapp/OpenAI/Codex/bin/zzz-old/codex.exe")
+        newer = self.discovery_file("localapp/OpenAI/Codex/bin/aaa-new/codex.exe")
+        os.utime(older, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(newer, ns=(2_000_000_000, 2_000_000_000))
+        other = self.discovery_file("custom-path/codex.exe")
+        self.assertEqual(self.discover_chatgpt(other)["launcher"], [str(newer.resolve())])
+
+    def test_discovery_preserves_native_override_but_rejects_desktop_override(self):
+        gui = self.discovery_file("WindowsApps/OpenAI.Codex_26.901_x64/app/Codex.exe")
+        native = self.discovery_file("localapp/OpenAI/Codex/bin/version/codex.exe")
+        override = self.discovery_file("chosen-cli/codex.exe")
+        self.assertEqual(self.discover_chatgpt(gui, override)["launcher"], [str(override.resolve())])
+        self.assertEqual(self.discover_chatgpt(gui, gui)["launcher"], [str(native.resolve())])
+
+    def test_discovery_desktop_or_alias_alone_never_counts_as_cli(self):
+        for relative in ("WindowsApps/OpenAI.Codex_26.901_x64/app/Codex.exe",
+                         "localapp/Microsoft/WindowsApps/codex.exe"):
+            with self.subTest(relative=relative):
+                gui = self.discovery_file(relative)
+                result = self.discover_chatgpt(gui, gui)
+                self.assertFalse(result["installed"])
+                self.assertEqual(result["launcher"], [])
+
+    def test_discovery_desktop_path_still_allows_npm_native_launcher_fallback(self):
+        gui = self.discovery_file("WindowsApps/OpenAI.Codex_26.901_x64/app/Codex.exe")
+        entry = self.discovery_file("appdata/npm/node_modules/@openai/codex/cli.js")
+        (entry.parent / "package.json").write_text(json.dumps({"bin": {"codex": "cli.js"}}), encoding="utf-8")
+        result = self.discover_chatgpt(gui, node="node.exe")
+        self.assertEqual(result["launcher"], ["node.exe", str(entry.resolve())])
+
     def test_codex_uses_last_completed_message(self):
         response = cli._parse_response("chatgpt", events(
             {"type": "thread.started", "thread_id": str(uuid.uuid4())},
