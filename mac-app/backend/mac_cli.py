@@ -16,8 +16,10 @@ import shlex
 import subprocess
 import tempfile
 import time
+import uuid
 
 from blog_cli_bridge import API_ENV_KEYS, BlogCliBridge, BlogCliError, PROVIDER_NAMES, _child_environment
+from blog_preferences import atomic_json_write
 
 
 SYSTEM_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
@@ -191,6 +193,58 @@ class MacLoginSession:
 
 
 class MacBlogCliBridge(BlogCliBridge):
+    def _login_workspace(self) -> Path:
+        root = self.data_dir.resolve()
+        workspace = root / "blog-cli-login"
+        if workspace.is_symlink() or workspace.resolve().parent != root:
+            raise BlogCliError("invalid_login", "CLI 로그인 자료 폴더가 앱 데이터 폴더 밖에 있습니다.")
+        return workspace
+
+    def _consume_login_completions(self):
+        """Only our completed login scripts can reset an old agy auth failure.
+
+        Status checks run in new backend processes, so the pending receipt is
+        durable. Claiming it by rename makes each completion consumable once;
+        a later real authentication failure cannot be reset by the old marker.
+        """
+        workspace = self._login_workspace()
+        if not workspace.is_dir():
+            return
+        for pending in workspace.glob("*.pending.json"):
+            try:
+                if pending.is_symlink() or pending.stat().st_size > 1024:
+                    continue
+                value = json.loads(pending.read_text(encoding="utf-8"))
+                if not isinstance(value, dict):
+                    continue
+                provider = value.get("provider")
+                stem = pending.name.removesuffix(".pending.json")
+                if (not isinstance(provider, str) or provider not in PROVIDER_NAMES or not stem.startswith(provider + "-")
+                        or value.get("marker") != stem + ".exit"):
+                    continue
+                marker = workspace / value["marker"]
+                if marker.is_symlink() or marker.resolve().parent != workspace or marker.stat().st_size > 4:
+                    continue
+                code = marker.read_text(encoding="ascii").strip()
+                if not re.fullmatch(r"\d{1,3}", code) or not 0 <= int(code) <= 255:
+                    continue
+                claimed = workspace / (stem + "." + uuid.uuid4().hex + ".consumed")
+                pending.rename(claimed)
+            except (OSError, ValueError, UnicodeError):
+                continue  # Still open, partial marker write, or claimed by another check.
+            try:
+                if provider == "antigravity" and int(code) == 0:
+                    self.login_console_closed(provider)
+                    self.log("Antigravity 로그인 명령 종료 확인 · 다음 실제 CLI 요청에서 계정을 확인합니다.")
+            finally:
+                claimed.unlink(missing_ok=True)
+
+    def check_accounts(self) -> dict[str, dict]:
+        self._consume_login_completions()
+        return super().check_accounts()
+
+    check_status = check_accounts
+
     def status(self) -> dict[str, dict]:
         discovered = discover_mac_clis(self.data_dir)
         with self._lock:
@@ -219,11 +273,12 @@ class MacBlogCliBridge(BlogCliBridge):
             if provider != "chatgpt":
                 raise BlogCliError("invalid_login", "기기 코드 로그인은 ChatGPT CLI에서만 지원합니다.", provider=provider)
             command.append("--device-auth")
-        workspace = (self.data_dir / "blog-cli-login").resolve()
+        workspace = self._login_workspace()
         workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         descriptor, filename = tempfile.mkstemp(prefix=f"{provider}-", suffix=".command", dir=workspace)
         script = Path(filename)
         marker = script.with_suffix(".exit")
+        pending = script.with_suffix(".pending.json")
         # Terminal can have a different environment from Finder. Reapply PATH and
         # remove API keys in the script itself as well as the launcher process.
         path_value = os.pathsep.join(str(path) for path in mac_path_entries())
@@ -240,11 +295,13 @@ class MacBlogCliBridge(BlogCliBridge):
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
                 stream.write("\n".join(lines))
             script.chmod(0o700)
+            atomic_json_write(pending, {"provider": provider, "marker": marker.name})
             process = subprocess.Popen(["/usr/bin/open", "-a", "Terminal", str(script)], cwd=str(workspace),
                                        env=_child_environment(), shell=False,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:
             script.unlink(missing_ok=True)
+            pending.unlink(missing_ok=True)
             raise BlogCliError("launch_failed", "Terminal 로그인 창을 열지 못했습니다.", provider=provider) from exc
         self.log(f"{PROVIDER_NAMES[provider]} Terminal 로그인 창을 열었습니다. 로그인 완료 후 상태를 다시 확인하세요.")
         session = MacLoginSession(process, marker, script)

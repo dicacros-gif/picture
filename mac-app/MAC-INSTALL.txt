@@ -3,7 +3,8 @@ Blog M1 2.0 설치와 첫 실행
 1. Blog-M1-2.0.0.zip 압축을 완전히 풉니다.
 2. Install-Blog.command를 Control-클릭하고 '열기'를 선택합니다.
 3. 원본 서명과 ARM64를 확인한 뒤 ~/Applications/Blog.app에 설치합니다.
-   기존 Blog.app은 휴지통에 백업하며 사용자 설정은 삭제하지 않습니다.
+   실행 중인 기존 Blog만 정상 종료를 기다린 뒤 교체합니다. 종료하지 못하면 설치를 중단합니다.
+   기존 Blog.app은 휴지통의 Blog-previous 폴더에 백업하며 사용자 설정은 삭제하지 않습니다.
 4. 앱의 'CLI 연결 확인'에서 본인 Mac에 설치한 Codex / Claude / Antigravity를 확인합니다.
    '로그인' 버튼은 Terminal을 엽니다. 본인 구독 계정으로 로그인한 뒤 다시 확인하세요.
    API 키는 사용하지 않습니다. Terminal 로그인을 마치지 않았는데 성공으로 표시하지 않습니다.

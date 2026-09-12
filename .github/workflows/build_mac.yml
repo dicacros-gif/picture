@@ -72,4 +72,5 @@ jobs:
           path: |
             mac-app/dist/Blog-M1-*.zip
             mac-app/dist/Blog-M1-*.sha256
+            mac-app/dist/Blog-M1-ui.png
           if-no-files-found: error

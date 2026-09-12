@@ -210,6 +210,76 @@ class MacCliTests(unittest.TestCase):
                 bridge.open_login("chatgpt")
         self.assertEqual(error.exception.code, "launch_failed")
         self.assertEqual(list((self.data / "blog-cli-login").glob("*.command")), [])
+        self.assertEqual(list((self.data / "blog-cli-login").glob("*.pending.json")), [])
+
+    def test_agy_login_receipt_survives_backend_restart_and_is_consumed_once(self):
+        self.native(self.bin / "agy")
+        records = self.discover()
+        process = Mock(pid=2048)
+        process.poll.return_value = 0
+        with patch.object(mac_cli, "discover_mac_clis", side_effect=lambda directory: copy.deepcopy(records)), \
+                patch.object(mac_cli, "mac_path_entries", return_value=[self.bin]), \
+                patch.object(mac_cli.subprocess, "Popen", return_value=process), \
+                patch.object(blog_cli_bridge, "_run", return_value=(0, "", "")) as run:
+            original = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            auth_error = blog_cli_bridge.BlogCliError("authentication_required", "Please log in")
+            original._record("antigravity", "auth", auth_error)
+            session = original.open_login("antigravity", return_process=True)
+            pending = session.script.with_suffix(".pending.json")
+            self.assertEqual(json.loads(pending.read_text(encoding="utf-8")),
+                             {"provider": "antigravity", "marker": session.marker.name})
+            session.marker.write_text("0\n", encoding="ascii")
+            resumed = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            result = resumed.check_accounts()["antigravity"]
+            self.assertEqual(result["auth_status"], "not_checked")
+            self.assertFalse(result["auth_available"], "CLI exit zero is not authenticated-account evidence")
+            self.assertFalse(pending.exists())
+            self.assertTrue(session.marker.exists(), "Only pending ownership receipt is consumed")
+            # An actual later auth failure cannot be cleared by the retained
+            # successful marker when the user presses recheck again.
+            resumed._record("antigravity", "auth", auth_error)
+            another = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            self.assertEqual(another.check_status()["antigravity"]["auth_status"], "authentication_required")
+        self.assertTrue(all(call.args[0][-1] == "--help" for call in run.call_args_list))
+
+    def test_open_or_failed_agy_login_does_not_reset_authentication_failure(self):
+        self.native(self.bin / "agy")
+        records = self.discover()
+        process = Mock(pid=2048)
+        process.poll.return_value = 0
+        with patch.object(mac_cli, "discover_mac_clis", side_effect=lambda directory: copy.deepcopy(records)), \
+                patch.object(mac_cli, "mac_path_entries", return_value=[self.bin]), \
+                patch.object(mac_cli.subprocess, "Popen", return_value=process), \
+                patch.object(blog_cli_bridge, "_run", return_value=(0, "", "")):
+            original = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            original._record("antigravity", "auth", blog_cli_bridge.BlogCliError("authentication_required", "Please log in"))
+            session = original.open_login("antigravity", return_process=True)
+            pending = session.script.with_suffix(".pending.json")
+            self.assertEqual(mac_cli.MacBlogCliBridge(self.data, lambda value: None).check_accounts()
+                             ["antigravity"]["auth_status"], "authentication_required")
+            self.assertTrue(pending.exists(), "The still-open console must remain pending")
+            session.marker.write_text("1\n", encoding="ascii")
+            self.assertEqual(mac_cli.MacBlogCliBridge(self.data, lambda value: None).check_accounts()
+                             ["antigravity"]["auth_status"], "authentication_required")
+            self.assertFalse(pending.exists())
+
+    def test_login_receipt_cannot_point_outside_its_own_workspace(self):
+        self.native(self.bin / "agy")
+        records = self.discover()
+        process = Mock(pid=2048)
+        with patch.object(mac_cli, "discover_mac_clis", side_effect=lambda directory: copy.deepcopy(records)), \
+                patch.object(mac_cli, "mac_path_entries", return_value=[self.bin]), \
+                patch.object(mac_cli.subprocess, "Popen", return_value=process), \
+                patch.object(blog_cli_bridge, "_run", return_value=(0, "", "")):
+            original = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            original._record("antigravity", "auth", blog_cli_bridge.BlogCliError("authentication_required", "Please log in"))
+            session = original.open_login("antigravity", return_process=True)
+            (self.data / "unrelated.exit").write_text("0\n", encoding="ascii")
+            pending = session.script.with_suffix(".pending.json")
+            pending.write_text(json.dumps({"provider": "antigravity", "marker": "../unrelated.exit"}), encoding="utf-8")
+            resumed = mac_cli.MacBlogCliBridge(self.data, lambda value: None)
+            self.assertEqual(resumed.check_accounts()["antigravity"]["auth_status"], "authentication_required")
+            self.assertTrue(pending.exists())
 
     def test_inherits_existing_text_image_validation_and_permissions(self):
         self.assertIs(mac_cli.MacBlogCliBridge.run_text, blog_cli_bridge.BlogCliBridge.run_text)

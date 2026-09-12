@@ -6,5 +6,5 @@ python -m PyInstaller --noconfirm --clean --onedir --name BlogEngine \
   --paths ../windows --paths backend --target-arch arm64 \
   --hidden-import AppKit --hidden-import Foundation backend/engine.py
 file backend-dist/BlogEngine/BlogEngine
-lipo -verify_arch arm64 backend-dist/BlogEngine/BlogEngine
+lipo backend-dist/BlogEngine/BlogEngine -verify_arch arm64
 backend-dist/BlogEngine/BlogEngine --data-dir "${RUNNER_TEMP:-/tmp}/blog-engine-smoke" self-test

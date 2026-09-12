@@ -321,7 +321,39 @@ function createMainWindow() {
     }
   });
   if (isSmokeTest) {
-    mainWindow.webContents.once("did-finish-load", () => app.exit(0));
+    const deadline = setTimeout(() => app.exit(1), 30000);
+    mainWindow.webContents.once("did-finish-load", async () => {
+      try {
+        let rendered;
+        for (let attempt = 0; attempt < 60; attempt++) {
+          rendered = await mainWindow.webContents.executeJavaScript(`(() => ({
+            ready: !document.getElementById('blogManual').disabled,
+            automation: document.getElementById('blogAutomation').checked,
+            mode: document.getElementById('blogMode').value,
+            intervals: [...document.getElementById('blogInterval').options].map(option => option.value),
+            prompt: document.getElementById('blogPromptText').value.length
+          }))()`);
+          if (rendered.ready) break;
+          await wait(50);
+        }
+        if (!rendered.ready || rendered.automation || rendered.mode !== 'draft'
+            || rendered.intervals.join(',') !== '1,2,3,4,5,6' || rendered.prompt < 100) {
+          throw new Error(`Mac UI initialization failed: ${JSON.stringify(rendered)}`);
+        }
+        const engine = await backend.invoke('self-test');
+        if (!engine.ok || !engine.korean_image_export) throw new Error('Packaged engine self-test failed');
+        if (process.env.BLOG_SMOKE_SCREENSHOT) {
+          mainWindow.setSize(1440, 1000);
+          await wait(150);
+          const capture = await mainWindow.webContents.capturePage();
+          fs.mkdirSync(path.dirname(process.env.BLOG_SMOKE_SCREENSHOT), { recursive: true });
+          fs.writeFileSync(process.env.BLOG_SMOKE_SCREENSHOT, capture.toPNG());
+        }
+        console.log(JSON.stringify({ smoke: 'passed', ui: rendered, engine }));
+        clearTimeout(deadline);
+        app.exit(0);
+      } catch (error) { console.error(error); clearTimeout(deadline); app.exit(1); }
+    });
     mainWindow.webContents.once("did-fail-load", () => app.exit(1));
   }
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
