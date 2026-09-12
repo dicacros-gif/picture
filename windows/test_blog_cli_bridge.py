@@ -414,6 +414,24 @@ class BlogCliBridgeTests(unittest.TestCase):
             self.assertEqual(runner.call_count, 1)
             self.assertEqual(list((self.root / ".gemini/config/projects").iterdir()), [])
 
+    def test_command_denial_continues_native_research_without_shell_permission(self):
+        conversation = str(uuid.uuid4())
+        first = events({"event": "init", "conversation_id": conversation},
+            {"event": "result", "result": {"status": "SUCCESS", "response": "partial",
+             "denied_actions": [{"action": "command"}]}})
+        second = events({"event": "init", "conversation_id": conversation},
+            {"event": "result", "result": {"status": "SUCCESS", "response": "verified"}})
+        with patch.object(cli.Path, "home", return_value=self.root), \
+             patch.object(self.bridge, "_provider", return_value=self.provider("antigravity")), \
+             patch.object(cli, "_run", side_effect=[(0, first, ""), (0, second, "")]) as runner:
+            result = self.bridge._request("antigravity", "Research public facts", self.root,
+                model="", images=None, image=False, timeout=30)
+        self.assertEqual(result.answer, "verified")
+        args = runner.call_args_list[1].args[0]
+        self.assertEqual(args[-2:], ["--conversation", conversation])
+        self.assertFalse(any("permission" in arg or "yolo" in arg for arg in args))
+        self.assertIn(b"Do not retry command", runner.call_args_list[1].kwargs['stdin'])
+
     def test_scoped_project_is_removed_when_child_is_cancelled(self):
         with patch.object(cli.Path, "home", return_value=self.root), \
              patch.object(self.bridge, "_provider", return_value=self.provider("antigravity")), \

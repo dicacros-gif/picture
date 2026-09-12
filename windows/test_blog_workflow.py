@@ -135,6 +135,31 @@ class BlogWorkflowTests(unittest.TestCase):
         arguments.update(overrides)
         return self.workflow.prepare(**arguments)
 
+    def test_stage_specific_models_reach_native_calls(self):
+        from blog_preferences import STAGE_ROLES
+        stages = [{"provider": provider, "role": STAGE_ROLES[index], "model": f"stage-{index}"}
+                  for index, provider in enumerate(DEFAULT_STEPS)]
+        article = self.prepare(stage_configs=stages)
+        self.assertTrue(article['ready_to_publish'])
+        calls = [call for call in self.bridge.calls if not call['images']]
+        self.assertEqual([call['model'] for call in calls], [f'stage-{i}' for i in range(4)])
+
+    def test_failed_review_recovers_same_topic_with_configured_writer(self):
+        from blog_cli_bridge import BlogCliError
+        original = self.bridge.run_text
+        def run(provider, prompt, **kwargs):
+            if provider == 'antigravity' and not kwargs.get('images'):
+                raise BlogCliError('permission_required', 'command denied', provider=provider)
+            return original(provider, prompt, **kwargs)
+        self.bridge.run_text = run
+        article = self.prepare(steps=['chatgpt', 'antigravity'], stage_configs=[
+            {'provider': 'chatgpt', 'role': '작성', 'model': 'writer'},
+            {'provider': 'antigravity', 'role': '팩트·최신 정보 보강', 'model': 'reviewer'}])
+        self.assertTrue(article['ready_to_publish'])
+        self.assertEqual(article['topic'], TOPIC)
+        calls = [call for call in self.bridge.calls if not call['images']]
+        self.assertIn('동일 주제 복구 단계', calls[-1]['prompt'])
+
     def latest_manifest(self):
         manifests = list((self.root / "runs").glob("*/manifest.json"))
         self.assertTrue(manifests)

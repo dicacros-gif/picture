@@ -975,6 +975,8 @@ class PictureCleanerApp(BlogWorkflowControls):
             "base_text",
             "blog_result",
             "comment_log",
+            "global_progress_log",
+            "cli_log",
             "cli_blocked_terms",
         ):
             widget = getattr(self, name, None)
@@ -1039,7 +1041,7 @@ class PictureCleanerApp(BlogWorkflowControls):
                         command=self._save_launch_choice).pack(side="left", padx=(0, 10))
         ttk.Label(topbar, text="반복 간격").pack(side="left")
         interval_box = ttk.Combobox(topbar, textvariable=self.auto_interval_hours,
-            values=["1", "2"], width=4, state="readonly")
+            values=["1", "2", "3", "4", "5", "6"], width=4, state="readonly")
         interval_box.pack(side="left", padx=5)
         interval_box.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Label(topbar, text="시간마다").pack(side="left")
@@ -1056,8 +1058,10 @@ class PictureCleanerApp(BlogWorkflowControls):
             variable=self.dark_mode,
             command=self._toggle_dark_mode,
         ).pack(side="right")
-        self.tabs = ttk.Notebook(outer)
-        self.tabs.pack(fill="both", expand=True)
+        from progress_panel import ProgressPanel
+        self.progress_panel = ProgressPanel(self, outer)
+        self.tabs = self.progress_panel.notebook
+        self.global_progress_log = self.progress_panel.text
         self.image_tab = ttk.Frame(self.tabs, padding=16)
         self.keyword_tab = ttk.Frame(self.tabs, padding=16)
         self.blog_tab = ttk.Frame(self.tabs, padding=16)
@@ -1072,9 +1076,6 @@ class PictureCleanerApp(BlogWorkflowControls):
         self._comment_ui()
         # 프로그램 시작 화면은 실시간 연관 검색어로 고정한다.
         self.tabs.select(self.keyword_tab)
-        ttk.Label(outer, text="전체 진행 상황", style="Sub.TLabel").pack(anchor="w", pady=(8, 2))
-        self.global_progress_log = ScrolledText(outer, height=5, wrap="word", font=("맑은 고딕", 9), state="disabled")
-        self.global_progress_log.pack(fill="x")
         ttk.Separator(outer).pack(fill="x", pady=(12, 7))
         ttk.Label(outer, textvariable=self.status, style="Status.TLabel").pack(
             fill="x"
@@ -1116,19 +1117,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         capture_actions.pack(fill="x", pady=(9, 0))
         ttk.Button(
             capture_actions,
-            text="1. 이미지 15장 크롭 저장",
-            style="Copy.TButton",
-            command=self.capture_google_images_15,
-        ).pack(side="left")
-        ttk.Button(
-            capture_actions,
-            text="2. 화질·해상도 개선",
-            style="Secondary.TButton",
-            command=self.enhance_google_images_15,
-        ).pack(side="left", padx=8)
-        ttk.Button(
-            capture_actions,
-            text="3. 1→2 순차 작업 시작",
+            text="이미지 15장 크롭·화질 개선",
             style="Accent.TButton",
             command=self.capture_and_enhance_google_images_15,
         ).pack(side="left")
@@ -1447,12 +1436,6 @@ class PictureCleanerApp(BlogWorkflowControls):
         ).pack(anchor="w")
         actions = ttk.Frame(self.comment_tab)
         actions.pack(fill="x", pady=12)
-        ttk.Button(
-            actions,
-            text="네이버 웨일 로그인 창 열기",
-            style="Secondary.TButton",
-            command=self.open_naver_login,
-        ).pack(side="left")
         ttk.Button(actions, text="내 글 답글·하트 시작", style="Accent.TButton", command=self.start_own_comments).pack(
             side="left", padx=8
         )
@@ -1468,8 +1451,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             style="Danger.TButton",
             command=self.naver_bot.stop,
         ).pack(side="left", padx=8)
-        self.comment_log = ScrolledText(self.comment_tab, wrap="word", font=("맑은 고딕", 10), state="disabled")
-        self.comment_log.pack(fill="both", expand=True)
+        ttk.Label(self.comment_tab, text="댓글 작업 상황은 모든 탭 하단의 전체 진행 상황에서 확인합니다.").pack(anchor="w")
 
     def _naver_log(self, message):
         self.events.put(("naver_log", message))
@@ -1720,15 +1702,17 @@ class PictureCleanerApp(BlogWorkflowControls):
                     if access_problem:
                         self._naver_log(str(access_problem))
                         break
-                    self._naver_log(f"전체 자동화 회차 실패: {exc}")
+                    pending_path = Path(getattr(self, "cli_app_dir", APP_DIR)) / "pending-blog-topic.json"
+                    prefix = "확정 주제 보완 대기" if pending_path.exists() else "주제 선정 사전 점검 대기"
+                    self._naver_log(f"{prefix}: {exc}")
                     self.events.put(
-                        ("auto_error", f"전체 자동화 회차 실패: {exc}")
+                        ("auto_error", f"{prefix}: {exc}")
                     )
                 if self.full_auto_stop.is_set():
                     break
                 try:
                     interval_hours = int(self.settings.get("auto_interval_hours", config.get("interval_hours", 1)))
-                    if interval_hours not in {1, 2}: interval_hours = 1
+                    if interval_hours not in range(1, 7): interval_hours = 1
                 except (TypeError, ValueError):
                     interval_hours = 1
                 config["interval_hours"] = interval_hours
@@ -1799,7 +1783,12 @@ class PictureCleanerApp(BlogWorkflowControls):
                 except Exception:
                     related_by_topic[topic] = {}
 
-        ranked = BlogWorkflow.rank_topics({source: [word for word in words if normalize_keyword(word) in candidates] for source, words in groups.items()}, related_by_topic,
+        ranking_groups = {source: [word for word in words if normalize_keyword(word) in candidates] for source, words in groups.items()}
+        collected = {normalize_keyword(word) for words in ranking_groups.values() for word in words}
+        stored_candidates = [word for word in candidates if word not in collected]
+        if stored_candidates:
+            ranking_groups["저장된 미사용 검색어"] = stored_candidates
+        ranked = BlogWorkflow.rank_topics(ranking_groups, related_by_topic,
             exclude_topics=self.topic_history.blocked_topics(), blocked_terms=blocked_terms)
         preferences = config if config is not None else self.cli_preferences
         ranked = [candidate for candidate in ranked if self.topic_history.is_duplicate(
@@ -1829,7 +1818,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         topic, related = choice["topic"], choice["keywords"]
         self._naver_log(f"선정: {topic} · 예상 관심 점수 {choice['score']} · {choice['reason']} (실제 CTR 아님)")
 
-        return topic, related, related_by_topic[topic]
+        return topic, related, related_by_topic.get(choice.get("source_topic", topic), {})
 
     def _run_full_automation_cycle(self, config: dict):
         self._cli_automation_cycle(config)
@@ -2546,20 +2535,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                         self.cli_log.insert("end", f"{rank}. {row['topic']} · {row['score']} · {row['reason']}\n")
                     self.cli_log.configure(state="disabled")
                 elif kind == "naver_log":
-                    if hasattr(self, "global_progress_log"):
-                        self.global_progress_log.configure(state="normal")
-                        self.global_progress_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")
-                        self.global_progress_log.see("end")
-                        self.global_progress_log.configure(state="disabled")
+                    if hasattr(self, "progress_panel"):
+                        self.progress_panel.append(f"[{datetime.now():%H:%M:%S}] {event[1]}")
                     if hasattr(self, "cli_log"):
                         self.cli_log.configure(state="normal")
                         self.cli_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")
                         self.cli_log.see("end")
                         self.cli_log.configure(state="disabled")
-                    self.comment_log.configure(state="normal")
-                    self.comment_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")
-                    self.comment_log.see("end")
-                    self.comment_log.configure(state="disabled")
                     self.status.set(event[1])
                 elif kind == "phone_topic":
                     self.topic.set(event[1])

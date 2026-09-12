@@ -12,7 +12,7 @@ from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from blog_cli_bridge import BlogCliBridge
-from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, normalize_preferences,
+from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLES, normalize_preferences,
                               store_prompt, normalize_blocked_terms, blocked_term_hits)
 from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
@@ -50,7 +50,6 @@ class BlogWorkflowControls(UnattendedControls):
                         supplied[field] = f"{original} ({suffix})"
                         suffix += 1
                 pref["prompts"] = [supplied, *pref["prompts"]]
-                pref["selected_prompt_id"] = supplied["id"]
             pref["default_revision"] = "user-20260912-thumbnail-v3"
         self.cli_active_prompt = pref["selected_prompt_id"]
         selected = next(p for p in pref["prompts"] if p["id"] == self.cli_active_prompt)
@@ -58,6 +57,8 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_preset_name = StringVar(value=selected["name"])
         self.cli_step_count = StringVar(value=str(pref["step_count"]))
         self.cli_order = [StringVar(value=PROVIDER_LABELS[p]) for p in pref["order"]]
+        self.cli_roles = [StringVar(value=s["role"]) for s in pref["stages"]]
+        self.cli_stage_models = [StringVar(value=s["model"]) for s in pref["stages"]]
         self.cli_review_mode = StringVar(value=pref["review_mode"] if pref["review_mode"] in REVIEW_MODES else REVIEW_MODES[0])
         self.cli_models = {key: StringVar(value=model) for key, model in pref["models"].items()}
         self.cli_google = BooleanVar(value=pref["include_google"])
@@ -75,13 +76,22 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _cleanup_stale_artifacts(self):
         cutoff = datetime.now().timestamp() - timedelta(days=7).total_seconds()
+        protected = set()
+        pending_path = self.cli_app_dir / "pending-blog-topic.json"
+        if pending_path.exists():
+            try:
+                pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                protected = {Path(p).resolve() for p in (pending.get("resume_run_dir"), pending.get("run_dir"),
+                    pending.get("choice", {}).get("selection_run_dir")) if p}
+            except (ValueError, OSError):
+                return  # Preserve work if its pending receipt cannot be read.
         for parent_name in ("blog-runs", "google-reference-candidates"):
             parent = self.cli_app_dir / parent_name
             if not parent.is_dir():
                 continue
             for path in parent.iterdir():
                 try:
-                    if path.is_dir() and path.stat().st_mtime < cutoff:
+                    if path.resolve() not in protected and path.is_dir() and path.stat().st_mtime < cutoff:
                         shutil.rmtree(path)
                 except OSError as exc:
                     self._naver_log(f"7일 경과 산출물 정리 실패 · {path}: {exc}")
@@ -97,16 +107,28 @@ class BlogWorkflowControls(UnattendedControls):
         ttk.Button(settings, text="관심 주제 자동 선정", command=self.select_cli_topic).grid(row=0, column=6)
         sequence = ttk.Frame(settings)
         sequence.grid(row=1, column=0, columnspan=7, sticky="ew", pady=6)
-        ttk.Label(sequence, text="실행 단계").pack(side="left")
+        ttk.Label(sequence, text="실행 단계").grid(row=0, column=0)
         count = ttk.Combobox(sequence, textvariable=self.cli_step_count, values=["1", "2", "3", "4"], state="readonly", width=3)
-        count.pack(side="left", padx=5)
+        count.grid(row=0, column=1, sticky="w", padx=5)
         self.cli_order_boxes = []
+        self.cli_role_boxes, self.cli_stage_model_boxes = [], []
         for index, variable in enumerate(self.cli_order):
-            ttk.Label(sequence, text=f"{index + 1}.").pack(side="left", padx=(6, 2))
+            row, column = 1 + index // 2, (index % 2) * 4
+            ttk.Label(sequence, text=f"{index + 1}.").grid(row=row, column=column, padx=(6, 2))
             box = ttk.Combobox(sequence, textvariable=variable, values=list(PROVIDER_LABELS.values()), state="readonly", width=21)
-            box.pack(side="left")
+            box.grid(row=row, column=column + 1, pady=2)
             box.bind("<<ComboboxSelected>>", self._save_cli_selection)
             self.cli_order_boxes.append(box)
+            role = ttk.Combobox(sequence, textvariable=self.cli_roles[index], values=STAGE_ROLES, state="readonly", width=20)
+            role.grid(row=row, column=column + 2, padx=4)
+            role.bind("<<ComboboxSelected>>", self._save_cli_selection)
+            self.cli_role_boxes.append(role)
+            model = ttk.Entry(sequence, textvariable=self.cli_stage_models[index], width=16)
+            model.grid(row=row, column=column + 3)
+            model.bind("<KeyRelease>", self._schedule_prompt_save)
+            model.bind("<FocusOut>", self._save_cli_selection)
+            self.cli_stage_model_boxes.append(model)
+        ttk.Label(sequence, text="단계별 모델: 비우면 아래 CLI 기본 모델 사용").grid(row=0, column=2, columnspan=6, sticky="w")
         count.bind("<<ComboboxSelected>>", self._save_cli_selection)
         options = ttk.Frame(settings)
         options.grid(row=2, column=0, columnspan=7, sticky="ew")
@@ -173,6 +195,8 @@ class BlogWorkflowControls(UnattendedControls):
         self.base_text.pack(fill="both", expand=True, padx=(0, 5))
         self.base_text.insert("1.0", next(p["text"] for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt))
         self.base_text.bind("<KeyRelease>", self._schedule_prompt_save)
+        self.base_text.edit_modified(False)
+        self.base_text.bind("<<Modified>>", self._prompt_modified)
         self.cli_preset_name.trace_add("write", lambda *_: self._schedule_prompt_save())
         ttk.Label(right, text="검수된 글 · 실행 기록").pack(anchor="w")
         self.blog_result = ScrolledText(right, wrap="word", font=("맑은 고딕", 10), height=12)
@@ -193,11 +217,22 @@ class BlogWorkflowControls(UnattendedControls):
         count = int(self.cli_step_count.get())
         for index, box in enumerate(getattr(self, "cli_order_boxes", [])):
             box.configure(state="readonly" if index < count else "disabled")
+        for index, box in enumerate(getattr(self, "cli_role_boxes", [])):
+            box.configure(state="readonly" if index < count else "disabled")
+        for index, box in enumerate(getattr(self, "cli_stage_model_boxes", [])):
+            box.configure(state="normal" if index < count else "disabled")
+
+    def _prompt_modified(self, _event=None):
+        if self.base_text.edit_modified():
+            self.base_text.edit_modified(False)
+            self._schedule_prompt_save()
 
     def _save_cli_selection(self, _event=None):
         reverse = {label: key for key, label in PROVIDER_LABELS.items()}
         self.cli_preferences.update(
             order=[reverse[value.get()] for value in self.cli_order],
+            stages=[{"provider": reverse[value.get()], "role": self.cli_roles[index].get(),
+                     "model": self.cli_stage_models[index].get().strip()} for index, value in enumerate(self.cli_order)],
             step_count=int(self.cli_step_count.get()), review_mode=self.cli_review_mode.get(),
             models={key: value.get().strip() for key, value in self.cli_models.items()},
             include_google=self.cli_google.get(), publication_mode=self.cli_publication.get(),
@@ -292,6 +327,7 @@ class BlogWorkflowControls(UnattendedControls):
         pref = copy.deepcopy(self.cli_preferences)
         selected = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
         return {"steps": pref["order"][:pref["step_count"]], "review_mode": pref["review_mode"],
+                "stage_configs": pref["stages"][:pref["step_count"]],
                 "models": pref["models"], "base_prompt": selected["text"],
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
                 "save_draft": pref["publication_mode"] == "임시저장까지만", "completion_label": pref["publication_mode"],
@@ -376,8 +412,17 @@ class BlogWorkflowControls(UnattendedControls):
             except Exception as exc:
                 self._naver_log(f"Google 참고 이미지 생략: {exc}")
         workflow = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
-        article = workflow.prepare(topic, keywords, config["base_prompt"], config["steps"],
-                                   config["review_mode"], models=config["models"], google_candidates=google)
+        resume_options = {"resume_run_dir": config["resume_run_dir"]} if config.get("resume_run_dir") else {}
+        if config.get("stage_configs"):
+            resume_options["stage_configs"] = config["stage_configs"]
+        brief = config["base_prompt"]
+        if config.get("selection_intent") or config.get("selection_question"):
+            brief += "\n확정된 검색 의도(주제를 바꾸지 말고 이 궁금증에 답한다): " + json.dumps({
+                "intent": config.get("selection_intent", ""), "question": config.get("selection_question", ""),
+                "related_keywords": keywords}, ensure_ascii=False)
+        article = workflow.prepare(topic, keywords, brief, config["steps"],
+                                   config["review_mode"], models=config["models"], google_candidates=google,
+                                   **resume_options)
         article["blog_id"] = config["blog_id"]
         article["auxiliary_dirs"] = [str(google_folder)] if google_folder else []
         self.events.put(("cli_article", article))
@@ -518,8 +563,8 @@ class BlogWorkflowControls(UnattendedControls):
         try:
             config = self._cli_configuration(silent=automatic)
             hours = int(self.auto_interval_hours.get())
-            if hours not in {1, 2}:
-                raise ValueError("자동화 간격은 1시간 또는 2시간입니다.")
+            if hours not in range(1, 7):
+                raise ValueError("자동화 간격은 1~6시간입니다.")
             config.update(interval_seconds=hours * 3600, interval_hours=hours)
         except ValueError as exc:
             if automatic:
@@ -538,6 +583,13 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _cli_automation_cycle(self, config):
         self._preflight_cli_accounts(config)
+        pending_path = self.cli_app_dir / "pending-blog-topic.json"
+        pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
+        if pending.get("publication_started"):
+            raise WorkflowError("확정 주제의 이전 발행 결과 확인이 필요합니다. 중복 발행을 막기 위해 원고를 보존합니다.")
+        if pending.get("choice"):
+            return self._complete_selected_topic(config, pending["groups"], pending["related"],
+                                                 pending["choice"], pending)
         groups = self._cli_realtime_groups()
         ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
         selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
@@ -545,6 +597,8 @@ class BlogWorkflowControls(UnattendedControls):
         attempts, article, choice = [], None, None
         selection_options = {"provider": provider, "model": config.get("models", {}).get(provider, ""),
                              "blocked_terms": config.get("blocked_terms")}
+        if config.get("stage_configs") and config["stage_configs"][0].get("model"):
+            selection_options["model"] = config["stage_configs"][0]["model"]
         recent = self.topic_history.recent_publications(30) if hasattr(self, "topic_history") else None
         if isinstance(recent, list): selection_options["recent_publications"] = recent
         for offset in (0, 12):
@@ -560,27 +614,52 @@ class BlogWorkflowControls(UnattendedControls):
                 if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir(): shutil.rmtree(failed_dir, ignore_errors=True)
                 self._naver_log(f"후보 {offset + 1}~{offset + len(batch)} CLI 선정 거절: {exc}")
         if choice is None:
+            if not ranked:
+                raise WorkflowError("진행 가능한 미사용 주제가 없습니다. 다음 수집에서 다시 확인합니다.")
             fallback = ranked[0]
             choice = {**fallback, "source_topic": fallback["topic"], "intent": "연관 검색어 기반 최고 점수 후보",
                       "selection_run_dir": ""}
             self._naver_log(f"CLI 선정 거절 2회 · 스포츠·사망이 아닌 최고 점수 후보 '{fallback['topic']}'로 진행합니다.")
-        selected_candidates = [choice, *(candidate for candidate in ranked if candidate["topic"] not in {choice.get("topic"), choice.get("source_topic")})]
-        for index, candidate in enumerate(selected_candidates[:3], 1):
+        self._ensure_topic_allowed(choice["topic"], choice["keywords"], config)
+        pending = {"choice": choice, "groups": groups, "related": related_by_topic}
+        self._save_pending_topic(pending)
+        return self._complete_selected_topic(config, groups, related_by_topic, choice, pending)
+
+    def _save_pending_topic(self, pending):
+        path = self.cli_app_dir / "pending-blog-topic.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+    def _complete_selected_topic(self, config, groups, related_by_topic, choice, pending):
+        attempts, article = [], None
+        # Once selected, keep the topic fixed throughout preparation and recovery.
+        recovery_config = dict(config)
+        if choice.get("intent"):
+            recovery_config["selection_intent"] = choice["intent"]
+        if choice.get("semantic_selection", {}).get("intent_question"):
+            recovery_config["selection_question"] = choice["semantic_selection"]["intent_question"]
+        if pending.get("resume_run_dir"):
+            recovery_config["resume_run_dir"] = pending["resume_run_dir"]
+        for index in range(1, 4):
             if self.full_auto_stop.is_set():
                 raise WorkflowError("사용자가 작업을 중지했습니다.")
-            topic = candidate["topic"]
-            self._naver_log(f"후보 {index}/3 · '{topic}' 선정·원고·이미지 검수 시작")
+            topic = choice["topic"]
+            article = None
+            self._naver_log(f"확정 주제 '{topic}' · 준비 시도 {index}/3")
             try:
-                current = choice if index == 1 else candidate
+                current = choice
                 topic, keywords = current["topic"], current["keywords"]
                 self._ensure_topic_allowed(topic, keywords, config)
                 source_topic = current.get("source_topic", topic)
                 self.events.put(("auto_topic", groups, topic, keywords, related_by_topic.get(source_topic, {})))
-                article = self._prepare_cli_worker(topic, keywords, config)
-                if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, article.get("title", ""),
+                prepared = self._prepare_cli_worker(topic, keywords, recovery_config)
+                if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, prepared.get("title", ""),
                         keyword_threshold=config.get("duplicate_keyword_threshold", .4),
                         title_threshold=config.get("duplicate_title_threshold", .5)) is True:
-                    raise WorkflowError("발행 이력과 연관어 또는 제목이 유사해 이번 후보를 제외합니다.", Path(article["run_dir"]))
+                    raise WorkflowError("확정 주제의 원고가 발행 이력과 유사합니다. 같은 주제의 원고 수정이 필요합니다.", Path(prepared["run_dir"]))
+                article = prepared
                 selection_value = current.get("selection_run_dir", "")
                 selection_dir = Path(selection_value) if selection_value else None
                 if selection_dir is not None and selection_dir.is_dir():
@@ -591,22 +670,32 @@ class BlogWorkflowControls(UnattendedControls):
             except Exception as exc:
                 if self.full_auto_stop.is_set():
                     raise WorkflowError("사용자가 작업을 중지했습니다.") from exc
+                article = None
                 problem = access_error_from_exception(exc)
                 if problem:
                     raise problem from exc
                 attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),
                                  "run_dir": getattr(exc, "run_dir", "")})
+                resume_dir = getattr(exc, "run_dir", "")
+                if resume_dir and (Path(resume_dir) / "manifest.json").is_file():
+                    recovery_config["resume_run_dir"] = str(resume_dir)
+                    pending["resume_run_dir"] = str(resume_dir)
+                    self._save_pending_topic(pending)
                 failed_dir = Path(getattr(exc, "run_dir", ""))
                 if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir():
                     shutil.rmtree(failed_dir, ignore_errors=True)
                 self._write_cycle_attempts(attempts)
-                self._naver_log(f"'{topic}' 이번 회차 제외: {exc}")
+                self._naver_log(f"'{topic}' 주제 유지 · 준비 재개 필요: {exc}")
         if article is None:
-            raise WorkflowError(f"최대 3개 후보 중 {len(attempts)}개를 시도했지만 준비되지 않았습니다. 다음 예약 회차에 다시 조회합니다.")
+            raise WorkflowError(f"확정 주제 '{topic}'의 준비를 {len(attempts)}회 시도했지만 준비되지 않았습니다. 주제를 바꾸지 않고 검토 자료를 보존합니다.", recovery_config.get("resume_run_dir"))
         # Browser publication/draft failures never enter the candidate retry loop.
+        pending["publication_started"] = True
+        pending["run_dir"] = article["run_dir"]
+        self._save_pending_topic(pending)
         result = self._publish_cli_worker(article, config)
         if not result.get("published") and config["publish"]:
             raise RuntimeError("네이버 발행 완료를 확인하지 못했습니다.")
+        (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)
         record = {"topic": topic, "keywords": keywords, "providers": config["steps"],
                   "saved_at": datetime.now().isoformat(timespec="seconds"),
                   "draft_only": config.get("save_draft", False), "completion_action": config.get("completion_label", "자동 발행"),

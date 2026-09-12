@@ -674,6 +674,22 @@ class BlogCliBridge:
                     if conversation_id and not code and emitted_id != conversation_id:
                         raise BlogCliError("invalid_response", "Antigravity가 요청한 대화를 이어갔는지 확인하지 못했습니다.", provider=provider)
                     additions = _denied_public_hosts(output) - hosts
+                    denied = {item.get("action") for event in _events(output) if event.get("event") == "result"
+                              for item in event.get("result", {}).get("denied_actions", []) if isinstance(item, dict)}
+                    if not code and denied and denied <= {"command", "run_command"} and attempt == 0 and emitted_id:
+                        # The task is public research, not shell execution. Continue with
+                        # the supported native readers rather than granting shell access.
+                        conversation_id = emitted_id
+                        self.log("Antigravity command 차단 확인 · 명령 실행 없이 네이티브 검색·페이지 읽기로 1회 이어서 확인합니다.")
+                        request_args = [*args, "--conversation", conversation_id]
+                        resume = ("Continue the original task and original JSON output schema. The command tool was denied. "
+                                  "Do not retry command, run_command, terminal, shell, Python or curl. Use native web search and "
+                                  "read_url_content for public primary sources instead. Do not change permissions. "
+                                  "Use the research already completed. If a claim cannot be verified, identify it in the requested "
+                                  "review metadata; never invent verification. Return the requested JSON, not an explanation of tools.")
+                        request_stdin = (json.dumps({"event": "user", "message": {"role": "user", "content": [
+                            {"type": "text", "text": resume}]}}) + "\n").encode("utf-8")
+                        continue
                     if code or not additions or attempt == 3 or len(hosts | additions) > 64:
                         break
                     if not emitted_id:

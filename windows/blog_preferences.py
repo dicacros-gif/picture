@@ -12,6 +12,7 @@ PROVIDER_LABELS = {
     "antigravity": "Antigravity CLI",
 }
 DEFAULT_ORDER = ["chatgpt", "claude", "antigravity", "chatgpt"]
+STAGE_ROLES = ["작성", "교차 검수", "팩트·최신 정보 보강", "문체 다듬기"]
 SPORTS_BLOCKED_TERMS = [
     "스포츠", "축구", "야구", "농구", "배구", "골프", "선수", "구단", "리그", "경기",
     "올림픽", "월드컵", "KBO", "프리미어리그", "감독 경질", "테니스", "배드민턴",
@@ -74,6 +75,9 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         if legacy_prompt and legacy_prompt.strip() != default_prompt.strip():
             presets.append({"id": "legacy", "name": "이전 글쓰기 프롬프트", "text": legacy_prompt})
     order = value.get("order", DEFAULT_ORDER)
+    object_stages = order if isinstance(order, list) and all(isinstance(p, dict) for p in order) else None
+    if object_stages is not None:
+        order = [p.get("provider") for p in object_stages]
     if not isinstance(order, list) or len(order) != 4 or any(p not in PROVIDER_LABELS for p in order):
         order = DEFAULT_ORDER.copy()
     try:
@@ -85,6 +89,14 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
     models = value.get("models", {})
     if not isinstance(models, dict):
         models = {}
+    stages = value.get("stages", object_stages or [])
+    stages = stages if isinstance(stages, list) else []
+    normalized_stages = []
+    for index, provider in enumerate(order):
+        stage = stages[index] if index < len(stages) and isinstance(stages[index], dict) else {}
+        role = stage.get("role", "팩트·최신 정보 보강" if provider == "antigravity" else STAGE_ROLES[index])
+        normalized_stages.append({"provider": provider, "role": role if role in STAGE_ROLES else STAGE_ROLES[index],
+                                  "model": str(stage.get("model", "")).strip()})
     def threshold(name, default):
         try:
             return max(.1, min(1.0, float(value.get(name, default))))
@@ -94,6 +106,7 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         "prompts": presets, "selected_prompt_id": selected,
         "default_revision": str(value.get("default_revision", "")),
         "order": list(order), "step_count": count,
+        "stages": normalized_stages,
         "review_mode": str(value.get("review_mode", "단계별 교차 검수")),
         "models": {key: str(models.get(key, "")).strip() for key in PROVIDER_LABELS},
         "include_google": value.get("include_google", True) is True,
