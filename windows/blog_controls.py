@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,7 @@ from tkinter.scrolledtext import ScrolledText
 
 from blog_cli_bridge import BlogCliBridge
 from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLES, normalize_preferences,
-                              store_prompt, normalize_blocked_terms, blocked_term_hits)
+                              store_prompt, normalize_blocked_terms, blocked_term_hits, atomic_json_write, save_settings_json)
 from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _related_to_topic
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
@@ -34,6 +35,14 @@ class BlogWorkflowControls(UnattendedControls):
     def _browser_task_busy(self):
         return any(getattr(self, name, False) for name in
                    ("naver_task_active", "full_auto_active", "realtime_task_active", "cli_login_active"))
+
+    def _discard_topic_review(self, value):
+        if not value:
+            return
+        path = Path(value).resolve()
+        root = (self.cli_app_dir / "blog-runs").resolve()
+        if root in path.parents and path.name.startswith("topic-review-") and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
     def _init_cli_controls(self, config_path, app_dir, default_prompt):
         self.cli_config_path, self.cli_app_dir = Path(config_path), Path(app_dir)
@@ -85,9 +94,16 @@ class BlogWorkflowControls(UnattendedControls):
         if pending_path.exists():
             try:
                 pending = json.loads(pending_path.read_text(encoding="utf-8"))
+                prepared = pending.get("prepared_article", {})
                 protected = {Path(p).resolve() for p in (pending.get("resume_run_dir"), pending.get("run_dir"),
-                    pending.get("choice", {}).get("selection_run_dir")) if p}
-            except (ValueError, OSError):
+                    pending.get("choice", {}).get("selection_run_dir"), *prepared.get("auxiliary_dirs", [])) if p}
+                for run_dir in tuple(protected):
+                    request_path = run_dir / "request.json"
+                    if (self.cli_app_dir.resolve() in run_dir.parents and request_path.is_file()):
+                        request = json.loads(request_path.read_text(encoding="utf-8"))
+                        protected.update(Path(item["path"]).resolve().parent
+                            for item in request.get("google_candidates", []) if isinstance(item, dict) and item.get("path"))
+            except (ValueError, OSError, TypeError, AttributeError):
                 return  # Preserve work if its pending receipt cannot be read.
         for parent_name in ("blog-runs", "google-reference-candidates"):
             parent = self.cli_app_dir / parent_name
@@ -95,7 +111,9 @@ class BlogWorkflowControls(UnattendedControls):
                 continue
             for path in parent.iterdir():
                 try:
-                    if path.resolve() not in protected and path.is_dir() and path.stat().st_mtime < cutoff:
+                    resolved = path.resolve()
+                    if (parent.resolve() in resolved.parents and not any(resolved == kept or resolved in kept.parents for kept in protected) and path.is_dir()
+                            and path.stat().st_mtime < cutoff):
                         shutil.rmtree(path)
                 except OSError as exc:
                     self._naver_log(f"7일 경과 산출물 정리 실패 · {path}: {exc}")
@@ -286,13 +304,12 @@ class BlogWorkflowControls(UnattendedControls):
             raise WorkflowError(f"'{topic}' 차단 · 주제 또는 연관어에 차단어 포함: {', '.join(hits)}")
 
     def _persist_cli_preferences(self):
+        if hasattr(self, "_general_settings_snapshot"):
+            self.settings.update(self._general_settings_snapshot())
         self.settings["cli_workflow"] = copy.deepcopy(self.cli_preferences)
         self.settings["auto_interval_hours"] = self.auto_interval_hours.get()
         self.settings["blog_id"] = self.blog_id.get().strip()
-        self.cli_config_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.cli_config_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.cli_config_path)
+        save_settings_json(self.cli_config_path, self.settings)
 
     def save_cli_prompt(self, *, create=False, silent=False):
         try:
@@ -429,7 +446,24 @@ class BlogWorkflowControls(UnattendedControls):
         google = []
         google_folder = None
         search_folder = None
-        if config["include_google"]:
+        if config["include_google"] and config.get("resume_run_dir"):
+            run_dir = Path(config["resume_run_dir"]).resolve()
+            if (self.cli_app_dir / "blog-runs").resolve() in run_dir.parents:
+                try:
+                    request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
+                    for item in request.get("google_candidates", []):
+                        if not isinstance(item, dict) or item.get("english_source_verified") is not True:
+                            continue
+                        path = Path(str(item.get("path", ""))).resolve()
+                        if ((self.cli_app_dir / "google-reference-candidates").resolve() in path.parents and path.is_file()
+                                and item.get("capture_sha256") == hashlib.sha256(path.read_bytes()).hexdigest()):
+                            google.append(item)
+                    google = google[:config.get("google_reference_count", 4)]
+                    if google:
+                        self._naver_log(f"같은 회차의 영어 원문 확인을 마친 Google 후보 {len(google)}장 재사용")
+                except (OSError, ValueError, TypeError, AttributeError):
+                    google = []
+        if config["include_google"] and not google:
             self._naver_log(f"Google 캡처 후보 최대 {config.get('google_reference_count', 4)}장의 화면과 사용 조건을 확인합니다.")
             try:
                 search = workflow.plan_google_image_search(topic, keywords, config["steps"],
@@ -461,7 +495,9 @@ class BlogWorkflowControls(UnattendedControls):
                                    **resume_options)
         article["blog_id"] = config["blog_id"]
         article["source_topic"] = config.get("quality_topic", topic)
-        article["auxiliary_dirs"] = [str(folder) for folder in (google_folder, search_folder) if folder]
+        article["auxiliary_dirs"] = list(dict.fromkeys([
+            *[str(folder) for folder in (google_folder, search_folder) if folder],
+            *[str(Path(item["path"]).resolve().parent) for item in google if item.get("path")]]))
         self.events.put(("cli_article", article))
         return article
 
@@ -564,9 +600,9 @@ class BlogWorkflowControls(UnattendedControls):
                                                                        consumed_keywords, article.get("title", ""))
                 if newly_recorded or confirmed_publication(result):
                     consumed = [article["topic"], *consumed_keywords]
-                    from keyword_database import consume, load_database, save_database
+                    from keyword_database import update_database
                     database_path = self.cli_app_dir / "keywords.json"
-                    save_database(database_path, consume(load_database(database_path), consumed))
+                    update_database(database_path, consumed=consumed)
                     self.events.put(("cli_topic_consumed", article["topic"], consumed))
                     self._naver_log(f"발행 확인 · '{article['topic']}' 키워드를 후보 목록에서 제외했습니다.")
                     if result.get("content_verified", True) is True:
@@ -692,9 +728,9 @@ class BlogWorkflowControls(UnattendedControls):
         groups = self._cli_realtime_groups()
         ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
         if config.get("quality_checks"):
-            ranked = [candidate for candidate in ranked if len(set(candidate.get("keywords", []))) >= 8]
+            ranked = [candidate for candidate in ranked if candidate.get("keywords")]
             if not ranked:
-                raise WorkflowError("소제목 8개에 배치할 실제 연관어가 충분한 후보를 수집 중입니다. 아직 주제를 확정하지 않았습니다.")
+                raise WorkflowError("검색 의도를 확인할 실제 연관어가 있는 미사용 주제를 수집 중입니다.")
         selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         provider = config["steps"][0]
         attempts, article, choice = [], None, None
@@ -713,8 +749,7 @@ class BlogWorkflowControls(UnattendedControls):
             except Exception as exc:
                 problem = access_error_from_exception(exc)
                 if problem: raise problem from exc
-                failed_dir = Path(getattr(exc, "run_dir", ""))
-                if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir(): shutil.rmtree(failed_dir, ignore_errors=True)
+                self._discard_topic_review(getattr(exc, "run_dir", ""))
                 self._naver_log(f"후보 {offset + 1}~{offset + len(batch)} CLI 선정 거절: {exc}")
         if choice is None:
             if not ranked:
@@ -730,10 +765,7 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _save_pending_topic(self, pending):
         path = self.cli_app_dir / "pending-blog-topic.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(pending, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        atomic_json_write(path, pending)
 
     def _complete_selected_topic(self, config, groups, related_by_topic, choice, pending):
         attempts, article = [], None
@@ -769,36 +801,59 @@ class BlogWorkflowControls(UnattendedControls):
                 if hasattr(self, "topic_history") and self.topic_history.is_duplicate(topic, keywords, prepared.get("title", ""),
                         keyword_threshold=config.get("duplicate_keyword_threshold", .4),
                         title_threshold=config.get("duplicate_title_threshold", .5)) is True:
+                    recent = self.topic_history.recent_publications(10)
                     feedback = "같은 검색 주제를 유지하면서 기존 발행 글과 겹치는 제목·관점을 수정하세요. " + json.dumps({
-                        "duplicate_title": prepared.get("title", ""), "recent_publications": self.topic_history.recent_publications(30)}, ensure_ascii=False)
+                        "duplicate_title": str(prepared.get("title", ""))[:120], "recent_publications": [
+                            {"title": str(item.get("title", ""))[:100], "topic": str(item.get("topic", ""))[:60]}
+                            for item in recent[:10]]}, ensure_ascii=False)
                     pending["revision_feedback"] = recovery_config["revision_feedback"] = feedback
                     raise WorkflowError("확정 주제의 원고가 발행 이력과 유사합니다. 같은 주제의 원고 수정이 필요합니다.", Path(prepared["run_dir"]))
                 article = prepared
                 article["source_topic"] = current.get("source_topic", topic)
                 selection_value = current.get("selection_run_dir", "")
-                selection_dir = Path(selection_value) if selection_value else None
+                selection_dir = Path(selection_value).resolve() if selection_value else None
                 if selection_dir is not None and selection_dir.is_dir():
-                    destination = Path(article["run_dir"]) / "topic-review"
-                    if destination.exists(): shutil.rmtree(destination)
-                    shutil.move(str(selection_dir), str(destination))
+                    destination = (Path(article["run_dir"]) / "topic-review").resolve()
+                    root = (self.cli_app_dir / "blog-runs").resolve()
+                    if root in selection_dir.parents and root in destination.parents and selection_dir != destination:
+                        if destination.exists(): shutil.rmtree(destination)
+                        shutil.move(str(selection_dir), str(destination))
                 break
             except Exception as exc:
-                if self.full_auto_stop.is_set():
-                    raise WorkflowError("사용자가 작업을 중지했습니다.") from exc
                 article = None
-                problem = access_error_from_exception(exc)
-                if problem:
-                    raise problem from exc
-                attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),
-                                 "run_dir": getattr(exc, "run_dir", "")})
                 resume_dir = getattr(exc, "run_dir", "")
                 if resume_dir and (Path(resume_dir) / "manifest.json").is_file():
                     recovery_config["resume_run_dir"] = str(resume_dir)
                     pending["resume_run_dir"] = str(resume_dir)
                     self._save_pending_topic(pending)
-                failed_dir = Path(getattr(exc, "run_dir", ""))
-                if failed_dir.name.startswith("topic-review-") and failed_dir.is_dir():
-                    shutil.rmtree(failed_dir, ignore_errors=True)
+                if self.full_auto_stop.is_set():
+                    raise WorkflowError("사용자가 작업을 중지했습니다.", resume_dir or recovery_config.get("resume_run_dir")) from exc
+                problem = access_error_from_exception(exc)
+                if problem:
+                    raise problem from exc
+                if resume_dir:
+                    try:
+                        failed = json.loads((Path(resume_dir) / "manifest.json").read_text(encoding="utf-8"))
+                        flags = ("approved", "facts_verified", "sources_verified", "search_intent_satisfied", "natural_korean")
+                        rejected = [item.get("review", {}) for item in failed.get("final_review_attempts", [])
+                            if isinstance(item, dict) and isinstance(item.get("review"), dict)
+                            and (any(item["review"].get(flag) is not True for flag in flags) or item["review"].get("issues"))]
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        rejected = []
+                    if rejected:
+                        pending["revision_number"] = int(pending.get("revision_number", 0)) + 1
+                        issues = [str(issue)[:240] for review in rejected[-2:] for issue in review.get("issues", [])][:8]
+                        missing_flags = sorted({flag for review in rejected[-2:] for flag in flags if review.get(flag) is not True})
+                        feedback = ("확정 주제를 유지하고 아래 최종 검수 지적만 근거에 맞게 수정하세요. "
+                            "확인되지 않은 사실을 단정하거나 검수 통과를 꾸미지 마세요. " + json.dumps({
+                                "revision": pending["revision_number"], "issues": issues, "unverified_checks": missing_flags,
+                                "title": str(failed.get("title", ""))[:120]}, ensure_ascii=False))
+                        pending["revision_feedback"] = recovery_config["revision_feedback"] = feedback
+                        self._save_pending_topic(pending)
+                        self._naver_log("최종 검수 지적을 같은 주제의 원고 수정에 반영합니다.")
+                attempts.append({"topic": topic, "stage": "prepare", "error": str(exc),
+                                 "run_dir": resume_dir})
+                self._discard_topic_review(getattr(exc, "run_dir", ""))
                 self._write_cycle_attempts(attempts)
                 self._naver_log(f"'{topic}' 주제 유지 · 준비 재개 필요: {exc}")
         if article is None:
@@ -809,26 +864,29 @@ class BlogWorkflowControls(UnattendedControls):
         pending["publication_started"] = False
         pending["run_dir"] = article["run_dir"]
         self._save_pending_topic(pending)
-        if pending.get("confirmed_receipt"):
+        if isinstance(pending.get("completion_result"), dict):
+            result = pending["completion_result"]
+            self._naver_log("완료한 회차의 저장 처리를 이어갑니다. 네이버 작업은 반복하지 않습니다.")
+        elif pending.get("confirmed_receipt"):
             result = self._record_cli_publication(article, config, pending["confirmed_receipt"])
         else:
             result = self._publish_cli_worker(article, config)
         if not result.get("published") and config["publish"]:
             raise RuntimeError("네이버 발행 완료를 확인하지 못했습니다.")
-        (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)
+        pending["completion_result"] = copy.deepcopy(result)
+        pending["phase"] = "completed"
+        self._save_pending_topic(pending)
         record = {"topic": topic, "keywords": keywords, "providers": config["steps"],
+                  "source_topic": article.get("source_topic", topic), "title": article.get("title", ""),
                   "saved_at": datetime.now().isoformat(timespec="seconds"),
                   "draft_only": config.get("save_draft", False), "completion_action": config.get("completion_label", "자동 발행"),
                   "run_dir": article["run_dir"], "publication": result}
-        self.auto_history = [*self.auto_history, record][-200:]
+        self.auto_history = [*[item for item in self.auto_history if item.get("run_dir") != article["run_dir"]], record][-200:]
         history = self.cli_app_dir / "automation-history.json"
-        history.write_text(json.dumps(self.auto_history, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_json_write(history, self.auto_history)
+        (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)
         self._naver_log(f"'{topic}' 회차 완료 · {config.get('completion_label', '자동 발행')}")
 
     def _write_cycle_attempts(self, attempts):
         path = self.cli_app_dir / "last-cycle-attempts.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"updated_at": datetime.now().isoformat(timespec="seconds"),
-                                         "attempts": attempts}, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        atomic_json_write(path, {"updated_at": datetime.now().isoformat(timespec="seconds"), "attempts": attempts})

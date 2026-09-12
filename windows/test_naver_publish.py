@@ -5,6 +5,7 @@ import io
 import json
 import re
 import tempfile
+import subprocess
 import unittest
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -12,7 +13,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from PIL import Image
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
 
 from naver_automation import NaverAutomation
 from blog_visual_style import IMAGE_POLICY
@@ -582,6 +583,26 @@ class PublishTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CC0"):
             self.app._validate_publish_article(self.article)
 
+    def test_public_domain_file_template_is_validated_again_before_publication(self):
+        self._append_google_images(1)
+        item = self.article["images"][-1]
+        source = ReferenceLicenseTests.source
+        image = ReferenceLicenseTests.image
+        item.update(NaverAutomation._commons_license_evidence(source, image, {
+            "original_file_present": True, "license_links": [], "public_domain_templates": [{
+                "name": "Public domain", "link_required": "false", "attribution_required": "false"}]}))
+        item.update(source_url=source, image_url=image)
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 7)
+        for changes in ({"license_evidence_type": "search_result"}, {"public_domain_template": {}},
+                        {"source_url": "https://example.com/File:Example.jpg"},
+                        {"image_url": image.replace("Example", "Unrelated")},
+                        {"license_evidence_url": source + "?other"},
+                        {"license_url": source + "#Other"}):
+            bad = copy.deepcopy(self.article)
+            bad["images"][-1].update(changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "CC0"):
+                self.app._validate_publish_article(bad)
+
     def test_public_markdown_and_source_urls_are_rejected(self):
         for text in ["**강조** 본문", "# 소제목", "출처 https://example.com/source"]:
             self.article["paragraphs"][0] = text
@@ -692,6 +713,145 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(NaverAutomation.inspect_published_naver_article(self.app, "testblog", self.article)["verified"])
 
 
+class CommentSubmissionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.app = NaverAutomation(self.root, lambda _: None)
+        self.driver = MagicMock(current_url="https://blog.naver.com/neighbor/123456789012")
+        self.phrase = "정성스러운 글 잘 읽었습니다."
+        self.record = {"id": "200", "author": "https://blog.naver.com/owner", "text": self.phrase}
+        self.mocks = {}
+        values = {"_fill_comment_editor": MagicMock(), "_comment_records": [{"id": "100"}],
+                  "_visible_comment_upload": MagicMock(), "_visible_comment_editor": MagicMock(),
+                  "_comment_editor_value": self.phrase, "_new_comment_record": self.record}
+        for name, value in values.items():
+            handle = patch.object(NaverAutomation, name, return_value=value)
+            self.mocks[name] = handle.start()
+            self.addCleanup(handle.stop)
+        handle = patch("naver_automation.WebDriverWait", ImmediateWait)
+        handle.start()
+        self.addCleanup(handle.stop)
+
+    def test_uncertain_comment_survives_restart_and_never_submits_new_random_phrase(self):
+        self.mocks["_new_comment_record"].return_value = None
+        with self.assertRaisesRegex(RuntimeError, "등록을 시도"):
+            self.app._submit_comment_once(self.driver, self.phrase, "owner")
+        receipt_path = next((self.root / "comment_receipts").glob("*.json"))
+        self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["status"], "uncertain")
+        restarted = NaverAutomation(self.root, lambda _: None)
+        self.driver.current_url = "https://m.blog.naver.com/PostView.naver?logNo=123456789012&blogId=neighbor"
+        with self.assertRaisesRegex(RuntimeError, "이전 댓글 등록 결과"):
+            restarted._submit_comment_once(self.driver, "새로운 랜덤 문구", "owner")
+        self.driver.execute_script.assert_called_once()
+        self.mocks["_fill_comment_editor"].assert_called_once()
+        self.mocks["_new_comment_record"].assert_called_with(self.driver, {"100"}, self.phrase, "owner", "")
+        self.mocks["_new_comment_record"].return_value = self.record
+        result = restarted._submit_comment_once(self.driver, "새로운 랜덤 문구", "owner")
+        self.assertTrue(result["reused_receipt"])
+        self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["status"], "confirmed")
+        self.driver.execute_script.assert_called_once()
+
+    def test_comment_receipt_is_durable_before_click_and_success_is_reusable(self):
+        def click(*_):
+            receipt = json.loads(next((self.root / "comment_receipts").glob("*.json")).read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "uncertain")
+            self.assertEqual(receipt["before_ids"], ["100"])
+        self.driver.execute_script.side_effect = click
+        self.app._submit_comment_once(self.driver, self.phrase, "owner", "parent123")
+        result = self.app._submit_comment_once(self.driver, "다음 문구", "owner", "parent123")
+        self.assertTrue(result["reused_receipt"])
+        self.driver.execute_script.assert_called_once()
+
+    def test_stop_during_comment_entry_or_upload_wait_prevents_submission(self):
+        for target in ("_fill_comment_editor", "_visible_comment_upload"):
+            with self.subTest(target=target):
+                self.app.reset_stop()
+                self.mocks[target].side_effect = lambda *_: (self.app.stop_event.set() or MagicMock())
+                with self.assertRaisesRegex(RuntimeError, "중지"):
+                    self.app._submit_comment_once(self.driver, self.phrase, "owner")
+                self.mocks[target].side_effect = None
+                self.driver.execute_script.assert_not_called()
+                self.assertFalse((self.root / "comment_receipts").exists())
+
+    def test_early_comment_failure_remains_retryable_and_corrupt_receipt_does_not_click(self):
+        self.mocks["_fill_comment_editor"].side_effect = RuntimeError("editor missing")
+        with self.assertRaises(RuntimeError):
+            self.app._submit_comment_once(self.driver, self.phrase, "owner")
+        self.assertFalse((self.root / "comment_receipts").exists())
+        self.mocks["_fill_comment_editor"].side_effect = None
+        self.app._submit_comment_once(self.driver, self.phrase, "owner")
+        path = next((self.root / "comment_receipts").glob("*.json"))
+        path.write_text("{broken", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "이전 댓글 등록 기록"):
+            self.app._submit_comment_once(self.driver, self.phrase, "owner")
+        self.driver.execute_script.assert_called_once()
+
+    def test_stopped_comment_workers_do_not_clear_stop_or_open_browser(self):
+        self.app._driver = MagicMock()
+        self.app.stop_event.set()
+        self.app.run_own_posts("owner", 3, 1)
+        self.app.run_neighbor_posts("owner", 1, 2)
+        self.assertTrue(self.app.stop_event.is_set())
+        self.app._driver.assert_not_called()
+
+    def test_existing_reply_uses_exact_author_identity(self):
+        comment, reply, profile = MagicMock(), MagicMock(), MagicMock()
+        comment.find_elements.return_value = [reply]
+        reply.find_elements.return_value = [profile]
+        for href, expected in (("https://blog.naver.com/owner_other", False),
+                               ("https://example.com/owner", False),
+                               ("https://blog.naver.com/OWNER", True),
+                               ("https://m.blog.naver.com/PostList.naver?blogId=owner", True)):
+            with self.subTest(href=href):
+                profile.get_attribute.return_value = href
+                self.assertIs(NaverAutomation._own_reply_exists(comment, "owner"), expected)
+
+
+class WhaleOwnershipTests(unittest.TestCase):
+    def test_command_profile_must_be_exact_even_with_quoted_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="blog owner ") as folder:
+            app = NaverAutomation(Path(folder), lambda _: None)
+            profile = (Path(folder) / "naver-whale-profile").resolve()
+            base = [r"C:\Program Files\Naver\whale.exe", f"--user-data-dir={profile}", "--remote-debugging-port=9222"]
+            self.assertEqual(app._owned_whale_command_port(subprocess.list2cmdline(base)), 9222)
+            cases = [base[:1] + [f"--user-data-dir={profile}-other", base[2]],
+                     base + [f"--user-data-dir={profile}-other"],
+                     base + ["--type=renderer"],
+                     [base[0], f"--user-agent=fake --user-data-dir={profile}", base[2]],
+                     [base[0], base[1], "--remote-debugging-port=65536"]]
+            for command in cases:
+                with self.subTest(command=command):
+                    self.assertIsNone(app._owned_whale_command_port(subprocess.list2cmdline(command)))
+            separated = [base[0], "--user-data-dir", str(profile), "--remote-debugging-port", "9222"]
+            self.assertEqual(app._owned_whale_command_port(subprocess.list2cmdline(separated)), 9222)
+
+    def test_other_profiles_ports_and_processes_are_never_probed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = NaverAutomation(Path(folder), lambda _: None)
+            profile = Path(folder) / "naver-whale-profile"
+            processes = [{"ProcessId": pid, "CommandLine": subprocess.list2cmdline([
+                r"C:\Whale\whale.exe", f"--user-data-dir={location}", f"--remote-debugging-port={port}"])}
+                for pid, location, port in [(11, profile.with_name("other-task"), 9221), (22, profile, 9222)]]
+            ports = "\n".join(f"TCP 127.0.0.1:{port} 0.0.0.0:0 LISTENING {pid}" for pid, port in [(11, 9221), (22, 9333), (22, 9222)])
+            response = MagicMock()
+            response.json.return_value = {"Browser": "Chrome/150.0.1.2", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/id"}
+            with patch("naver_automation.subprocess.run", side_effect=[MagicMock(stdout=ports), MagicMock(stdout=json.dumps(processes))]), \
+                 patch("naver_automation.requests.get", return_value=response) as request:
+                self.assertEqual(app._find_running_automation_whale(), (9222, "150.0.1.2"))
+            request.assert_called_once_with("http://127.0.0.1:9222/json/version", timeout=1)
+
+    def test_missing_process_command_line_never_attaches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = NaverAutomation(Path(folder), lambda _: None)
+            ports = "TCP 127.0.0.1:9222 0.0.0.0:0 LISTENING 22"
+            with patch("naver_automation.subprocess.run", side_effect=[MagicMock(stdout=ports), MagicMock(stdout='[{"ProcessId":22,"CommandLine":null}]')]), \
+                 patch("naver_automation.requests.get") as request:
+                self.assertIsNone(app._find_running_automation_whale())
+            request.assert_not_called()
+
+
 class ReferenceLicenseTests(unittest.TestCase):
     source = "https://commons.wikimedia.org/wiki/File:Example.jpg"
     image = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Example.jpg/800px-Example.jpg"
@@ -791,6 +951,35 @@ class ReferenceLicenseTests(unittest.TestCase):
         self.assertEqual(NaverAutomation._reference_source_url([self.source]), self.source)
         self.assertEqual(NaverAutomation._reference_source_url(["https://example.com/image.jpg"]), "")
 
+    def test_localized_creative_commons_deeds_preserve_license_conditions(self):
+        for slug, required in (("publicdomain/zero/1.0", False),
+                               ("publicdomain/mark/1.0", False), ("licenses/by/4.0", True)):
+            with self.subTest(slug=slug):
+                result = self.evidence(license_links=[f"https://creativecommons.org/{slug}/deed.en"])
+                self.assertTrue(result["license_verified"])
+                self.assertEqual(result["license_url"], f"https://creativecommons.org/{slug}/")
+                self.assertIs(result["attribution_required"], required)
+        for value in ("https://creativecommons.org/licenses/by-sa/4.0/deed.en",
+                      "https://creativecommons.org/publicdomain/zero/1.0/unrelated",
+                      "https://creativecommons.org.example.com/publicdomain/zero/1.0/deed.en"):
+            self.assertFalse(self.evidence(license_links=[value])["license_verified"])
+
+    def test_public_domain_template_requires_explicit_file_terms_and_matching_original(self):
+        template = {"name": "Public domain", "link_required": "false", "attribution_required": "false"}
+        page = {"original_file_present": True, "license_links": [], "public_domain_templates": [template]}
+        result = NaverAutomation._commons_license_evidence(self.source, self.image, page)
+        self.assertTrue(result["license_verified"])
+        self.assertEqual(result["license_url"], self.source + "#Licensing")
+        self.assertEqual(result["public_domain_template"], template)
+        for field, value in (("name", "Free use"), ("name", "CC BY 4.0"),
+                             ("link_required", "true"), ("attribution_required", "true"),
+                             ("attribution_required", "")):
+            with self.subTest(field=field, value=value):
+                invalid = {**page, "public_domain_templates": [{**template, field: value}]}
+                self.assertFalse(NaverAutomation._commons_license_evidence(self.source, self.image, invalid)["license_verified"])
+        self.assertFalse(NaverAutomation._commons_license_evidence(self.source, self.image.replace("Example", "Other"), page)["license_verified"])
+        self.assertFalse(NaverAutomation._commons_license_evidence(self.source, self.image, {**page, "original_file_present": False})["license_verified"])
+
     def test_preview_resize_preserves_entire_aspect_ratio(self):
         source = Image.new("RGB", (400, 600), "white")
         enlarged = NaverAutomation._gently_enhance_google_image(source)
@@ -805,6 +994,8 @@ class ReferenceLicenseTests(unittest.TestCase):
             app._inspect_reference_license = MagicMock(return_value={"license_verified": False, "license_url": "", "attribution": ""})
             thumbnails = [MagicMock() for _ in range(3)]
             previews = [MagicMock() for _ in range(3)]
+            loading_placeholder = MagicMock()
+            loading_placeholder.is_displayed.side_effect = StaleElementReferenceException("Google replaced placeholder")
             selection = {"index": 0}
             for index, (thumb, preview) in enumerate(zip(thumbnails, previews)):
                 thumb.is_displayed.return_value = True
@@ -815,7 +1006,7 @@ class ReferenceLicenseTests(unittest.TestCase):
                 Image.new("RGB", (400, 240), (index * 30, 50, 70)).save(buffer, "PNG")
                 preview.screenshot_as_png = buffer.getvalue()
             def find_elements(_by, selector):
-                return thumbnails if selector == "img.YQ4gaf, img.rg_i, div[data-ri] img" else [previews[selection["index"]]]
+                return thumbnails if "div[data-img-wrapper]" in selector else [loading_placeholder, previews[selection["index"]]]
             def script(source, *arguments):
                 if "scrollIntoView" in source:
                     selection["index"] = thumbnails.index(arguments[0])
@@ -834,18 +1025,21 @@ class ReferenceLicenseTests(unittest.TestCase):
             self.assertTrue(all(item["license_verified"] is False and item["vision_reviewed"] is False for item in candidates))
             self.assertTrue(all(item["capture_width"] == 400 for item in candidates))
             self.assertTrue(all(Path(item["path"]).is_file() for item in candidates))
+            self.assertTrue(all(item["capture_sha256"] == hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+                                for item in candidates))
             download.assert_not_called()
 
     def test_reuse_only_skips_ineligible_results_and_stops_after_sixty_candidates(self):
         reusable = {"license_verified": True, "commercial_use_allowed": True, "modification_allowed": True,
                     "attribution_required": False, "share_alike": False,
                     "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"}
-        scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [3, 4], 4, 2, False),
-                     ([{}] * 61, [], 60, 4, False),
-                     ([reusable] * 12, list(range(1, 11)), 10, 20, False),
+        scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [3, 4], 4, 2, False, 0),
+                     ([{}] * 61, [], 60, 4, False, 0),
+                     ([reusable] * 12, list(range(1, 11)), 10, 20, False, 0),
+                     ([reusable], [62], 1, 1, False, 61),
                      ([{**reusable, "english_source_verified": False},
-                       {**reusable, "english_source_verified": True, "source_language": "en"}], [2], 2, 1, True)]
-        for rights, expected_ranks, expected_checks, requested, english in scenarios:
+                       {**reusable, "english_source_verified": True, "source_language": "en"}], [2], 2, 1, True, 0)]
+        for rights, expected_ranks, expected_checks, requested, english, small_count in scenarios:
             with self.subTest(expected_ranks=expected_ranks), tempfile.TemporaryDirectory() as folder:
                 app = NaverAutomation(Path(folder), lambda _: None)
                 driver = MagicMock()
@@ -861,7 +1055,11 @@ class ReferenceLicenseTests(unittest.TestCase):
                 for thumb in thumbnails:
                     thumb.is_displayed.return_value = True
                     thumb.rect = {"width": 200, "height": 150}
-                driver.find_elements.side_effect = lambda _by, selector: thumbnails if selector.startswith("img.YQ4gaf") else [preview]
+                small_icons = [MagicMock() for _ in range(small_count)]
+                for icon in small_icons:
+                    icon.is_displayed.return_value = True
+                    icon.rect = {"width": 45, "height": 45}
+                driver.find_elements.side_effect = lambda _by, selector: small_icons + thumbnails if "div[data-img-wrapper]" in selector else [preview]
                 def script(source, *arguments):
                     if "scrollIntoView" in source:
                         selection["index"] = thumbnails.index(arguments[0])
@@ -878,6 +1076,9 @@ class ReferenceLicenseTests(unittest.TestCase):
                                                                        reuse_only=True, english_only=english)
                 self.assertEqual([item["search_rank"] for item in captured], expected_ranks)
                 self.assertEqual(app._inspect_reference_license.call_count, expected_checks)
+                diagnostics = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+                self.assertEqual(diagnostics["scanned_count"], expected_checks)
+                self.assertEqual(diagnostics["rejection_counts"].get("thumbnail_too_small", 0), small_count)
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
                 self.assertEqual(query["q"], [keyword + " site:commons.wikimedia.org"])
                 if english:

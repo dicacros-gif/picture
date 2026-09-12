@@ -1,0 +1,164 @@
+import json
+import hashlib
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+import test_blog_controls as ui_support
+import test_process_resume as resume_support
+from blog_cli_bridge import BlogCliError
+from blog_controls import BlogWorkflowControls
+from blog_preferences import atomic_json_write
+from blog_runtime import CliAccessRequired
+from blog_workflow import WorkflowError
+
+
+class InterruptedPreparationTests(unittest.TestCase):
+    cycle = resume_support.ProcessResumeTests.cycle
+
+    def test_stop_and_auth_failure_keep_run_pointer_before_exit(self):
+        for failure in ('stop', 'auth'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+                app, config = self.cycle(folder)
+                workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+                run_dir = Path(folder) / 'blog-runs' / 'in-progress'
+                run_dir.mkdir(parents=True)
+                atomic_json_write(run_dir / 'manifest.json', {'ready_to_publish': False})
+                def fail(*_):
+                    error = WorkflowError('일시 중단', run_dir)
+                    if failure == 'stop':
+                        app.full_auto_stop.set()
+                    else:
+                        error.__cause__ = BlogCliError('authentication_required', '로그인 필요', provider='antigravity')
+                    raise error
+                app._prepare_cli_worker.side_effect = fail
+                with self.assertRaises((WorkflowError, CliAccessRequired)):
+                    app._cli_automation_cycle(config)
+                pending = json.loads((Path(folder) / 'pending-blog-topic.json').read_text(encoding='utf-8'))
+                self.assertEqual(pending['resume_run_dir'], str(run_dir))
+                app.full_auto_stop.clear()
+                app._prepare_cli_worker.side_effect = None
+                app._prepare_cli_worker.return_value = {'topic': 'A', 'run_dir': str(run_dir)}
+                app._cli_automation_cycle(config)
+                self.assertEqual(app._prepare_cli_worker.call_args.args[2]['resume_run_dir'], str(run_dir))
+                workflow.return_value.select_topic.assert_called_once()
+
+    def test_completion_history_write_failure_does_not_repeat_saved_draft(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            config.update(publish=False, save_draft=True)
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            app._publish_cli_worker.return_value = {'status': 'draft', 'saved': True, 'published': False}
+            def failing_write(path, value):
+                if Path(path).name == 'automation-history.json':
+                    raise OSError('이력 파일 일시 잠금')
+                atomic_json_write(path, value)
+            with patch('blog_controls.atomic_json_write', side_effect=failing_write), self.assertRaises(OSError):
+                app._cli_automation_cycle(config)
+            pending = json.loads((Path(folder) / 'pending-blog-topic.json').read_text(encoding='utf-8'))
+            self.assertEqual(pending['phase'], 'completed')
+            self.assertTrue(pending['completion_result']['saved'])
+            app._cli_automation_cycle(config)
+            app._publish_cli_worker.assert_called_once()
+            app._prepare_cli_worker.assert_called_once()
+            self.assertEqual(len(app.auto_history), 1)
+            self.assertFalse((Path(folder) / 'pending-blog-topic.json').exists())
+
+    def test_final_approved_flag_does_not_hide_failed_fact_gate(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            run_dir = Path(folder) / 'blog-runs' / 'facts-rejected'
+            atomic_json_write(run_dir / 'manifest.json', {'final_review_attempts': [{'review': {
+                'approved': True, 'facts_verified': False, 'sources_verified': True,
+                'search_intent_satisfied': True, 'natural_korean': True, 'issues': []}}]})
+            app._prepare_cli_worker.side_effect = [WorkflowError('사실 확인 거절', run_dir),
+                {'topic': 'A', 'run_dir': str(run_dir)}]
+            app._cli_automation_cycle(config)
+            self.assertIn('facts_verified', app._prepare_cli_worker.call_args.args[2]['revision_feedback'])
+            self.assertEqual(app._prepare_cli_worker.call_count, 2)
+            self.assertEqual(len(app.auto_history), 1)
+            self.assertFalse((Path(folder) / 'pending-blog-topic.json').exists())
+
+    def test_few_real_related_keywords_are_comparable_candidates(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            config['quality_checks'] = True
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            app._cli_automation_cycle(config)
+            self.assertEqual(len(workflow.return_value.select_topic.call_args.args[0]), 4)
+            app._publish_cli_worker.assert_called_once()
+
+    def test_failed_final_audit_is_returned_as_bounded_same_topic_revision(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.cycle(folder)
+            workflow.return_value.select_topic.return_value = {'topic': 'A', 'keywords': ['A 방법']}
+            run_dir = Path(folder) / 'blog-runs' / 'final-rejected'
+            atomic_json_write(run_dir / 'manifest.json', {'title': 'A 제목',
+                'final_review_attempts': [{'review': {'approved': False, 'issues': ['확인되지 않은 금액 ' * 600]}}]})
+            app._prepare_cli_worker.side_effect = [WorkflowError('최종 사실 거절', run_dir),
+                {'topic': 'A', 'run_dir': str(run_dir)}]
+            app._cli_automation_cycle(config)
+            second = app._prepare_cli_worker.call_args.args[2]
+            self.assertEqual(second['resume_run_dir'], str(run_dir))
+            self.assertIn('확인되지 않은 금액', second['revision_feedback'])
+            self.assertLessEqual(len(second['revision_feedback']), 4000)
+            self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ['A', 'A'])
+            app._publish_cli_worker.assert_called_once()
+
+
+class GoogleCandidateReuseTests(unittest.TestCase):
+    def test_resume_reuses_english_source_candidates_without_new_search(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app = ui_support.BlogUiTests.make_app(self, folder, {})
+            app._preflight_cli_accounts = Mock()
+            app.naver_bot = Mock()
+            run_dir = Path(folder) / 'blog-runs' / 'pending'
+            image_dir = Path(folder) / 'google-reference-candidates' / 'kept'
+            image_dir.mkdir(parents=True)
+            photo = image_dir / 'original.png'
+            photo.write_bytes(b'candidate fixture')
+            candidate = {'path': str(photo), 'english_source_verified': True, 'source_language': 'en',
+                         'capture_sha256': hashlib.sha256(photo.read_bytes()).hexdigest()}
+            atomic_json_write(run_dir / 'request.json', {'google_candidates': [candidate]})
+            workflow.return_value.prepare.return_value = {'topic': '전기요금', 'run_dir': str(run_dir)}
+            config = {'steps': ['chatgpt'], 'models': {}, 'include_google': True, 'base_prompt': '지침',
+                      'review_mode': '단계별 교차 검수', 'blog_id': 'owner', 'resume_run_dir': str(run_dir)}
+            article = app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            app.naver_bot.capture_google_reference_candidates.assert_not_called()
+            workflow.return_value.plan_google_image_search.assert_not_called()
+            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], [candidate])
+            self.assertIn(str(image_dir), article['auxiliary_dirs'])
+            photo.write_bytes(b'replaced content must not inherit reuse evidence')
+            workflow.return_value.plan_google_image_search.return_value = {'query': 'Korean home electricity saving'}
+            app.naver_bot.capture_google_reference_candidates.return_value = []
+            app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            app.naver_bot.capture_google_reference_candidates.assert_called_once()
+
+    def test_cleanup_preserves_pending_google_original_and_auxiliary_folder(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = object.__new__(BlogWorkflowControls)
+            app.cli_app_dir, app._naver_log = Path(folder), Mock()
+            run = Path(folder) / 'blog-runs' / 'pending'
+            source = Path(folder) / 'google-reference-candidates' / 'needed'
+            auxiliary = Path(folder) / 'blog-runs' / 'search-query'
+            expired = Path(folder) / 'blog-runs' / 'expired'
+            for directory in (run, source, auxiliary, expired):
+                directory.mkdir(parents=True)
+            atomic_json_write(run / 'request.json', {'google_candidates': [{'path': str(source / 'photo.png')}]})
+            atomic_json_write(Path(folder) / 'pending-blog-topic.json', {'resume_run_dir': str(run),
+                'prepared_article': {'auxiliary_dirs': [str(auxiliary)]}})
+            old = time.time() - 9 * 86400
+            for directory in (run, source, auxiliary, expired):
+                os.utime(directory, (old, old))
+            app._cleanup_stale_artifacts()
+            for directory in (run, source, auxiliary):
+                self.assertTrue(directory.exists())
+            self.assertFalse(expired.exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

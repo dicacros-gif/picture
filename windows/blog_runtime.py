@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ctypes
+from contextlib import contextmanager
+import errno
 import os
 import subprocess
 import sys
@@ -11,6 +13,50 @@ from tkinter import BooleanVar, Toplevel, ttk
 
 from blog_cli_bridge import BlogCliBridge, BlogCliError
 from blog_preferences import PROVIDER_LABELS
+
+
+class ApplicationAlreadyRunning(RuntimeError):
+    pass
+
+
+@contextmanager
+def application_instance_lock(app_dir):
+    """One application per data directory, including differently named executables."""
+    directory = Path(app_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    stream = (directory / "blog-instance.lock").open("a+b")
+    acquired = False
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise
+            raise ApplicationAlreadyRunning("Blog가 이미 실행 중입니다. 실행 중인 창을 사용하거나 종료한 뒤 다시 실행하세요.") from exc
+        yield
+    finally:
+        try:
+            if acquired:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
 
 
 class CliAccessRequired(RuntimeError):

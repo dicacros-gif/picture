@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import tempfile
+import time
 import unicodedata
 from pathlib import Path
 
@@ -102,31 +105,51 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
     caption_style = {"caption_band_height": 0, "caption_text_color": "", "caption_background_color": "", "caption_font": ""}
     with Image.open(source) as original:
         oriented = ImageOps.exif_transpose(original)
-        if "A" in oriented.getbands():
+        if "A" in oriented.getbands() or "transparency" in oriented.info:
             canvas = Image.new("RGBA", oriented.size, "white")
             canvas.alpha_composite(oriented.convert("RGBA"))
             pixels = canvas.convert("RGB")
         else:
             pixels = oriented.convert("RGB")
+        # Crop the cover first, then size the delivered square. Resizing the
+        # landscape source first left a requested 2048px cover only 1152px wide.
+        if headline:
+            side = min(pixels.size)
+            left, top = (pixels.width - side) // 2, (pixels.height - side) // 2
+            pixels = pixels.crop((left, top, left + side, top + side))
         if max(pixels.size) < target_long_side:
             scale = target_long_side / max(pixels.size)
             pixels = pixels.resize((round(pixels.width * scale), round(pixels.height * scale)), Image.Resampling.LANCZOS)
         cover_color = ""
         if headline:
-            side = min(pixels.size)
-            left, top = (pixels.width - side) // 2, (pixels.height - side) // 2
-            pixels = pixels.crop((left, top, left + side, top + side))
             pixels, cover_color = _draw_cover(pixels, headline, font_path)
         if caption:
             pixels, caption_style = _draw_caption(pixels, caption, font_path)
         # Retain the source file and generation history separately from the upload copy.
         clean = Image.frombytes("RGB", pixels.size, pixels.tobytes())
         destination.parent.mkdir(parents=True, exist_ok=True)
-        clean.save(destination, format="JPEG", quality=95, subsampling=0, optimize=True)
-    with Image.open(destination) as verified:
-        if verified.getexif() or any(key.lower() in {"exif", "xmp", "icc_profile", "software", "comment"} for key in verified.info):
-            raise RuntimeError("업로드 사본의 메타데이터 정리를 확인하지 못했습니다.")
-        width, height = verified.size
+        descriptor, temporary_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=destination.parent)
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            clean.save(temporary, format="JPEG", quality=95, subsampling=0, optimize=True)
+            with Image.open(temporary) as verified:
+                verified.load()
+                if verified.getexif() or any(key.lower() in {"exif", "xmp", "icc_profile", "software", "comment"} for key in verified.info):
+                    raise RuntimeError("업로드 사본의 메타데이터 정리를 확인하지 못했습니다.")
+                width, height = verified.size
+            with temporary.open("rb+") as stream:
+                os.fsync(stream.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, destination)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(.05 * (attempt + 1))
+        finally:
+            temporary.unlink(missing_ok=True)
     return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
             "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "metadata_stripped": True,
             "delivery_format": "JPEG", "image_style": "photorealistic",

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv
+import ctypes
 import io
 import hashlib
 import json
@@ -941,7 +941,7 @@ class NaverAutomation:
     def _launch_whale_legacy(self) -> tuple[int, str]:
         whale = self._find_whale()
         port = self._free_port()
-        profile = self.data_dir / "naver-whale-profile"
+        profile = (self.data_dir / "naver-whale-profile").resolve()
         profile.mkdir(parents=True, exist_ok=True)
         command = [
             str(whale),
@@ -968,10 +968,11 @@ class NaverAutomation:
                     return port, match.group(1)
             except Exception:
                 time.sleep(0.25)
+        self._stop_whale_process()
         raise RuntimeError("네이버 웨일 자동화 연결을 시작하지 못했습니다.")
 
     def _find_running_automation_whale(self) -> tuple[int, str] | None:
-        """Find a previously launched automation Whale and reuse its CDP port."""
+        """Reuse only the exact app profile and the CDP port owned by that process."""
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             netstat = subprocess.run(
@@ -983,14 +984,12 @@ class NaverAutomation:
                 timeout=10,
                 creationflags=flags,
             )
-            tasklist = subprocess.run(
+            processes = subprocess.run(
                 [
-                    "tasklist",
-                    "/FI",
-                    "IMAGENAME eq whale.exe",
-                    "/FO",
-                    "CSV",
-                    "/NH",
+                    "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    "[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+                    "Get-CimInstance Win32_Process -Filter \"Name='whale.exe'\" | "
+                    "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
                 ],
                 capture_output=True,
                 text=True,
@@ -1002,12 +1001,18 @@ class NaverAutomation:
         except Exception:
             return None
 
-        whale_pids: set[int] = set()
+        owned_endpoints: set[tuple[int, int]] = set()
         try:
-            for row in csv.reader(tasklist.stdout.splitlines()):
-                if len(row) >= 2 and row[0].strip().lower() == "whale.exe":
-                    whale_pids.add(int(row[1].replace(",", "").strip()))
-        except (TypeError, ValueError):
+            rows = json.loads(processes.stdout.lstrip("\ufeff").strip() or "[]")
+            if isinstance(rows, dict):
+                rows = [rows]
+            for row in rows:
+                if not isinstance(row, dict) or type(row.get("ProcessId")) is not int:
+                    continue
+                port = self._owned_whale_command_port(row.get("CommandLine", ""))
+                if port is not None:
+                    owned_endpoints.add((row["ProcessId"], port))
+        except (TypeError, ValueError, AttributeError):
             return None
 
         candidates: list[int] = []
@@ -1017,7 +1022,7 @@ class NaverAutomation:
             re.MULTILINE | re.IGNORECASE,
         ):
             port, pid = int(match.group(1)), int(match.group(2))
-            if pid in whale_pids:
+            if (pid, port) in owned_endpoints:
                 candidates.append(port)
 
         for port in dict.fromkeys(candidates):
@@ -1028,11 +1033,55 @@ class NaverAutomation:
                 ).json()
                 match = re.search(r"Chrome/([\d.]+)", info.get("Browser", ""))
                 websocket = str(info.get("webSocketDebuggerUrl", ""))
-                if match and websocket.startswith("ws://127.0.0.1:"):
+                socket_url = urllib.parse.urlparse(websocket)
+                if match and socket_url.scheme == "ws" and socket_url.hostname == "127.0.0.1" and socket_url.port == port:
                     return port, match.group(1)
             except Exception:
                 continue
         return None
+
+    def _owned_whale_command_port(self, command_line: str) -> int | None:
+        if not isinstance(command_line, str) or not command_line or os.name != "nt":
+            return None
+        # CommandLineToArgvW handles both whole quoted arguments and a quoted
+        # value after '='. A substring search can match an unrelated user-agent.
+        parser = ctypes.WinDLL("shell32", use_last_error=True).CommandLineToArgvW
+        parser.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+        parser.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        release = ctypes.WinDLL("kernel32", use_last_error=True).LocalFree
+        release.argtypes = [ctypes.c_void_p]
+        release.restype = ctypes.c_void_p
+        count = ctypes.c_int()
+        arguments = parser(command_line, ctypes.byref(count))
+        if not arguments:
+            return None
+        try:
+            values = [arguments[index] for index in range(count.value)]
+        finally:
+            release(arguments)
+        if not values or Path(values[0]).name.casefold() != "whale.exe":
+            return None
+        options = {}
+        for index, argument in enumerate(values[1:], 1):
+            name, separator, value = argument.partition("=")
+            if name == "--type":
+                return None
+            if name not in {"--user-data-dir", "--remote-debugging-port"}:
+                continue
+            if name in options:
+                return None
+            options[name] = value if separator else (values[index + 1] if index + 1 < len(values) else "")
+        profile = options.get("--user-data-dir", "")
+        raw_port = options.get("--remote-debugging-port", "")
+        try:
+            expected = (self.data_dir / "naver-whale-profile").resolve()
+            actual = Path(profile)
+            if not profile or not actual.is_absolute() or actual.resolve() != expected:
+                return None
+            port = int(raw_port)
+        except (OSError, ValueError):
+            return None
+        return port if 0 < port < 65536 else None
 
     def _start_whale_instance(
         self,
@@ -1695,7 +1744,9 @@ class NaverAutomation:
             license_parts = urllib.parse.urlparse(str(value))
             if license_parts.hostname != "creativecommons.org":
                 continue
-            license_path = license_parts.path.rstrip("/")
+            # Commons links to localized CC deeds (e.g. /deed.en); these
+            # identify the same canonical license, not a different grant.
+            license_path = re.sub(r"/deed(?:\.[A-Za-z-]+)?$", "", license_parts.path.rstrip("/"))
             public_domain = license_path in {
                 "/publicdomain/zero/1.0", "/publicdomain/mark/1.0"
             }
@@ -1720,7 +1771,47 @@ class NaverAutomation:
                 "attribution_required": by_license,
             })
             break
+        if not result["license_verified"]:
+            for template in page.get("public_domain_templates", []):
+                if not isinstance(template, dict) or template != {
+                    "name": "Public domain", "link_required": "false", "attribution_required": "false"
+                }:
+                    continue
+                # Observed on Commons' NASA files: an explicit, file-specific
+                # PD license template provides machine-readable reuse terms
+                # without linking to a Creative Commons deed.
+                result.update({
+                    "license_verified": True, "license": "Public domain",
+                    "license_url": urllib.parse.urlunparse(source._replace(fragment="Licensing")),
+                    "commercial_use_allowed": True, "modification_allowed": True,
+                    "attribution_required": False, "share_alike": False,
+                    "license_evidence_url": source_url,
+                    "license_evidence_type": "commons_file_public_domain_template",
+                    "license_evidence": "Matching Commons original file and explicit Public domain template; link/attribution not required",
+                    "public_domain_template": dict(template),
+                    "attribution": f"{file_name[1]} · {author or 'Wikimedia Commons'} · {source_url}",
+                })
+                break
         return result
+
+    @staticmethod
+    def _commons_public_domain_license_verified(item: dict) -> bool:
+        """Check the persisted, file-specific PD template evidence at delivery."""
+        source_url = str(item.get("source_url", ""))
+        source = urllib.parse.urlparse(source_url)
+        original = urllib.parse.urlparse(str(item.get("image_url", "")))
+        file_name = urllib.parse.unquote(source.path).split("/wiki/File:", 1)
+        return bool(
+            item.get("license_evidence_type") == "commons_file_public_domain_template"
+            and item.get("license") == "Public domain"
+            and item.get("public_domain_template") == {
+                "name": "Public domain", "link_required": "false", "attribution_required": "false"}
+            and source.scheme == "https" and source.hostname == "commons.wikimedia.org"
+            and len(file_name) == 2 and original.hostname == "upload.wikimedia.org"
+            and file_name[1].replace(" ", "_") in urllib.parse.unquote(original.path).split("/")
+            and item.get("license_evidence_url") == source_url
+            and item.get("license_url") == urllib.parse.urlunparse(source._replace(fragment="Licensing"))
+        )
 
     @staticmethod
     def _reference_language_evidence(page: dict, observed_url: str) -> dict:
@@ -1776,6 +1867,11 @@ class NaverAutomation:
                     ? authorLabel.nextElementSibling.innerText : '',
                   license_links: [...document.querySelectorAll('.licensetpl a[href]')]
                     .map(a => a.href),
+                  public_domain_templates: [...document.querySelectorAll('.licensetpl')].map(e=>({
+                    name:e.querySelector('.licensetpl_short')?.textContent.trim() || '',
+                    link_required:e.querySelector('.licensetpl_link_req')?.textContent.trim() || '',
+                    attribution_required:e.querySelector('.licensetpl_attr_req')?.textContent.trim() || ''
+                  })),
                   document_language: document.documentElement.lang || '',
                   english_description_visible: Boolean(englishDescription),
                   english_description: englishDescription?.innerText || ''
@@ -1824,35 +1920,90 @@ class NaverAutomation:
             search_options["lr"] = "lang_en"
         search_url = "https://www.google.com/search?" + urllib.parse.urlencode(search_options)
         driver.get(search_url)
-        selector = "img.YQ4gaf, img.rg_i, div[data-ri] img"
+        # Current Google image results use unclassified dimg_* images inside
+        # result cards. YQ4gaf now also occurs on tiny suggestion chips.
+        selector = "div[data-img-wrapper] img, div[data-preview-id] img, img.YQ4gaf, img.rg_i, div[data-ri] img"
+        candidates: list[dict] = []
+        diagnostics = {"query": keyword, "english_only": english_only, "reuse_only": reuse_only,
+                       "requested_count": count, "selector": selector, "scan_limit": 60,
+                       "thumbnails_found": 0, "scanned_count": 0, "rejection_counts": {}, "rejections": []}
+        def reject(rank, reason, **observed):
+            counts = diagnostics["rejection_counts"]
+            counts[reason] = counts.get(reason, 0) + 1
+            diagnostics["rejections"].append({"rank": rank, "reason": reason, **observed})
+        def finish(status):
+            diagnostics.update(status=status, captured_count=len(candidates))
+            _save(output_dir / "google_reference_diagnostics.json", diagnostics)
+            _save(output_dir / "google_reference_manifest.json", candidates)
+            counts = ", ".join(f"{key}={value}" for key, value in diagnostics["rejection_counts"].items()) or "없음"
+            self.log(f"Google 참고 이미지 진단 · 검색 요소 {diagnostics['thumbnails_found']}개 · "
+                     f"검토 {diagnostics['scanned_count']}개 · 확보 {len(candidates)}/{count}장 · 제외: {counts}")
         try:
             WebDriverWait(driver, 20).until(lambda d: d.find_elements(By.CSS_SELECTOR, selector))
         except TimeoutException:
+            reject(0, "search_results_missing")
+            finish("no_results")
             self.log("Google 참고 이미지 검색 결과가 없어 생성 이미지로 진행합니다.")
             return []
-        candidates: list[dict] = []
         seen: set[str] = set()
         thumbnails = driver.find_elements(By.CSS_SELECTOR, selector)
-        for rank, thumbnail in enumerate(thumbnails[:60], 1):
+        diagnostics["thumbnails_found"] = len(thumbnails)
+        eligible_thumbnails = []
+        for rank, thumbnail in enumerate(thumbnails, 1):
+            try:
+                if not thumbnail.is_displayed():
+                    reject(rank, "thumbnail_hidden")
+                    continue
+                rect = thumbnail.rect
+                if rect["width"] < 110 or rect.get("height", 0) < 80:
+                    reject(rank, "thumbnail_too_small", width=rect["width"], height=rect.get("height"))
+                    continue
+                element_id = thumbnail.get_attribute("id")
+                eligible_thumbnails.append((rank, thumbnail, element_id if isinstance(element_id, str) else ""))
+            except WebDriverException as exc:
+                reject(rank, "thumbnail_unavailable", error=str(exc)[:300])
+        diagnostics["eligible_thumbnails"] = len(eligible_thumbnails)
+        # The scan budget applies to photographs, not icons preceding them.
+        for rank, thumbnail, element_id in eligible_thumbnails[:60]:
             if self.stop_event.is_set():
+                finish("cancelled")
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
             if len(candidates) >= count:
                 break
+            diagnostics["scanned_count"] += 1
+            stage, preview_observations = "thumbnail", []
             try:
-                if not thumbnail.is_displayed() or thumbnail.rect["width"] < 110:
-                    continue
+                # Opening/closing the preview replaces Google's result nodes.
+                # Resolve the recorded search result again before each click.
+                if element_id:
+                    current = driver.find_elements(By.ID, element_id)
+                    if not current:
+                        reject(rank, "thumbnail_unavailable")
+                        continue
+                    thumbnail = current[0]
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", thumbnail)
+                stage = "preview"
                 def preview_ready(d):
                     viable = []
+                    preview_observations.clear()
                     for element in d.find_elements(By.CSS_SELECTOR, "img.sFlh5c, img.iPVvYb, img.n3VNCb, div[role='dialog'] img"):
-                        if not element.is_displayed():
+                        try:
+                            displayed = element.is_displayed()
+                            info = d.execute_script("""
+                                const e=arguments[0], r=e.getBoundingClientRect();
+                                return {width:e.naturalWidth,height:e.naturalHeight,
+                                  display_width:r.width,display_height:r.height,
+                                  url:e.currentSrc||e.src||'',complete:e.complete};
+                            """, element) if displayed else None
+                        except StaleElementReferenceException:
+                            # Google's preview switches placeholders while the
+                            # full image loads. Poll the new DOM, not a new topic.
                             continue
-                        info = d.execute_script("""
-                            const e=arguments[0], r=e.getBoundingClientRect();
-                            return {width:e.naturalWidth,height:e.naturalHeight,
-                              display_width:r.width,display_height:r.height,
-                              url:e.currentSrc||e.src||'',complete:e.complete};
-                        """, element)
+                        if not info:
+                            continue
+                        if len(preview_observations) < 12:
+                            preview_observations.append({key: info.get(key) for key in
+                                ("width", "height", "display_width", "display_height", "complete")})
                         if (info.get("complete") and info.get("width", 0) >= 640
                                 and info.get("height", 0) >= 360
                                 and info.get("display_width", 0) >= 320
@@ -1861,6 +2012,7 @@ class NaverAutomation:
                             viable.append((info["width"] * info["height"], element, info))
                     return max(viable, key=lambda value: value[0])[1:] if viable else None
                 preview, info = WebDriverWait(driver, 5).until(preview_ready)
+                stage = "source_license"
                 links = driver.execute_script("""
                     const links=[];
                     for (const start of arguments) {
@@ -1877,6 +2029,8 @@ class NaverAutomation:
                     self._inspect_reference_license(driver, source_url, info["url"])
                 if english_only and evidence.get("english_source_verified") is not True:
                     seen.add(info["url"])
+                    reject(rank, "english_source_unverified", source_url=source_url,
+                           source_language=evidence.get("source_language", ""))
                     self.log(f"Google 참고 이미지 {rank}번 · 영어 원문 페이지를 확인하지 못해 다음 후보를 확인합니다.")
                     continue
                 if reuse_only and (evidence.get("license_verified") is not True
@@ -1885,8 +2039,12 @@ class NaverAutomation:
                         or evidence.get("attribution_required") is not False
                         or evidence.get("share_alike") is not False):
                     seen.add(info["url"])
+                    reject(rank, "reuse_rights_unverified", source_url=source_url,
+                           license_verified=evidence.get("license_verified", False), license_url=evidence.get("license_url", ""),
+                           attribution_required=evidence.get("attribution_required"))
                     self.log(f"Google 참고 이미지 {rank}번 · 출처 표시 없는 재사용 권한을 확인하지 못해 다음 후보를 확인합니다.")
                     continue
+                stage = "capture"
                 old_style = preview.get_attribute("style") or ""
                 try:
                     driver.execute_script("arguments[0].style.setProperty('object-fit','contain','important');", preview)
@@ -1895,6 +2053,7 @@ class NaverAutomation:
                 finally:
                     driver.execute_script("arguments[0].setAttribute('style',arguments[1]);", preview, old_style)
                 if image.width < 320 or image.height < 200:
+                    reject(rank, "capture_too_small", width=image.width, height=image.height)
                     continue
                 capture_size = image.size
                 image = self._gently_enhance_google_image(image)
@@ -1902,6 +2061,7 @@ class NaverAutomation:
                 self._save_clean_jpeg(image, path)
                 candidate = {
                     "path": str(path.resolve()), "provider": "google", "query": keyword,
+                    "capture_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                     "search_rank": rank, "source_url": source_url, "url": source_url,
                     "image_url": info["url"], "width": image.width, "height": image.height,
                     "source_width": info["width"], "source_height": info["height"],
@@ -1915,9 +2075,11 @@ class NaverAutomation:
                 candidates.append(candidate)
                 seen.add(info["url"])
             except (WebDriverException, OSError, ValueError) as exc:
-                self.log(f"Google 참고 이미지 후보 {rank}번 건너뜀: {exc}")
+                reject(rank, "preview_timeout" if isinstance(exc, TimeoutException) and stage == "preview" else "candidate_error",
+                       stage=stage, error=str(exc)[:500], preview_observations=preview_observations)
+                self.log(f"Google 참고 이미지 후보 {rank}번 건너뜀: {type(exc).__name__} · {str(exc).split('Stacktrace:', 1)[0].strip()[:200]}")
         self._save_internal_image_source_history(candidates)
-        _save(output_dir / "google_reference_manifest.json", candidates)
+        finish("complete" if len(candidates) >= count else "partial" if candidates else "no_eligible_candidates")
         return candidates
 
     @staticmethod
@@ -2970,8 +3132,9 @@ class NaverAutomation:
                 if item.get("attribution_required"):
                     raise ValueError("공개 출처 표시가 필요한 참고 이미지는 이 글의 자동 발행 대상에서 제외합니다.")
                 license_parts = urllib.parse.urlparse(str(item["license_url"]))
-                if (license_parts.scheme != "https" or license_parts.hostname != "creativecommons.org"
-                        or license_parts.path.rstrip("/") not in {"/publicdomain/zero/1.0", "/publicdomain/mark/1.0"}
+                cc_public_domain = (license_parts.scheme == "https" and license_parts.hostname == "creativecommons.org"
+                                    and license_parts.path.rstrip("/") in {"/publicdomain/zero/1.0", "/publicdomain/mark/1.0"})
+                if (not (cc_public_domain or NaverAutomation._commons_public_domain_license_verified(item))
                         or item.get("attribution_required") is not False):
                     raise ValueError("참고 이미지에는 출처 표시가 필요 없는 CC0 또는 공개 도메인 라이선스 확인이 필요합니다.")
             reviews = item.get("reviews")
@@ -3536,9 +3699,23 @@ class NaverAutomation:
 
     def _write_publication_receipt(self, path: Path, receipt: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, path)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(receipt, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(.05 * (attempt + 1))
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _claim_publication_receipt(path: Path, receipt: dict) -> bool:
@@ -3989,13 +4166,13 @@ class NaverAutomation:
             except TimeoutException:
                 return
 
-    @staticmethod
-    def _own_reply_exists(comment, blog_id: str) -> bool:
+    @classmethod
+    def _own_reply_exists(cls, comment, blog_id: str) -> bool:
         replies = comment.find_elements(By.CSS_SELECTOR, ".u_cbox_reply_area li.u_cbox_comment")
         for reply in replies:
             profile = reply.find_elements(By.CSS_SELECTOR, "a.u_cbox_name")
             href = profile[0].get_attribute("href") if profile else ""
-            if blog_id.lower() in (href or "").lower():
+            if cls._comment_author_matches(href or "", blog_id):
                 return True
         return False
 
@@ -4063,6 +4240,8 @@ class NaverAutomation:
             return False
 
     def _like_comment(self, comment, key: str) -> bool:
+        if self.stop_event.is_set():
+            return False
         buttons = [
             button
             for button in self._comment_action_elements(
@@ -4103,6 +4282,8 @@ class NaverAutomation:
         return True
 
     def _reply(self, comment, phrase: str, blog_id: str) -> bool:
+        if self.stop_event.is_set():
+            raise RuntimeError("사용자가 작업을 중지했습니다.")
         phrase = webdriver_bmp_text(phrase)
         comment_no = self._comment_no(comment)
         if not comment_no:
@@ -4118,7 +4299,7 @@ class NaverAutomation:
         if not buttons:
             raise RuntimeError("대상 댓글의 답글 버튼을 찾지 못했습니다.")
         self.driver.execute_script("arguments[0].click()", buttons[0])
-        self._submit_comment(self.driver, phrase, blog_id, comment_no)
+        self._submit_comment_once(self.driver, phrase, blog_id, comment_no)
         return True
 
     @staticmethod
@@ -4325,11 +4506,17 @@ class NaverAutomation:
         return None
 
     @classmethod
-    def _submit_comment(cls, driver, phrase: str, blog_id: str, comment_no: str = ""):
+    def _submit_comment(cls, driver, phrase: str, blog_id: str, comment_no: str = "", *,
+                        stop_event=None, before_submit=None):
+        def check_stop():
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("사용자가 작업을 중지했습니다. 댓글을 등록하지 않았습니다.")
+        check_stop()
         if not blog_id.strip():
             raise RuntimeError("댓글 작성자를 확인할 네이버 블로그 ID가 필요합니다.")
         phrase = webdriver_bmp_text(phrase)
         cls._fill_comment_editor(driver, phrase, comment_no)
+        check_stop()
         before = {record["id"] for record in cls._comment_records(driver, comment_no)}
         try:
             upload = WebDriverWait(
@@ -4340,6 +4527,9 @@ class NaverAutomation:
         editor = cls._visible_comment_editor(driver, comment_no)
         if editor is None or cls._comment_editor_value(editor) != " ".join(phrase.split()):
             raise RuntimeError("등록 직전 댓글 내용이 달라져 등록하지 않았습니다.")
+        check_stop()
+        if before_submit is not None:
+            before_submit(before)
         # Click exactly once. Never retry submission after an uncertain response.
         try:
             driver.execute_script("arguments[0].click()", upload)
@@ -4352,12 +4542,68 @@ class NaverAutomation:
                 "중복 방지를 위해 재등록하지 않습니다. 해당 글에서 등록 여부를 확인하세요."
             ) from exc
 
+    @staticmethod
+    def _comment_target_url(url: str) -> str:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname in {"blog.naver.com", "m.blog.naver.com"}:
+            path = urllib.parse.unquote(parsed.path).strip("/")
+            direct = re.fullmatch(r"([^/]+)/(\d+)", path)
+            query = urllib.parse.parse_qs(parsed.query)
+            author = direct[1] if direct else (query.get("blogId") or [""])[0]
+            number = direct[2] if direct else (query.get("logNo") or [""])[0]
+            if author and re.fullmatch(r"\d+", number):
+                return f"https://blog.naver.com/{author.lower()}/{number}"
+        # Local fixture pages have no account data. Avoid retaining a data URL's
+        # complete HTML in the small submission receipt.
+        return "page-sha256:" + hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    def _submit_comment_once(self, driver, phrase: str, blog_id: str, comment_no: str = ""):
+        """Resume read-only confirmation after an uncertain click, including after restart."""
+        if self.stop_event.is_set():
+            raise RuntimeError("사용자가 작업을 중지했습니다.")
+        phrase = webdriver_bmp_text(phrase)
+        target = self._comment_target_url(str(driver.current_url or ""))
+        identity = {"target": target, "author": blog_id.casefold(), "parent_comment": comment_no}
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+        path = self.data_dir / "comment_receipts" / f"{key}.json"
+        if path.exists():
+            try:
+                prior = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(prior, dict) or prior.get("identity") != identity
+                        or prior.get("status") not in {"confirmed", "uncertain"}
+                        or not isinstance(prior.get("phrase"), str) or not isinstance(prior.get("before_ids"), list)
+                        or any(not isinstance(value, str) for value in prior["before_ids"])):
+                    raise ValueError("Invalid comment receipt")
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError("이전 댓글 등록 기록을 읽을 수 없어 중복 등록을 중단했습니다.") from exc
+            if prior["status"] == "confirmed":
+                return {**prior.get("record", {}), "reused_receipt": True}
+            record = self._new_comment_record(driver, set(prior["before_ids"]), prior["phrase"], blog_id, comment_no)
+            if record:
+                prior.update(status="confirmed", record=record)
+                self._write_publication_receipt(path, prior)
+                return {**record, "reused_receipt": True}
+            raise RuntimeError("이전 댓글 등록 결과가 아직 확인되지 않았습니다. 새 문구로 재등록하지 않고 해당 글을 보존합니다.")
+        receipt = {"version": 1, "identity": identity, "status": "uncertain", "phrase": phrase,
+                   "submitted_at": datetime.now().isoformat(timespec="seconds")}
+        def claim(before):
+            receipt["before_ids"] = sorted(before)
+            if not self._claim_publication_receipt(path, receipt):
+                raise RuntimeError("다른 실행의 댓글 제출 기록이 있어 등록 버튼을 누르지 않았습니다.")
+        record = self._submit_comment(driver, phrase, blog_id, comment_no,
+                                      stop_event=self.stop_event, before_submit=claim)
+        receipt.update(status="confirmed", record=record)
+        self._write_publication_receipt(path, receipt)
+        return record
+
     @classmethod
     def _write_neighbor_comment(cls, driver, phrase: str, blog_id: str) -> None:
         cls._submit_comment(driver, phrase, blog_id)
 
     def run_own_posts(self, blog_id: str, days: int, interval: int, do_like: bool = True):
-        self.stop_event.clear()
+        if self.stop_event.is_set():
+            self.log("중지된 댓글 작업을 시작하지 않았습니다.")
+            return
         driver = self._require_naver_login(self._driver())
         driver.get("https://section.blog.naver.com/BlogHome.naver")
         if False and not any(
@@ -4539,7 +4785,9 @@ class NaverAutomation:
         return output
 
     def run_neighbor_posts(self, blog_id: str, interval: int, maximum: int):
-        self.stop_event.clear()
+        if self.stop_event.is_set():
+            self.log("중지된 이웃 댓글 작업을 시작하지 않았습니다.")
+            return
         driver = self._driver()
         urls = self._neighbor_urls(driver, blog_id, maximum * 3)
         done = skipped = 0
@@ -4559,7 +4807,7 @@ class NaverAutomation:
                 continue
             phrase = webdriver_bmp_text(random.choice(NEIGHBOR_COMMENTS))
             try:
-                self._write_neighbor_comment(driver, phrase, blog_id)
+                self._submit_comment_once(driver, phrase, blog_id)
                 done += 1
                 self.state.setdefault("neighbor_commented", []).append(log_no)
                 _save(self.state_file, self.state)

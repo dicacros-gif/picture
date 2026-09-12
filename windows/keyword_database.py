@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 
-from blog_topic_history import normalize_topic, topic_key
+from blog_preferences import atomic_json_write
+from blog_topic_history import TopicHistory, normalize_topic, topic_key
 
 
 def _now(value=None):
@@ -80,10 +81,21 @@ def consume(records, values):
 def save_database(path: Path, records, now=None):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     records = prune(records, now=now)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({"version": 2, "keywords": list(records.values())}, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    atomic_json_write(path, {"version": 2, "keywords": list(records.values())})
     return records
+
+
+def update_database(path: Path, *, observed=(), consumed=(), now=None, seed_records=None, keyword_filter=None):
+    """Read/modify/write under one shared thread/process lock to prevent lost updates."""
+    path = Path(path)
+    # Reuse the existing data-path lock only; no topic-history schema is read here.
+    with TopicHistory(path)._locked():
+        records = load_database(path, now=now) if path.exists() else dict(seed_records or {})
+        records = consume(merge(records, observed, now=now), consumed)
+        if keyword_filter is not None:
+            allowed = {topic_key(word) for word in keyword_filter(words(records))}
+            records = {key: item for key, item in records.items() if key in allowed}
+        return save_database(path, records, now=now)
 
 
 def words(records):

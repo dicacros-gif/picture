@@ -1,6 +1,8 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, PngImagePlugin
 from image_delivery import clean_export
@@ -69,7 +71,51 @@ class ImageDeliveryTests(unittest.TestCase):
             Image.new('RGB',(1600,900),'gray').save(source)
             result=clean_export(source,target,headline='고르는 기준')
             self.assertEqual(result['width'],result['height'])
-            self.assertGreaterEqual(result['width'],900)
+            self.assertEqual(result['width'],2048)
+
+    def test_failed_export_preserves_existing_delivery_copy_and_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory)/'source.png', Path(directory)/'upload.jpg'
+            Image.new('RGB', (640, 480), 'red').save(source)
+            Image.new('RGB', (640, 480), 'blue').save(target)
+            original, approved_copy = source.read_bytes(), target.read_bytes()
+            with patch.object(Image.Image, 'save', side_effect=OSError('disk full')), self.assertRaises(OSError):
+                clean_export(source, target, target_long_side=640)
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(target.read_bytes(), approved_copy)
+            self.assertEqual(list(Path(directory).glob('*.tmp')), [])
+
+    def test_short_windows_replace_lock_is_retried_without_partial_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory)/'source.png', Path(directory)/'upload.jpg'
+            Image.new('RGB', (640, 480), 'red').save(source)
+            previous = b'previous approved delivery'
+            target.write_bytes(previous)
+            replace = os.replace
+            attempts = []
+            def locked_then_replace(temporary, destination):
+                self.assertEqual(Path(destination).read_bytes(), previous)
+                attempts.append(temporary)
+                if len(attempts) < 3:
+                    raise PermissionError('scanner lock')
+                return replace(temporary, destination)
+            with patch('image_delivery.os.replace', side_effect=locked_then_replace), patch('image_delivery.time.sleep'):
+                result = clean_export(source, target, target_long_side=640)
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(result['width'], 640)
+            self.assertNotEqual(target.read_bytes(), previous)
+
+    def test_palette_transparency_renders_white_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory)/'palette.png', Path(directory)/'upload.jpg'
+            image = Image.new('P', (64, 64), 0)
+            image.putpalette([0, 0, 0, 255, 0, 0] + [0] * 762)
+            image.save(source, transparency=0)
+            original = source.read_bytes()
+            clean_export(source, target, target_long_side=64)
+            with Image.open(target) as rendered:
+                self.assertEqual(rendered.getpixel((32, 32)), (255, 255, 255))
+            self.assertEqual(source.read_bytes(), original)
 
     def test_cover_rejects_long_or_multiline_caption(self):
         with tempfile.TemporaryDirectory() as directory:

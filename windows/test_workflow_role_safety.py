@@ -1,0 +1,191 @@
+import copy
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import test_blog_workflow as support
+from blog_cli_bridge import BlogCliError
+from blog_quality import inspect_article
+from blog_stage_roles import check_role_change
+from blog_workflow import BlogWorkflow, REVIEW_MODES, WorkflowError, _validate_article
+
+
+class RoleInvariantTests(unittest.TestCase):
+    def fact_added_before_footer(self):
+        previous = support.valid_article()
+        result = copy.deepcopy(previous)
+        fact = "지원 기능은 해당 제품의 제조사 안내에서 직접 확인할 수 있습니다."
+        paragraph = result["paragraphs"][7]
+        boundary = paragraph.index("#배터리관리0")
+        result["paragraphs"][7] = paragraph[:boundary] + fact + "\n\n" + paragraph[boundary:]
+        result["sources"][0]["supports"].append(fact)
+        result["fact_additions"] = [{"index": 7, "text": fact, "source_urls": [result["sources"][0]["url"]]}]
+        return previous, result
+
+    def test_fact_addition_before_footer_preserves_original_copy_and_editor_format(self):
+        previous, result = self.fact_added_before_footer()
+        check_role_change("팩트·최신 정보 보강", previous, result)
+        _validate_article(result, support.KEYWORDS, require_visual_style=True)
+        self.assertTrue(result["paragraphs"][7].endswith("뜻과 의미"))
+
+    def test_undocumented_footer_insertion_or_unverified_source_is_rejected(self):
+        previous, result = self.fact_added_before_footer()
+        result["fact_additions"][0]["source_urls"] = ["https://unverified.example/source"]
+        with self.assertRaises(ValueError):
+            check_role_change("팩트·최신 정보 보강", previous, result)
+        result.pop("fact_additions")
+        with self.assertRaises(ValueError):
+            check_role_change("팩트·최신 정보 보강", previous, result)
+
+    def test_malformed_fact_metadata_is_a_repairable_value_error(self):
+        for field, value in [("fact_additions", [None]), ("fact_additions", {}),
+                             ("fact_corrections", [None]), ("fact_corrections", {})]:
+            with self.subTest(field=field, value=value):
+                previous, result = support.valid_article(), support.valid_article()
+                result[field] = value
+                with self.assertRaises(ValueError):
+                    check_role_change("팩트·최신 정보 보강", previous, result)
+
+    def test_explicit_addition_ledger_cannot_hide_an_undeclared_append(self):
+        previous, result = support.valid_article(), support.valid_article()
+        result["fact_additions"] = []
+        result["paragraphs"][0] += "\n\n추가로 모든 제품에 같은 지원 조건이 적용됩니다."
+        with self.assertRaises(ValueError):
+            check_role_change("팩트·최신 정보 보강", previous, result)
+
+    def test_style_may_change_thousands_separator_without_changing_amount(self):
+        previous = support.valid_article()
+        previous["paragraphs"][0] += "\n가격은 1,000원입니다."
+        result = copy.deepcopy(previous)
+        result["paragraphs"][0] = result["paragraphs"][0].replace("1,000원", "1000 원")
+        check_role_change("문체 다듬기", previous, result)
+
+    def test_style_cannot_change_title_date_or_currency_unit(self):
+        for title_change in (False, True):
+            with self.subTest(title_change=title_change):
+                previous = support.valid_article()
+                previous["title"] = "2026년 배터리 교체는 언제 필요할까요?"
+                previous["paragraphs"][0] += "\n교체 금액은 100만원입니다."
+                result = copy.deepcopy(previous)
+                if title_change:
+                    result["title"] = result["title"].replace("2026", "2027")
+                else:
+                    result["paragraphs"][0] = result["paragraphs"][0].replace("100만원", "100원")
+                with self.assertRaises(ValueError):
+                    check_role_change("문체 다듬기", previous, result)
+
+    def test_style_cannot_swap_different_sections_numbers(self):
+        previous = support.valid_article()
+        previous["paragraphs"][0] += "\n노트북 비용은 100만원입니다."
+        previous["paragraphs"][1] += "\n다른 기기 비용은 200만원입니다."
+        result = copy.deepcopy(previous)
+        result["paragraphs"][0] = result["paragraphs"][0].replace("100만원", "200만원")
+        result["paragraphs"][1] = result["paragraphs"][1].replace("200만원", "100만원")
+        with self.assertRaises(ValueError):
+            check_role_change("문체 다듬기", previous, result)
+
+    def test_natural_mode_uses_only_available_keywords_without_impossible_eight_unique_requirement(self):
+        article = support.valid_article()
+        article["subheading_keywords"] = [*support.KEYWORDS, "", "", "", "", ""]
+        for index, keyword in enumerate(support.KEYWORDS):
+            article["paragraphs"][index] = article["paragraphs"][index].replace(f"배터리의 숨은 변화 {index + 1}", keyword)
+        codes = {issue["code"] for issue in inspect_article(article, support.KEYWORDS, support.TOPIC, mode="natural")}
+        self.assertFalse({"heading_keyword", "heading_keyword_coverage", "heading_duplicate"} & codes)
+        prompt = BlogWorkflow._article_prompt(support.TOPIC, support.KEYWORDS, "추가 문체", editorial_mode="natural")
+        self.assertIn("실제 연관어는 3개", prompt)
+        self.assertIn("빈 문자열", prompt)
+        article["subheading_keywords"][2] = ""
+        self.assertIn("heading_keyword_coverage", {issue["code"] for issue in inspect_article(
+            article, support.KEYWORDS, support.TOPIC, mode="natural")})
+
+
+class WorkflowRoleRecoveryTests(unittest.TestCase):
+    setUp = support.BlogWorkflowTests.setUp
+    prepare = support.BlogWorkflowTests.prepare
+    latest_manifest = support.BlogWorkflowTests.latest_manifest
+    assert_blocked = support.BlogWorkflowTests.assert_blocked
+
+    def routes(self):
+        return [{"provider": "chatgpt", "model": "writer", "role": "작성"},
+                {"provider": "antigravity", "model": "facts", "role": "팩트·최신 정보 보강"}]
+
+    def test_fact_recovery_cannot_rewrite_approved_copy(self):
+        original = self.bridge.run_text
+        def run(provider, prompt, **kwargs):
+            if provider == "antigravity" and not kwargs.get("images"):
+                raise BlogCliError("permission_required", "command denied")
+            response = original(provider, prompt, **kwargs)
+            if "동일 주제 복구 단계" in prompt:
+                result = json.loads(response)
+                result["paragraphs"][0] = result["paragraphs"][0].replace("눈에 보이는 숫자 하나로", "표시된 숫자만으로")
+                return json.dumps(result)
+            return response
+        self.bridge.run_text = run
+        failed = self.assert_blocked("기존 제목·문단", steps=["chatgpt", "antigravity"], stage_configs=self.routes())
+        self.assertFalse(self.bridge.generations)
+        self.assertFalse(Path(failed["run_dir"], "stage-2-antigravity.checkpoint.json").exists())
+        self.assertTrue(Path(failed["run_dir"], "stage-1-chatgpt.checkpoint.json").is_file())
+
+    def test_fact_recovery_accepts_verified_addition_and_keeps_footer(self):
+        original = self.bridge.run_text
+        _, corrected = RoleInvariantTests().fact_added_before_footer()
+        def run(provider, prompt, **kwargs):
+            if provider == "antigravity" and not kwargs.get("images"):
+                raise BlogCliError("permission_required", "command denied")
+            if "동일 주제 복구 단계" in prompt:
+                self.assertIn("fact_additions", prompt)
+                return json.dumps(corrected)
+            return original(provider, prompt, **kwargs)
+        self.bridge.run_text = run
+        result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=self.routes())
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(result["paragraphs"][7], corrected["paragraphs"][7])
+
+    def test_editorial_without_style_role_uses_last_successful_route(self):
+        original = self.bridge.run_text
+        denied, repair_routes = [], []
+        def run(provider, prompt, **kwargs):
+            if provider == "antigravity" and not kwargs.get("images"):
+                denied.append(prompt)
+                raise BlogCliError("permission_required", "command denied")
+            if prompt.startswith("EDITORIAL_TARGETED_REPAIR"):
+                repair_routes.append((provider, kwargs.get("model")))
+                return json.dumps({"paragraph_patches": []})
+            return original(provider, prompt, **kwargs)
+        self.bridge.run_text = run
+        issue = {"code": "section_length", "index": 0, "text": "", "detail": "분량 보완"}
+        with patch("blog_workflow.inspect_article", return_value=[issue]):
+            result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=self.routes(), quality_checks=True)
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(len(denied), 1)
+        self.assertEqual(repair_routes, [("chatgpt", "writer"), ("chatgpt", "writer")])
+
+    def test_changed_vision_model_rechecks_existing_files_without_regeneration(self):
+        original = self.bridge.run_text
+        blocked = True
+        def run(provider, prompt, **kwargs):
+            if blocked and prompt.startswith("FINAL_ARTICLE_REVIEW"):
+                review = support.valid_article()["review"]
+                review.update(approved=False, issues=["최종 확인 보완"])
+                return json.dumps(review)
+            return original(provider, prompt, **kwargs)
+        self.bridge.run_text = run
+        stages = [{"provider": "chatgpt", "model": "old-model", "role": "작성"}]
+        failed = self.assert_blocked("승인", steps=["chatgpt"], stage_configs=stages, review_mode=REVIEW_MODES[1])
+        self.assertEqual(len(self.bridge.generations), 8)
+        request = json.loads(Path(failed["run_dir"], "request.json").read_text(encoding="utf-8"))
+        request["stage_configs"][0]["model"] = "new-model"
+        blocked = False
+        self.bridge.calls.clear()
+        result = self.workflow.prepare(**request, resume_run_dir=failed["run_dir"])
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(len(self.bridge.generations), 8)
+        visual = [call for call in self.bridge.calls if call["images"]]
+        self.assertEqual(len(visual), 8)
+        self.assertTrue(all(call["model"] == "new-model" for call in visual))
+        self.assertTrue(all(item["previous_vision_reviews"] for item in result["image_candidates"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

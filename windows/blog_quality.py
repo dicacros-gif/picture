@@ -42,6 +42,8 @@ def inspect_article(article, keywords, topic, *, mode='strict'):
         add('title_keyword', -1, title, '제목에 실제 연관 검색어 한 개를 자연스럽게 포함')
     bridges = article.get('bridge_sentences', [])
     keys = article.get('subheading_keywords', [])
+    actual_keywords = list(dict.fromkeys(keyword for keyword in keywords if isinstance(keyword, str) and keyword.strip()))
+    sparse_keywords = mode == 'natural' and len(actual_keywords) < 8
     used = set()
     concrete = 0
     all_sentences = []
@@ -65,11 +67,15 @@ def inspect_article(article, keywords, topic, *, mode='strict'):
         if not isinstance(bridges, list) or len(bridges) != 8 or not isinstance(bridges[i], str) or not bridges[i].strip() or bridges[i] not in p:
             add('bridge', i, '', 'bridge_sentences에 이 구역의 실제 연결 문장을 기록하고 본문에 포함')
         key = keys[i] if isinstance(keys, list) and len(keys) == 8 else None
-        if not isinstance(key, str) or not key or key not in keywords or key not in heading(p):
+        if key == '' and sparse_keywords:
+            pass  # No invented keywords just to fill eight metadata positions.
+        elif not isinstance(key, str) or not key or key not in actual_keywords or key not in heading(p):
             add('heading_keyword', i, heading(p), '실제 연관어를 소제목에 넣고 subheading_keywords에 기록')
         elif key in used:
             add('heading_duplicate', i, heading(p), '다른 소제목에 사용하지 않은 실제 연관어 사용')
         used.add(key if isinstance(key, str) else '')
+    if sparse_keywords and len(set(actual_keywords) & used) < len(actual_keywords):
+        add('heading_keyword_coverage', -1, '', f'확보한 실제 연관어 {len(actual_keywords)}개를 서로 다른 소제목에 배치하고 나머지는 빈 문자열로 기록')
     if concrete < 4:
         add('specificity', -1, '', f'구체적인 금액·기간·횟수·조건이 있는 구역 {concrete}개: 최소 4개 필요. 수치 창작 금지')
     for start in range(2, len(all_sentences)):
@@ -115,7 +121,7 @@ def apply_patches(article, response, issues):
     """Accept edits only for reported sections; metadata cannot approve facts."""
     result = copy.deepcopy(article)
     permitted = {item['index'] for item in issues if item['index'] >= 0}
-    if any(item['code'] in {'total_length', 'specificity', 'density', 'sections'} for item in issues):
+    if any(item['code'] in {'total_length', 'specificity', 'density', 'sections', 'heading_keyword_coverage'} for item in issues):
         permitted.update(range(8))
     patches = response.get('paragraph_patches', [])
     if not isinstance(patches, list):

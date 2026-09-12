@@ -24,8 +24,9 @@ from send2trash import send2trash
 from chatgpt_classic_automation import ChatGPTClassicAutomation
 from blog_controls import BlogWorkflowControls, next_cycle_tick
 from blog_workflow import BlogWorkflow
-from blog_preferences import automation_config_snapshot, blocked_term_hits
-from blog_runtime import access_error_from_exception, wait_for_restart_parent
+from blog_preferences import (atomic_json_write, automation_config_snapshot, blocked_term_hits,
+                              load_settings_json, save_settings_json)
+from blog_runtime import ApplicationAlreadyRunning, application_instance_lock, access_error_from_exception, wait_for_restart_parent
 from naver_automation import NaverAutomation
 
 
@@ -76,6 +77,8 @@ DEFAULT_BLOG_PROMPT = (
 
 
 def load_json(path: Path, default):
+    if Path(path).name.casefold() == "settings.json":
+        return load_settings_json(path, default)
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -83,8 +86,10 @@ def load_json(path: Path, default):
 
 
 def save_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    if Path(path).name.casefold() == "settings.json":
+        save_settings_json(path, value)
+    else:
+        atomic_json_write(path, value)
 
 
 def default_screenshot_folder() -> Path:
@@ -617,11 +622,15 @@ def compose_related_topic(seed: str, keywords: list[str]) -> str:
 class PictureCleanerApp(BlogWorkflowControls):
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title(f"{APP_NAME} · 무인 CLI 블로그 2026-09-12")
+        self.root.title(APP_NAME)
+        icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "assets" / "blog.ico"
+        if icon.is_file():
+            self.root.iconbitmap(default=str(icon))
         self.root.geometry("1180x780")
         self.root.minsize(940, 650)
         self.events: queue.Queue[tuple] = queue.Queue()
-        self.settings = load_json(CONFIG_FILE, {})
+        loaded_settings = load_json(CONFIG_FILE, {})
+        self.settings = loaded_settings if isinstance(loaded_settings, dict) else {}
         self.dark_mode = BooleanVar(value=self.settings.get("dark_mode", False))
         from keyword_database import load_database, words
         self.keyword_db_records = load_database(DB_FILE)
@@ -683,7 +692,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             value=self.settings.get("blog_auto_images", True)
         )
         self.blog_id = StringVar(value=self.settings.get("blog_id", "macdcross"))
-        self.comment_days = StringVar(value="10")
+        self.comment_days = StringVar(value=self.settings.get("comment_days", "10"))
         self.comment_interval = StringVar(value=self.settings.get("comment_interval", "5"))
         self.neighbor_interval = StringVar(value=self.settings.get("neighbor_interval", "60"))
         self.neighbor_max = StringVar(value=self.settings.get("neighbor_max", "5"))
@@ -694,6 +703,11 @@ class PictureCleanerApp(BlogWorkflowControls):
         self._init_cli_controls(CONFIG_FILE, APP_DIR, DEFAULT_BLOG_PROMPT)
         self._style()
         self._layout()
+        self._install_general_settings_autosave()
+        recovery = self.settings.get("_settings_recovery", {})
+        if isinstance(recovery, dict) and recovery.get("message"):
+            self.status.set(recovery["message"])
+            self._naver_log(recovery["message"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.after_idle(self._maximize_window)
@@ -701,6 +715,58 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.root.after(500, self._maximize_window)
         self.root.after(100, self._poll)
         self.root.after(300, lambda: self.run_realtime(startup=True))
+
+    def _general_settings_snapshot(self):
+        names = ("folder", "today_only", "recycle", "claude_cli_model", "antigravity_cli_model",
+                 "blog_id", "comment_days", "comment_interval", "neighbor_interval", "neighbor_max",
+                 "dark_mode", "blog_auto_images", "auto_use_claude", "auto_use_antigravity",
+                 "auto_interval_hours", "auto_image_count")
+        settings = {name: getattr(self, name).get() for name in names if hasattr(self, name)}
+        limits = {"comment_days": (1, None, "10"), "comment_interval": (0, None, "5"),
+                  "neighbor_interval": (10, None, "60"), "neighbor_max": (1, 200, "5"),
+                  "auto_interval_hours": (1, 6, "1"), "auto_image_count": (1, None, "10")}
+        for name, (minimum, maximum, default) in limits.items():
+            if name not in settings:
+                continue
+            try:
+                number = int(settings[name])
+                if number < minimum or (maximum is not None and number > maximum):
+                    raise ValueError
+                settings[name] = str(number)
+            except (TypeError, ValueError, OverflowError):
+                settings[name] = self.settings.get(name, default)
+        return settings
+
+    def _install_general_settings_autosave(self):
+        self._general_settings_job = None
+        for name in self._general_settings_snapshot():
+            getattr(self, name).trace_add("write", lambda *_: self._schedule_general_settings_save())
+
+    def _schedule_general_settings_save(self):
+        if getattr(self, "_closing", False):
+            return
+        pending = getattr(self, "_general_settings_job", None)
+        if pending:
+            self.root.after_cancel(pending)
+        self._general_settings_job = self.root.after(700, self._autosave_general_settings)
+
+    def _autosave_general_settings(self):
+        self._general_settings_job = None
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.settings.update(self._general_settings_snapshot())
+            self._persist_cli_preferences()
+        except (OSError, ValueError) as exc:
+            self.status.set(f"설정 저장 실패: {exc}")
+            self._naver_log(f"설정 저장 실패: {exc}")
+
+    def _update_keyword_queue(self, *, observed=(), consumed=()):
+        from keyword_database import reconcile, update_database, words
+        seed = reconcile(getattr(self, "keyword_db_records", {}), getattr(self, "keyword_db", []))
+        self.keyword_db_records = update_database(DB_FILE, observed=observed, consumed=consumed,
+            seed_records=seed, keyword_filter=self.topic_history.filter_keywords)
+        self.keyword_db = words(self.keyword_db_records)
 
     def _style(self):
         style = ttk.Style()
@@ -1453,6 +1519,8 @@ class PictureCleanerApp(BlogWorkflowControls):
 
         def work():
             try:
+                if self.naver_bot.stop_event.is_set() or getattr(self, "_closing", False):
+                    return
                 self._naver_log(f"{label} 준비 중...")
                 target(*args)
             except Exception as exc:
@@ -1461,7 +1529,11 @@ class PictureCleanerApp(BlogWorkflowControls):
             finally:
                 self.naver_task_active = False
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception:
+            self.naver_task_active = False
+            raise
 
     def open_naver_login(self):
         self._start_naver_task(
@@ -2330,13 +2402,7 @@ class PictureCleanerApp(BlogWorkflowControls):
                         self.keyword_text.insert("1.0", "\n".join(merged))
                     self.seed.set(seed)
                     self.topic.set(compose_related_topic(seed, merged))
-                    from keyword_database import merge, consume, reconcile, save_database, words
-                    allowed = self.topic_history.filter_keywords(merged)
-                    self.keyword_db_records = merge(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), allowed)
-                    blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
-                    self.keyword_db_records = consume(self.keyword_db_records, blocked)
-                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
-                    self.keyword_db = words(self.keyword_db_records)
+                    self._update_keyword_queue(observed=merged)
                     if merged and failed_sources:
                         self.status.set(
                             f"'{seed}' 연관 검색어 {len(merged)}개 · "
@@ -2387,13 +2453,7 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self.topic.set(
                         compose_related_topic(seed, combined_keywords)
                     )
-                    from keyword_database import merge, consume, reconcile, save_database, words
-                    allowed = self.topic_history.filter_keywords(combined_keywords)
-                    self.keyword_db_records = merge(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), allowed)
-                    blocked = set(words(self.keyword_db_records)) - set(self.topic_history.filter_keywords(words(self.keyword_db_records)))
-                    self.keyword_db_records = consume(self.keyword_db_records, blocked)
-                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
-                    self.keyword_db = words(self.keyword_db_records)
+                    self._update_keyword_queue(observed=combined_keywords)
                     full_failed = [
                         source for source, words in full_result.items() if not words
                     ]
@@ -2499,11 +2559,8 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self._set_cli_runtime_controls(False)
                 elif kind == "cli_topic_consumed":
                     self.realtime_groups = self.topic_history.filter_groups(self.realtime_groups)
-                    from keyword_database import consume, reconcile, save_database, words
                     consumed = event[2] if len(event) > 2 else [event[1]]
-                    self.keyword_db_records = consume(reconcile(getattr(self, "keyword_db_records", {}), self.keyword_db), consumed)
-                    self.keyword_db_records = save_database(DB_FILE, self.keyword_db_records)
-                    self.keyword_db = words(self.keyword_db_records)
+                    self._update_keyword_queue(consumed=consumed)
                     self._render_keyword_groups(self.realtime_groups)
                     self.status.set(f"발행한 키워드 '{event[1]}' 제거 완료 · 다음 회차에는 다른 키워드를 선택합니다.")
                 elif kind == "cli_preparing":
@@ -2530,6 +2587,9 @@ class PictureCleanerApp(BlogWorkflowControls):
                     if hasattr(self, "cli_log"):
                         self.cli_log.configure(state="normal")
                         self.cli_log.insert("end", f"[{datetime.now():%H:%M:%S}] {event[1]}\n")
+                        lines = int(self.cli_log.index("end-1c").split(".")[0])
+                        if lines > 5000:
+                            self.cli_log.delete("1.0", f"{lines - 5000 + 1}.0")
                         self.cli_log.see("end")
                         self.cli_log.configure(state="disabled")
                     self.status.set(event[1])
@@ -2541,50 +2601,54 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.root.after(100, self._poll)
 
     def close(self):
+        if getattr(self, "_closing", False):
+            return
         self._closing = True
         self._cancel_automatic_resume()
-        if hasattr(self, "cli_preferences"):
-            # Save edited preset content and current choices before shutdown.
-            current = next(p for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt)
-            edited = self.base_text.get("1.0", "end").strip()
-            if edited:
-                current["text"] = edited
-            self._save_cli_selection()
-        save_json(
-            CONFIG_FILE,
-            {
-                **self.settings,
-                "cli_workflow": self.cli_preferences,
-                "folder": self.folder.get(),
-                "today_only": self.today_only.get(),
-                "recycle": self.recycle.get(),
-                "claude_cli_model": self.claude_cli_model.get(),
-                "antigravity_cli_model": self.antigravity_cli_model.get(),
-                "blog_prompt": self.base_text.get("1.0", "end").strip(),
-                "blog_id": self.blog_id.get(),
-                "comment_interval": self.comment_interval.get(),
-                "neighbor_interval": self.neighbor_interval.get(),
-                "neighbor_max": self.neighbor_max.get(),
-                "dark_mode": self.dark_mode.get(),
-                "blog_auto_images": self.blog_auto_images.get(),
-                "auto_use_claude": self.auto_use_claude.get(),
-                "auto_use_antigravity": self.auto_use_antigravity.get(),
-                "auto_interval_hours": self.auto_interval_hours.get(),
-                "auto_image_count": self.auto_image_count.get(),
-            },
-        )
         self.full_auto_stop.set()
         self.naver_bot.stop()
-        self.naver_bot.close()
-        self.root.destroy()
+        try:
+            if hasattr(self, "cli_preferences"):
+                current = next(p for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt)
+                edited = self.base_text.get("1.0", "end").strip()
+                if edited:
+                    current["text"] = edited
+                self._save_cli_selection()
+            self.settings.update(self._general_settings_snapshot())
+            save_json(CONFIG_FILE, {**self.settings, "cli_workflow": self.cli_preferences,
+                                   "blog_prompt": self.base_text.get("1.0", "end").strip()})
+        except (OSError, ValueError) as exc:
+            self._closing = False
+            self.status.set(f"설정 저장에 실패해 창을 유지합니다. 작업은 중지했습니다: {exc}")
+            self._naver_log(f"종료 설정 저장 실패: {exc}")
+            return
+        self._finish_close_when_idle()
+
+    def _finish_close_when_idle(self):
+        if self._browser_task_busy():
+            self.status.set("작업이 안전하게 중지되면 프로그램을 종료합니다.")
+            self.root.after(100, self._finish_close_when_idle)
+            return
+        try:
+            self.naver_bot.close()
+        finally:
+            self.root.destroy()
 
 
 def main():
     wait_for_restart_parent(sys.argv[1:])
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    root = Tk()
-    PictureCleanerApp(root)
-    root.mainloop()
+    try:
+        with application_instance_lock(APP_DIR):
+            root = Tk()
+            PictureCleanerApp(root)
+            root.mainloop()
+    except ApplicationAlreadyRunning as exc:
+        notice = Tk()
+        notice.withdraw()
+        try:
+            messagebox.showinfo(APP_NAME, str(exc), parent=notice)
+        finally:
+            notice.destroy()
 
 
 if __name__ == "__main__":

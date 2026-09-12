@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets/default_blog_prompt.txt', 'assets')]
+datas = [('assets/default_blog_prompt.txt', 'assets'), ('assets/blog.ico', 'assets')]
 binaries = [('drivers\\chromedriver.exe', 'drivers')]
 hiddenimports = []
 tmp_ret = collect_all('PIL')

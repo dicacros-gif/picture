@@ -12,11 +12,12 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import threading
 import time
 import unicodedata
 from urllib.parse import parse_qs, unquote, urlsplit
+
+from blog_preferences import atomic_json_write
 
 
 _PATH_LOCKS: dict[str, threading.RLock] = {}
@@ -183,21 +184,10 @@ class TopicHistory:
             raise TopicHistoryError("발행 주제 이력을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다. 이력 파일을 확인하세요.") from exc
 
     def _write(self, data: dict) -> None:
-        temporary = None
         try:
-            descriptor, name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=self.path.parent)
-            temporary = Path(name)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(data, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
+            atomic_json_write(self.path, data)
         except OSError as exc:
             raise TopicHistoryError("발행 주제 이력을 저장하지 못했습니다. 다음 자동 발행 전에 저장 경로를 확인하세요.") from exc
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _entry(topic: str, result: dict, run_dir: str = "", keywords=None, title="") -> dict:
@@ -236,10 +226,32 @@ class TopicHistory:
             changed = new or key in data["pending"]
             if new:
                 data["published"][key] = self._entry(topic, result, run_dir, keywords, title)
+            else:
+                changed = self._enrich_entry(data["published"][key], result, run_dir, keywords, title) or changed
             data["pending"].pop(key, None)
             if changed:
                 self._write(data)
             return new
+
+    @classmethod
+    def _enrich_entry(cls, entry, result, run_dir="", keywords=None, title=""):
+        """Recover missing metadata only for the same confirmed publication URL."""
+        if _published_url(entry.get("url")) != _published_url(result.get("url")):
+            return False
+        changed = False
+        previous = cls._filtered(entry.get("keywords", []), set())
+        combined = cls._filtered([*previous, *cls._filtered(keywords or [], set())], set())
+        if combined != previous:
+            entry["keywords"] = combined
+            changed = True
+        supplied_title = normalize_topic(title or result.get("title", ""))[:500]
+        if not entry.get("title") and supplied_title:
+            entry["title"], entry["title_terms"] = supplied_title, title_terms(supplied_title)
+            changed = True
+        if not entry.get("run_dir") and run_dir:
+            entry["run_dir"] = str(run_dir)[:2000]
+            changed = True
+        return changed
 
     def record_uncertain(self, topic: str, result: dict, run_dir: str = "") -> bool:
         """Reserve only an actual browser submission receipt; do not consume its topic."""
@@ -269,10 +281,16 @@ class TopicHistory:
             changed = False
             for record in candidates:
                 key = topic_key(record["topic"])
+                keywords = self._filtered([record.get("source_topic", ""),
+                                          *self._filtered(record.get("keywords", []), set())], set())
                 if key not in data["published"]:
-                    data["published"][key] = self._entry(record["topic"], record["publication"], record.get("run_dir", ""))
+                    data["published"][key] = self._entry(record["topic"], record["publication"], record.get("run_dir", ""),
+                                                         keywords, record.get("title", ""))
                     imported += 1
                     changed = True
+                else:
+                    changed = self._enrich_entry(data["published"][key], record["publication"], record.get("run_dir", ""),
+                                                keywords, record.get("title", "")) or changed
                 if key in data["pending"]:
                     del data["pending"][key]
                     changed = True

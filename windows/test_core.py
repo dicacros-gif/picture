@@ -886,7 +886,7 @@ class CoreTests(unittest.TestCase):
                 automation, "_comment_action_elements", return_value=[reply_button]
             ) as actions,
             patch.object(
-                automation, "_submit_comment",
+                automation, "_submit_comment_once",
                 side_effect=lambda *_args: events.append("submit"),
             ) as submit,
         ):
@@ -1149,7 +1149,7 @@ class CoreTests(unittest.TestCase):
                     patch.object(automation, "_open_comments", return_value=True),
                     patch("naver_automation.random.choice", return_value=phrase),
                     patch.object(
-                        NaverAutomation, "_submit_comment",
+                        NaverAutomation, "_submit_comment_once",
                         return_value={"id": "9002", "author": "https://blog.naver.com/macdcross", "text": phrase},
                         side_effect=None if verified else RuntimeError("새 댓글 확인 실패"),
                     ) as submit,
@@ -1203,7 +1203,9 @@ class CoreTests(unittest.TestCase):
         netstat_output = (
             "  TCP    127.0.0.1:51955    0.0.0.0:0    LISTENING    36540\n"
         )
-        tasklist_output = '"whale.exe","36540","Console","1","100,000 K"\n'
+        profile = (Path("unused") / "naver-whale-profile").resolve()
+        process_output = json.dumps({"ProcessId": 36540,
+            "CommandLine": f'"C:\\Whale\\whale.exe" "--user-data-dir={profile}" --remote-debugging-port=51955'})
         response = MagicMock()
         response.json.return_value = {
             "Browser": "Chrome/148.0.7778.271",
@@ -1215,7 +1217,7 @@ class CoreTests(unittest.TestCase):
                 "naver_automation.subprocess.run",
                 side_effect=[
                     MagicMock(stdout=netstat_output),
-                    MagicMock(stdout=tasklist_output),
+                    MagicMock(stdout=process_output),
                 ],
             ),
             patch("naver_automation.requests.get", return_value=response),

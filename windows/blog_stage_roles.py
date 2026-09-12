@@ -20,6 +20,10 @@ def role_prompt(role, has_draft):
             "예외적으로 확인할 수 없거나 틀린 수치·기간·조건 문장은 제거하고 확인된 정보로 교체한다. "
             "이 부분 수정은 fact_corrections 배열에 index(0부터), old(기존 문장 250자 이내), new(교체문), reason, source_urls를 기록한다. "
             "새 사실을 담은 교체문에는 sources에서 확인된 1차 자료 URL을 반드시 연결한다. "
+            "추가 정보는 fact_additions 배열에 index(0부터), text(새 문장), source_urls를 기록한다. "
+            "일반 구역은 기존 문자열 끝에 빈 줄과 새 문장을 추가한다. 마지막 구역은 기존 해시태그 줄 바로 앞에 "
+            "새 문장과 빈 줄을 삽입하여 해시태그와 뜻과 의미로 끝나는 SEO 제목을 맨 아래 유지한다. "
+            "fact_corrections와 fact_additions에는 이번 단계의 변경만 기록하고 이전 단계 배열을 그대로 복사하지 않는다. "
             "확인하지 못한 자료를 확인했다고 표시하지 않는다."
         ),
         "문체 다듬기": (
@@ -34,12 +38,26 @@ def role_prompt(role, has_draft):
 def check_role_change(role, previous, result):
     if not previous:
         return
+    if not isinstance(previous, dict) or not isinstance(result, dict):
+        raise ValueError('역할 검수에는 기존 원고와 수정 원고 객체가 필요합니다.')
+    old, new = previous.get('paragraphs'), result.get('paragraphs')
+    if (not isinstance(old, list) or not isinstance(new, list) or len(old) != len(new)
+            or any(not isinstance(value, str) for value in [*old, *new])):
+        raise ValueError('기존 구역의 개수와 문자열 구조를 유지해야 합니다.')
     if role == "팩트·최신 정보 보강":
-        old, new = previous.get("paragraphs", []), result.get("paragraphs", [])
         corrected = list(old)
-        verified = {source.get('url') for source in result.get('sources', []) if isinstance(source, dict)
+        sources = result.get('sources', [])
+        if not isinstance(sources, list):
+            raise ValueError('팩트 검증 출처는 배열이어야 합니다.')
+        verified = {source.get('url') for source in sources if isinstance(source, dict)
+                    and isinstance(source.get('url'), str)
                     and source.get('verified') is True and source.get('is_primary') is True}
-        for patch in result.get('fact_corrections', []):
+        patches, additions = result.get('fact_corrections', []), result.get('fact_additions', [])
+        if not isinstance(patches, list) or not isinstance(additions, list):
+            raise ValueError('팩트 부분 수정과 추가 정보는 각각 배열이어야 합니다.')
+        for patch in patches:
+            if not isinstance(patch, dict):
+                raise ValueError('팩트 부분 수정 항목은 객체여야 합니다.')
             index, before, after = patch.get('index'), patch.get('old'), patch.get('new')
             if (type(index) is not int or not 0 <= index < len(corrected)
                     or not isinstance(before, str) or not 5 <= len(before) <= 250
@@ -49,11 +67,31 @@ def check_role_change(role, previous, result):
             if after and (not isinstance(urls, list) or not urls or any(url not in verified for url in urls)):
                 raise ValueError('팩트 교체문에 확인된 1차 자료가 필요합니다.')
             corrected[index] = corrected[index].replace(before, after, 1)
-        if previous.get("title") != result.get("title") or len(old) != len(new) or any(
-                not after.startswith(before) for before, after in zip(corrected, new)):
+        for addition in additions:
+            if not isinstance(addition, dict):
+                raise ValueError('팩트 추가 항목은 객체여야 합니다.')
+            index, text = addition.get('index'), addition.get('text')
+            urls = addition.get('source_urls')
+            if (type(index) is not int or not 0 <= index < len(corrected) or not isinstance(text, str)
+                    or not text.strip() or not isinstance(urls, list) or not urls
+                    or any(url not in verified for url in urls)):
+                raise ValueError('추가 사실에 올바른 구역·문장·확인된 1차 자료가 필요합니다.')
+            section = corrected[index]
+            footer = re.search(r'(?m)^[ \t]*#[^\s#]+(?:[ \t]+#[^\s#]+){9,}[ \t]*$', section)
+            if footer and index == len(corrected) - 1:
+                corrected[index] = section[:footer.start()] + text.strip() + '\n\n' + section[footer.start():]
+            else:
+                corrected[index] = section + '\n\n' + text.strip()
+        # A missing additions field is accepted only for old append-only results.
+        # Fresh schema responses must account for every added sentence.
+        mismatch = (any(after != before for before, after in zip(corrected, new)) if 'fact_additions' in result else
+                    any(not after.startswith(before) for before, after in zip(corrected, new)))
+        if previous.get("title") != result.get("title") or mismatch:
             raise ValueError("팩트 보강 단계가 기존 제목·문단을 변경했습니다. 기존 문장을 유지하고 확인된 정보만 덧붙여야 합니다.")
     if role == "문체 다듬기":
-        def numbers(article):
-            return sorted(re.findall(r"\d+(?:[.,]\d+)*", " ".join(article.get("paragraphs", []))))
-        if numbers(previous) != numbers(result):
-            raise ValueError("문체 단계에서 본문의 수치·날짜가 변경되었습니다. 사실을 유지한 수정이 필요합니다.")
+        def numbers(text):
+            values = re.findall(r"\d+(?:[.,]\d+)*(?:\s*(?:퍼센트|개월|만원|억원|시간|달러|킬로미터|원|년|월|일|주|분|초|회|번|명|개|배|%|kg|km|cm|mm))?", text)
+            return sorted(re.sub(r'(?<=\d),(?=\d{3}(?:\D|$))', '', re.sub(r'\s+', '', value)) for value in values)
+        if numbers(str(previous.get('title', ''))) != numbers(str(result.get('title', ''))) or any(
+                numbers(before) != numbers(after) for before, after in zip(old, new)):
+            raise ValueError("문체 단계에서 제목·구역의 수치·날짜·단위가 변경되었습니다. 사실을 유지한 수정이 필요합니다.")
