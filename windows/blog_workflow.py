@@ -372,6 +372,82 @@ def _validate_text_review(review: Any):
         raise WorkflowError("CLI 원고 검수에 해결되지 않은 문제가 있습니다." + (" " + detail if detail else ""))
 
 
+def _apply_humanize_response(article, response):
+    """Keep valid short style edits; a failed numeric invariant preserves its old text."""
+    patches = response.get('paragraph_patches') if isinstance(response, dict) else None
+    if (not isinstance(patches, list) or len(patches) > 8
+            or any(field in response for field in ('paragraphs', 'title', 'sources', 'review', 'image_prompts'))):
+        raise WorkflowFormatError("최종 문체 응답은 전체 재작성이 아닌 최대 8개 문장 교체여야 합니다.")
+    counts, lengths = {}, {}
+    for item in patches:
+        if not isinstance(item, dict):
+            raise WorkflowFormatError("최종 문체 수정 항목은 구역·원문·교체문 객체여야 합니다.")
+        index, old, new = item.get('index'), item.get('old'), item.get('new')
+        if (type(index) is not int or not 0 <= index < len(article['paragraphs'])
+                or not isinstance(old, str) or not 1 <= len(old) <= 500
+                or not isinstance(new, str) or not 1 <= len(new) <= 750):
+            raise WorkflowFormatError("최종 문체 수정의 구역·원문·교체문 길이가 올바르지 않습니다.")
+        counts[index], lengths[index] = counts.get(index, 0) + 1, lengths.get(index, 0) + len(old)
+        if counts[index] > 2 or lengths[index] > len(article['paragraphs'][index]) // 3:
+            raise WorkflowFormatError("최종 문체 수정은 구역당 짧은 문장 2개와 원문 3분의 1 이내여야 합니다.")
+    permitted = [{'index': i, 'code': 'natural_finish'} for i in range(len(article['paragraphs']))]
+    try:
+        # Reject structural errors as before, including an absent/ambiguous old
+        # string. A dependency on a later-rejected edit is handled separately.
+        apply_patches(article, {'paragraph_patches': patches}, permitted)
+    except ValueError as exc:
+        raise WorkflowFormatError(str(exc)) from exc
+    repaired, accepted, rejected = copy.deepcopy(article), [], []
+    for number, item in enumerate(patches):
+        try:
+            candidate = apply_patches(repaired, {'paragraph_patches': [item]}, permitted)
+            check_role_change('문체 다듬기', repaired, candidate)
+        except ValueError as exc:
+            rejected.append({'patch_number': number, 'index': item['index'], 'old': item['old'],
+                             'new': item['new'], 'reason': str(exc)})
+            continue
+        repaired = candidate
+        accepted.append(number)
+    check_role_change('문체 다듬기', article, repaired)
+
+    # Response metadata may describe a rejected replacement. Prefer phrases
+    # present in the accepted copy, then the corresponding preserved old ones.
+    omitted = []
+    for field in ('bridge_sentences', 'subheading_keywords', 'bold_terms', 'bold_phrases', 'highlight_phrases'):
+        if field not in article and field not in response:
+            continue
+        previous = article.get(field, [])
+        previous = list(previous) if isinstance(previous, list) and all(isinstance(v, str) for v in previous) else []
+        for number in accepted:
+            item = patches[number]
+            previous = [value.replace(item['old'], item['new'])
+                if field not in {'bridge_sentences', 'subheading_keywords'} or index == item['index'] else value
+                for index, value in enumerate(previous)]
+        proposed = response.get(field, [])
+        proposed = proposed if isinstance(proposed, list) and all(isinstance(v, str) for v in proposed) else []
+        if field in {'bridge_sentences', 'subheading_keywords'}:
+            if len(proposed) != len(repaired['paragraphs']):
+                proposed = []
+            values = []
+            for index, paragraph in enumerate(repaired['paragraphs']):
+                eligible = paragraph if field == 'bridge_sentences' else '\n'.join(
+                    line for line in paragraph.splitlines() if line.lstrip('\ufeff \t').startswith('❝'))
+                choices = [items[index] for items in (proposed, previous) if len(items) > index]
+                values.append(next((value for value in choices if value and value in eligible), ''))
+        else:
+            choices = list(dict.fromkeys([*proposed, *previous]))
+            if field == 'highlight_phrases':
+                values = list(choose_visual_style(repaired['paragraphs'], [], choices)['highlight_phrases'])
+            elif field == 'bold_phrases':
+                values = choose_visual_style(repaired['paragraphs'], choices, [])['bold_phrases']
+            else:
+                values = [value for value in choices if value and any(value in paragraph for paragraph in repaired['paragraphs'])]
+        omitted.extend({'field': field, 'text': value} for value in proposed if value and value not in values)
+        repaired[field] = values
+    return repaired, {'patch_count': len(accepted), 'requested_patch_count': len(patches),
+                      'accepted_patch_numbers': accepted, 'rejected_patches': rejected, 'metadata_filtered': omitted}
+
+
 def derive_bold_terms(article: dict, keywords: list[str]) -> list[str]:
     """Formatting metadata only; never insert markup or new visible claims."""
     body = "\n".join(article.get("paragraphs", []))
@@ -1033,29 +1109,11 @@ class BlogWorkflow:
         self.log(f"최종 문체 · {route['provider']} CLI로 자연스러운 문장 부분 검수 1회")
         response = self._text_call(run_dir, 'editorial-natural-finish', route['provider'], prompt, models,
                                    timeout=180, retry_transient=False)
-        patches = response.get('paragraph_patches')
-        if (not isinstance(patches, list) or len(patches) > 8
-                or any(field in response for field in ('paragraphs', 'title', 'sources', 'review', 'image_prompts'))):
-            raise WorkflowFormatError("최종 문체 응답은 전체 재작성이 아닌 최대 8개 문장 교체여야 합니다.")
-        counts, lengths = {}, {}
-        for item in patches:
-            if not isinstance(item, dict):
-                raise WorkflowFormatError("최종 문체 수정 항목은 구역·원문·교체문 객체여야 합니다.")
-            index, old, new = item.get('index'), item.get('old'), item.get('new')
-            if (type(index) is not int or not 0 <= index < len(article['paragraphs'])
-                    or not isinstance(old, str) or not 1 <= len(old) <= 500
-                    or not isinstance(new, str) or not 1 <= len(new) <= 750):
-                raise WorkflowFormatError("최종 문체 수정의 구역·원문·교체문 길이가 올바르지 않습니다.")
-            counts[index], lengths[index] = counts.get(index, 0) + 1, lengths.get(index, 0) + len(old)
-            if counts[index] > 2 or lengths[index] > len(article['paragraphs'][index]) // 3:
-                raise WorkflowFormatError("최종 문체 수정은 구역당 짧은 문장 2개와 원문 3분의 1 이내여야 합니다.")
-        try:
-            repaired = apply_patches(article, response, [{'index': i, 'code': 'natural_finish'} for i in range(8)])
-            check_role_change('문체 다듬기', article, repaired)
-        except ValueError as exc:
-            raise WorkflowFormatError(str(exc)) from exc
+        repaired, details = _apply_humanize_response(article, response)
+        for rejected in details['rejected_patches']:
+            self.log(f"최종 문체 {rejected['index'] + 1}구역 원문 유지 · {rejected['reason']}")
         return repaired, {"status": "completed", "provider": route['provider'], "model": route.get('model', ''),
-                          "patch_count": len(patches), "upstream_sha256": _json_hash(article),
+                          **details, "upstream_sha256": _json_hash(article),
                           "article_sha256": _json_hash(repaired)}
 
     def _review_image(self, run_dir, candidate, paragraphs, steps, review_mode, models, name, stages=None):

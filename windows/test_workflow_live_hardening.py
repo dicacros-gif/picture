@@ -86,11 +86,14 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
         self.assertEqual(result['editorial_quality']['humanization']['patch_count'], 1)
         self.assertEqual(result['final_reviews'][0]['provider'], 'chatgpt')
 
-    def test_style_amount_change_is_rejected_before_image_generation(self):
+    def test_style_amount_change_keeps_original_and_still_requires_independent_audit(self):
         self.bridge.article['paragraphs'][0] += '\n교체 비용은 100만원입니다.'
         self.natural_bridge({'paragraph_patches': [{'index': 0, 'old': '100만원입니다.', 'new': '100원입니다.'}]})
-        self.assert_blocked('수치·날짜·단위', **self.natural_options())
-        self.assertFalse(self.bridge.generations)
+        result = self.prepare(**self.natural_options())
+        self.assertIn('100만원입니다.', result['paragraphs'][0])
+        self.assertEqual(result['editorial_quality']['humanization']['patch_count'], 0)
+        self.assertEqual(len(result['editorial_quality']['humanization']['rejected_patches']), 1)
+        self.assertTrue(result['final_reviews'])
 
     def test_style_full_rewrite_is_rejected_before_image_generation(self):
         self.natural_bridge({'paragraph_patches': [], 'paragraphs': self.bridge.article['paragraphs']})
