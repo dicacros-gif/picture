@@ -111,6 +111,70 @@ class InterruptedPreparationTests(unittest.TestCase):
 
 
 class GoogleCandidateReuseTests(unittest.TestCase):
+    def google_app(self, folder, workflow, count=3):
+        app = ui_support.BlogUiTests.make_app(self, folder, {})
+        app._preflight_cli_accounts = Mock()
+        app.naver_bot = Mock()
+        workflow.return_value.prepare.return_value = {'topic': '전기요금', 'run_dir': str(Path(folder) / 'blog-runs' / 'new')}
+        workflow.return_value.plan_google_image_search.return_value = {
+            'query': 'home electricity meter',
+            'queries': ['home electricity meter', 'household power socket', 'domestic solar panels', 'ignored fourth query']}
+        config = {'steps': ['chatgpt'], 'models': {}, 'include_google': True, 'base_prompt': '지침',
+                  'review_mode': '단계별 교차 검수', 'blog_id': 'owner', 'google_reference_count': count}
+        return app, config
+
+    def test_alternative_queries_keep_candidates_deduplicate_and_stop_at_goal(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.google_app(folder, workflow)
+            first = {'path': str(Path(folder) / 'one.jpg'), 'image_url': 'https://example.org/one.jpg', 'capture_sha256': 'one'}
+            second = {'path': str(Path(folder) / 'two.jpg'), 'image_url': 'https://example.org/two.jpg', 'capture_sha256': 'two'}
+            third = {'path': str(Path(folder) / 'three.jpg'), 'image_url': 'https://example.org/three.jpg', 'capture_sha256': 'three'}
+            app.naver_bot.capture_google_reference_candidates.side_effect = [[first], [dict(first), second, third]]
+            app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            calls = app.naver_bot.capture_google_reference_candidates.call_args_list
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([call.kwargs['count'] for call in calls], [3, 3])
+            self.assertNotEqual(calls[0].args[1], calls[1].args[1])
+            self.assertTrue(all(call.kwargs['reuse_only'] and call.kwargs['english_only'] for call in calls))
+            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], [first, second, third])
+
+    def test_three_kept_photos_scan_past_duplicate_leading_result_to_reach_four(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.google_app(folder, workflow, count=4)
+            photos = [{'path': str(Path(folder) / f'{index}.jpg'),
+                       'image_url': f'https://example.org/{index}.jpg', 'capture_sha256': str(index)}
+                      for index in range(5)]
+            batches = [photos[:3], [dict(photos[0]), photos[3], photos[4]]]
+            def capture(_query, _folder, **kwargs):
+                return batches.pop(0)[:kwargs['count']]
+            app.naver_bot.capture_google_reference_candidates.side_effect = capture
+            app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            calls = app.naver_bot.capture_google_reference_candidates.call_args_list
+            self.assertEqual([call.kwargs['count'] for call in calls], [4, 4])
+            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], photos[:4])
+
+    def test_search_failure_uses_remaining_queries_without_discarding_results(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.google_app(folder, workflow)
+            one = {'path': str(Path(folder) / 'one.jpg')}
+            two = {'path': str(Path(folder) / 'two.jpg')}
+            app.naver_bot.capture_google_reference_candidates.side_effect = [[one], RuntimeError('preview timeout'), [two]]
+            app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            self.assertEqual(app.naver_bot.capture_google_reference_candidates.call_count, 3)
+            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], [one, two])
+
+    def test_stop_in_google_capture_never_starts_more_searches_or_writing(self):
+        with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
+            app, config = self.google_app(folder, workflow)
+            def cancel(*args, **kwargs):
+                app.full_auto_stop.set()
+                raise RuntimeError('stopped')
+            app.naver_bot.capture_google_reference_candidates.side_effect = cancel
+            with self.assertRaisesRegex(WorkflowError, '중지'):
+                app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
+            app.naver_bot.capture_google_reference_candidates.assert_called_once()
+            workflow.return_value.prepare.assert_not_called()
+
     def test_resume_reuses_english_source_candidates_without_new_search(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
             app = ui_support.BlogUiTests.make_app(self, folder, {})
@@ -158,6 +222,30 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             for directory in (run, source, auxiliary):
                 self.assertTrue(directory.exists())
             self.assertFalse(expired.exists())
+
+
+class EarlyResumeReceiptTests(unittest.TestCase):
+    def test_pointer_written_before_work_and_preserves_fixed_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = object.__new__(BlogWorkflowControls)
+            app.cli_app_dir, app._naver_log = Path(folder), Mock()
+            run = Path(folder) / 'blog-runs' / 'current'
+            atomic_json_write(run / 'request.json', {'topic': '전기요금'})
+            atomic_json_write(run / 'manifest.json', {'status': 'preparing'})
+            pending_path = Path(folder) / 'pending-blog-topic.json'
+            original = {'phase': 'preparing', 'choice': {'topic': '전기요금'}, 'config': {'base_prompt': '지침', 'interval_hours': 1}}
+            atomic_json_write(pending_path, original)
+            app._remember_preparing_run('전기요금', run)
+            saved = json.loads(pending_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved['resume_run_dir'], str(run.resolve()))
+            self.assertEqual(saved['config'], original['config'])
+            before = pending_path.read_bytes()
+            with self.assertRaises(WorkflowError):
+                app._remember_preparing_run('다른 주제', run)
+            self.assertEqual(pending_path.read_bytes(), before)
+            with self.assertRaises(WorkflowError):
+                app._remember_preparing_run('전기요금', Path(folder))
+            self.assertEqual(pending_path.read_bytes(), before)
 
 
 if __name__ == '__main__':

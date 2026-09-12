@@ -27,6 +27,7 @@ from blog_workflow import BlogWorkflow
 from blog_preferences import (atomic_json_write, automation_config_snapshot, blocked_term_hits,
                               load_settings_json, save_settings_json)
 from blog_runtime import ApplicationAlreadyRunning, application_instance_lock, access_error_from_exception, wait_for_restart_parent
+from blog_diagnostics import BlogDiagnostics, capture_thread_exceptions, redact_diagnostic
 from naver_automation import NaverAutomation
 
 
@@ -629,6 +630,8 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.root.geometry("1180x780")
         self.root.minsize(940, 650)
         self.events: queue.Queue[tuple] = queue.Queue()
+        self.diagnostics = BlogDiagnostics(APP_DIR / "logs" / "blog.log")
+        self.root.bind("<Destroy>", lambda event: self._close_diagnostics() if event.widget is self.root else None, add="+")
         loaded_settings = load_json(CONFIG_FILE, {})
         self.settings = loaded_settings if isinstance(loaded_settings, dict) else {}
         self.dark_mode = BooleanVar(value=self.settings.get("dark_mode", False))
@@ -709,6 +712,9 @@ class PictureCleanerApp(BlogWorkflowControls):
             self.status.set(recovery["message"])
             self._naver_log(recovery["message"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.report_callback_exception = lambda kind, value, trace: self._report_uncaught_exception(
+            "화면 콜백 예외", kind, value, trace)
+        self._naver_log("프로그램 시작 · Blog")
         self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
         self.root.after_idle(self._maximize_window)
         # 일부 Windows 환경은 최초 매핑 직후 창 상태를 다시 복원하므로 한 번 더 적용한다.
@@ -1508,7 +1514,26 @@ class PictureCleanerApp(BlogWorkflowControls):
         ttk.Label(self.comment_tab, text="댓글 작업 상황은 모든 탭 하단의 전체 진행 상황에서 확인합니다.").pack(anchor="w")
 
     def _naver_log(self, message):
-        self.events.put(("naver_log", message))
+        safe = redact_diagnostic(message)
+        self.events.put(("naver_log", safe))
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            warning = diagnostics.write(safe)
+            if warning:
+                self.events.put(("naver_log", warning))
+
+    def _report_uncaught_exception(self, label, kind, value, trace):
+        self.events.put(("naver_log", redact_diagnostic(f"{label}: {kind.__name__}: {value}")))
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            warning = diagnostics.exception(label, kind, value, trace)
+            if warning:
+                self.events.put(("naver_log", warning))
+
+    def _close_diagnostics(self):
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.close()
 
     def _start_naver_task(self, label, target, *args):
         if self._browser_task_busy():
@@ -2631,7 +2656,11 @@ class PictureCleanerApp(BlogWorkflowControls):
             return
         try:
             self.naver_bot.close()
+        except Exception:
+            self._report_uncaught_exception("브라우저 종료 예외", *sys.exc_info())
         finally:
+            self._naver_log("프로그램 종료 · Blog")
+            self._close_diagnostics()
             self.root.destroy()
 
 
@@ -2640,8 +2669,22 @@ def main():
     try:
         with application_instance_lock(APP_DIR):
             root = Tk()
-            PictureCleanerApp(root)
-            root.mainloop()
+            application = None
+            try:
+                application = PictureCleanerApp(root)
+                with capture_thread_exceptions(application._report_uncaught_exception):
+                    root.mainloop()
+            except Exception:
+                if application is not None:
+                    application._report_uncaught_exception("프로그램 예외", *sys.exc_info())
+                else:
+                    diagnostics = BlogDiagnostics(APP_DIR / "logs" / "blog.log")
+                    diagnostics.exception("프로그램 시작 예외", *sys.exc_info())
+                    diagnostics.close()
+                raise
+            finally:
+                if application is not None:
+                    application._close_diagnostics()
     except ApplicationAlreadyRunning as exc:
         notice = Tk()
         notice.withdraw()

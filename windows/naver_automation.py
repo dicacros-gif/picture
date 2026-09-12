@@ -1891,6 +1891,20 @@ class NaverAutomation:
                 finally:
                     driver.switch_to.window(previous)
 
+    @staticmethod
+    def _reference_diagnostic_url(value) -> str:
+        """Keep public page identity without URL credentials, queries or blobs."""
+        if not isinstance(value, str):
+            return ""
+        try:
+            parts = urllib.parse.urlparse(value)
+            if parts.scheme not in {"http", "https"} or not parts.hostname:
+                return (parts.scheme + ":(omitted)") if parts.scheme else ""
+            host = parts.hostname + (":" + str(parts.port) if parts.port else "")
+            return urllib.parse.urlunparse((parts.scheme, host, parts.path, "", "", ""))[:500]
+        except ValueError:
+            return ""
+
     def capture_google_reference_candidates(
         self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False, english_only: bool = False
     ) -> list[dict]:
@@ -1919,50 +1933,110 @@ class NaverAutomation:
         if english_only:
             search_options["lr"] = "lang_en"
         search_url = "https://www.google.com/search?" + urllib.parse.urlencode(search_options)
-        driver.get(search_url)
         # Current Google image results use unclassified dimg_* images inside
         # result cards. YQ4gaf now also occurs on tiny suggestion chips.
         selector = "div[data-img-wrapper] img, div[data-preview-id] img, img.YQ4gaf, img.rg_i, div[data-ri] img"
         candidates: list[dict] = []
+        candidate_started = None
+        termination_reason = ""
+        consecutive_preview_failures = 0
         diagnostics = {"query": keyword, "english_only": english_only, "reuse_only": reuse_only,
                        "requested_count": count, "selector": selector, "scan_limit": 60,
-                       "thumbnails_found": 0, "scanned_count": 0, "rejection_counts": {}, "rejections": []}
+                       "candidate_time_budget_seconds": 90, "preview_failure_limit": 3,
+                       "thumbnails_found": 0, "scanned_count": 0, "rejection_counts": {}, "rejections": [],
+                       "result_load_samples": [], "photo_candidates": [], "preview_attempts": []}
+        def safe_text(value, limit=300):
+            if not isinstance(value, str):
+                return ""
+            return re.sub(r"https?://[^\s<>]+", lambda m: self._reference_diagnostic_url(m.group()), value)[:limit]
         def reject(rank, reason, **observed):
             counts = diagnostics["rejection_counts"]
             counts[reason] = counts.get(reason, 0) + 1
+            for key in list(observed):
+                if key.endswith("url"):
+                    observed[key] = self._reference_diagnostic_url(observed[key])
+                elif key == "error":
+                    observed[key] = safe_text(observed[key], 500)
             diagnostics["rejections"].append({"rank": rank, "reason": reason, **observed})
         def finish(status):
             diagnostics.update(status=status, captured_count=len(candidates))
+            diagnostics["consecutive_preview_failures"] = consecutive_preview_failures
+            if candidate_started is not None:
+                diagnostics["candidate_elapsed_seconds"] = round(time.monotonic() - candidate_started, 2)
+            try:
+                diagnostics.update(final_url=self._reference_diagnostic_url(driver.current_url),
+                                   final_title=safe_text(driver.title))
+            except WebDriverException:
+                diagnostics["page_observation_unavailable"] = True
             _save(output_dir / "google_reference_diagnostics.json", diagnostics)
             _save(output_dir / "google_reference_manifest.json", candidates)
             counts = ", ".join(f"{key}={value}" for key, value in diagnostics["rejection_counts"].items()) or "없음"
             self.log(f"Google 참고 이미지 진단 · 검색 요소 {diagnostics['thumbnails_found']}개 · "
                      f"검토 {diagnostics['scanned_count']}개 · 확보 {len(candidates)}/{count}장 · 제외: {counts}")
+        latest_photos, latest_rejections = [], []
+        previous_signature, stable_polls = None, 0
+        def settled_photos(d):
+            nonlocal latest_photos, latest_rejections, previous_signature, stable_polls
+            if self.stop_event.is_set():
+                raise RuntimeError("사용자가 작업을 중지했습니다.")
+            thumbnails = d.find_elements(By.CSS_SELECTOR, selector)
+            latest_photos, latest_rejections = [], []
+            for rank, thumbnail in enumerate(thumbnails, 1):
+                try:
+                    if not thumbnail.is_displayed():
+                        latest_rejections.append((rank, "thumbnail_hidden", {}))
+                        continue
+                    rect = thumbnail.rect
+                    if rect["width"] < 110 or rect.get("height", 0) < 80:
+                        latest_rejections.append((rank, "thumbnail_too_small", {"width": rect["width"], "height": rect.get("height")}))
+                        continue
+                    element_id = thumbnail.get_attribute("id")
+                    latest_photos.append((rank, thumbnail, element_id if isinstance(element_id, str) else ""))
+                except StaleElementReferenceException:
+                    latest_rejections.append((rank, "thumbnail_unavailable", {}))
+            diagnostics["thumbnails_found"] = len(thumbnails)
+            if len(diagnostics["result_load_samples"]) < 60:
+                diagnostics["result_load_samples"].append({"elements": len(thumbnails), "photos": len(latest_photos)})
+            signature = tuple(element_id or str(thumbnail.id) for _, thumbnail, element_id in latest_photos)
+            stable_polls = stable_polls + 1 if signature and signature == previous_signature else 1
+            previous_signature = signature
+            # Require several unchanged photo observations. An icon alone
+            # never ends the wait; sparse results receive more settling time.
+            return latest_photos if latest_photos and stable_polls >= (3 if len(latest_photos) >= count else 5) else None
         try:
-            WebDriverWait(driver, 20).until(lambda d: d.find_elements(By.CSS_SELECTOR, selector))
-        except TimeoutException:
+            if self.stop_event.is_set():
+                raise RuntimeError("사용자가 작업을 중지했습니다.")
+            driver.get(search_url)
+            try:
+                WebDriverWait(driver, 20, poll_frequency=.4).until(settled_photos)
+                diagnostics["results_stabilized"] = True
+            except TimeoutException:
+                diagnostics["results_stabilized"] = False
+            eligible_thumbnails = latest_photos
+        except RuntimeError:
+            finish("cancelled")
+            raise
+        except WebDriverException as exc:
+            reject(0, "search_navigation_error", error=str(exc))
+            finish("search_error")
+            raise
+        for rank, reason, observed in latest_rejections:
+            reject(rank, reason, **observed)
+        diagnostics["eligible_thumbnails"] = len(eligible_thumbnails)
+        if not eligible_thumbnails:
             reject(0, "search_results_missing")
             finish("no_results")
-            self.log("Google 참고 이미지 검색 결과가 없어 생성 이미지로 진행합니다.")
+            self.log("Google 참고 이미지 검색 결과에 사진이 없어 다음 검색어 또는 생성 이미지로 진행합니다.")
             return []
-        seen: set[str] = set()
-        thumbnails = driver.find_elements(By.CSS_SELECTOR, selector)
-        diagnostics["thumbnails_found"] = len(thumbnails)
-        eligible_thumbnails = []
-        for rank, thumbnail in enumerate(thumbnails, 1):
+        for rank, thumbnail, element_id in eligible_thumbnails[:60]:
             try:
-                if not thumbnail.is_displayed():
-                    reject(rank, "thumbnail_hidden")
-                    continue
-                rect = thumbnail.rect
-                if rect["width"] < 110 or rect.get("height", 0) < 80:
-                    reject(rank, "thumbnail_too_small", width=rect["width"], height=rect.get("height"))
-                    continue
-                element_id = thumbnail.get_attribute("id")
-                eligible_thumbnails.append((rank, thumbnail, element_id if isinstance(element_id, str) else ""))
-            except WebDriverException as exc:
-                reject(rank, "thumbnail_unavailable", error=str(exc)[:300])
-        diagnostics["eligible_thumbnails"] = len(eligible_thumbnails)
+                diagnostics["photo_candidates"].append({"rank": rank, "id": safe_text(element_id, 120),
+                    "alt": safe_text(thumbnail.get_attribute("alt")),
+                    "src": self._reference_diagnostic_url(thumbnail.get_attribute("src"))})
+            except StaleElementReferenceException:
+                diagnostics["photo_candidates"].append({"rank": rank, "id": safe_text(element_id, 120), "stale": True})
+        seen: set[str] = set()
+        candidate_started = time.monotonic()
         # The scan budget applies to photographs, not icons preceding them.
         for rank, thumbnail, element_id in eligible_thumbnails[:60]:
             if self.stop_event.is_set():
@@ -1970,23 +2044,27 @@ class NaverAutomation:
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
             if len(candidates) >= count:
                 break
+            if time.monotonic() - candidate_started >= diagnostics["candidate_time_budget_seconds"]:
+                termination_reason = "time_budget_exhausted"
+                reject(rank, termination_reason)
+                self.log("Google 참고 이미지 후보 검토 90초 한도에 도달해 확보한 사진을 유지하고 다음 검색어로 진행합니다.")
+                break
             diagnostics["scanned_count"] += 1
             stage, preview_observations = "thumbnail", []
             try:
-                # Opening/closing the preview replaces Google's result nodes.
-                # Resolve the recorded search result again before each click.
-                if element_id:
-                    current = driver.find_elements(By.ID, element_id)
-                    if not current:
-                        reject(rank, "thumbnail_unavailable")
-                        continue
-                    thumbnail = current[0]
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", thumbnail)
-                stage = "preview"
                 def preview_ready(d):
+                    if self.stop_event.is_set():
+                        raise RuntimeError("사용자가 작업을 중지했습니다.")
                     viable = []
                     preview_observations.clear()
-                    for element in d.find_elements(By.CSS_SELECTOR, "img.sFlh5c, img.iPVvYb, img.n3VNCb, div[role='dialog'] img"):
+                    preview_elements = d.find_elements(By.CSS_SELECTOR, "img.sFlh5c, img.iPVvYb, img.n3VNCb, div[role='dialog'] img")
+                    selector_counts = d.execute_script("""return Object.fromEntries(
+                      ['img.sFlh5c','img.iPVvYb','img.n3VNCb',"div[role='dialog'] img"].map(
+                        selector=>[selector,document.querySelectorAll(selector).length]));""")
+                    attempt_record["selector_counts"] = ({str(key): value for key, value in selector_counts.items()
+                                                          if type(value) is int} if isinstance(selector_counts, dict) else {})
+                    attempt_record["selector_counts"]["combined"] = len(preview_elements)
+                    for element in preview_elements:
                         try:
                             displayed = element.is_displayed()
                             info = d.execute_script("""
@@ -2011,19 +2089,44 @@ class NaverAutomation:
                                 and info.get("url") not in seen):
                             viable.append((info["width"] * info["height"], element, info))
                     return max(viable, key=lambda value: value[0])[1:] if viable else None
-                preview, info = WebDriverWait(driver, 5).until(preview_ready)
+                for attempt in range(1, 3):
+                    attempt_record = {"rank": rank, "attempt": attempt, "selector_counts": {}}
+                    diagnostics["preview_attempts"].append(attempt_record)
+                    try:
+                        if self.stop_event.is_set():
+                            raise RuntimeError("사용자가 작업을 중지했습니다.")
+                        # Resolve the selected result again after DOM changes.
+                        if element_id:
+                            current = driver.find_elements(By.ID, element_id)
+                            if not current:
+                                raise StaleElementReferenceException("Selected photo result was replaced")
+                            thumbnail = current[0]
+                        stage = "preview"
+                        driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", thumbnail)
+                        preview, info = WebDriverWait(driver, 5, poll_frequency=.25).until(preview_ready)
+                        links = driver.execute_script("""
+                            const links=[];
+                            for (const start of arguments) {
+                              let e=start;
+                              for (let level=0;e && level<4;level++,e=e.parentElement) {
+                                if(e.matches('a[href]')) links.push(e.href);
+                                links.push(...[...e.querySelectorAll('a[href]')].map(a=>a.href));
+                              }
+                            }
+                            return [...new Set(links)];
+                        """, preview, thumbnail)
+                        attempt_record.update(status="ready", observations=list(preview_observations))
+                        break
+                    except (StaleElementReferenceException, TimeoutException) as exc:
+                        attempt_record.update(status="retry" if attempt == 1 else "failed",
+                                              error=safe_text(str(exc)), observations=list(preview_observations))
+                        if attempt == 2:
+                            raise
+                        self.log(f"Google 참고 이미지 {rank}번 · 미리보기 로딩을 한 번 더 확인합니다.")
+                consecutive_preview_failures = 0
                 stage = "source_license"
-                links = driver.execute_script("""
-                    const links=[];
-                    for (const start of arguments) {
-                      let e=start;
-                      for (let level=0;e && level<4;level++,e=e.parentElement) {
-                        if(e.matches('a[href]')) links.push(e.href);
-                        links.push(...[...e.querySelectorAll('a[href]')].map(a=>a.href));
-                      }
-                    }
-                    return [...new Set(links)];
-                """, preview, thumbnail)
+                if self.stop_event.is_set():
+                    raise RuntimeError("사용자가 작업을 중지했습니다.")
                 source_url = self._reference_source_url(links or [])
                 evidence = self._inspect_reference_license(driver, source_url, info["url"], english_only=True) if english_only else \
                     self._inspect_reference_license(driver, source_url, info["url"])
@@ -2045,6 +2148,8 @@ class NaverAutomation:
                     self.log(f"Google 참고 이미지 {rank}번 · 출처 표시 없는 재사용 권한을 확인하지 못해 다음 후보를 확인합니다.")
                     continue
                 stage = "capture"
+                if self.stop_event.is_set():
+                    raise RuntimeError("사용자가 작업을 중지했습니다.")
                 old_style = preview.get_attribute("style") or ""
                 try:
                     driver.execute_script("arguments[0].style.setProperty('object-fit','contain','important');", preview)
@@ -2077,9 +2182,22 @@ class NaverAutomation:
             except (WebDriverException, OSError, ValueError) as exc:
                 reject(rank, "preview_timeout" if isinstance(exc, TimeoutException) and stage == "preview" else "candidate_error",
                        stage=stage, error=str(exc)[:500], preview_observations=preview_observations)
-                self.log(f"Google 참고 이미지 후보 {rank}번 건너뜀: {type(exc).__name__} · {str(exc).split('Stacktrace:', 1)[0].strip()[:200]}")
+                self.log(f"Google 참고 이미지 후보 {rank}번 건너뜀: {type(exc).__name__} · {safe_text(str(exc).split('Stacktrace:', 1)[0].strip(), 200)}")
+                if stage in {"thumbnail", "preview"} and isinstance(exc, (StaleElementReferenceException, TimeoutException)):
+                    consecutive_preview_failures += 1
+                    if consecutive_preview_failures >= diagnostics["preview_failure_limit"]:
+                        termination_reason = "preview_unavailable"
+                        reject(rank, termination_reason, consecutive_failures=consecutive_preview_failures)
+                        self.log("Google 참고 이미지 미리보기가 3개 연속 열리지 않아 다음 검색어로 진행합니다.")
+                        break
+            except RuntimeError:
+                if self.stop_event.is_set():
+                    finish("cancelled")
+                raise
         self._save_internal_image_source_history(candidates)
-        finish("complete" if len(candidates) >= count else "partial" if candidates else "no_eligible_candidates")
+        if termination_reason:
+            diagnostics["termination_reason"] = termination_reason
+        finish(termination_reason or ("complete" if len(candidates) >= count else "partial" if candidates else "no_eligible_candidates"))
         return candidates
 
     @staticmethod

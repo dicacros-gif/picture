@@ -1091,6 +1091,205 @@ class ReferenceLicenseTests(unittest.TestCase):
                 download.assert_not_called()
 
 
+class ReferenceCaptureLoadingTests(unittest.TestCase):
+    class PollingWait:
+        def __init__(self, driver, *_args, **_kwargs):
+            self.driver = driver
+
+        def until(self, callback):
+            for _ in range(8):
+                result = callback(self.driver)
+                if result:
+                    return result
+            raise TimeoutException("Offline bounded polling ended")
+
+    def setup_capture(self, folder, *, loading=True, icons_only=False, preview_error="", cancel="", photo_count=2, blocked_previews=()):
+        app = NaverAutomation(Path(folder), lambda _: None)
+        driver = MagicMock()
+        driver.current_url = "https://www.google.com/search?q=wallet&token=SECRET#session"
+        driver.title = "Google photo results"
+        app._driver = MagicMock(return_value=driver)
+        app._inspect_reference_license = MagicMock(return_value={"license_verified": False})
+        icon = MagicMock()
+        icon.is_displayed.return_value = True
+        icon.rect = {"width": 16, "height": 16}
+        photos, previews = [], []
+        for index in range(photo_count):
+            photo = MagicMock()
+            photo.is_displayed.return_value = True
+            photo.rect = {"width": 220, "height": 150}
+            attrs = {"id": f"dimg_{index}", "alt": f"Wallet photo {index}",
+                     "src": f"https://user:password@example.com/photo{index}.jpg?access_token=SECRET#private"}
+            photo.get_attribute.side_effect = lambda name, values=attrs: values.get(name, "")
+            photos.append(photo)
+            preview = MagicMock()
+            preview.is_displayed.return_value = True
+            preview.get_attribute.return_value = "original-css"
+            buffer = io.BytesIO()
+            Image.new("RGB", (400, 240), ((index * 40) % 256, 60, 80)).save(buffer, "PNG")
+            preview.screenshot_as_png = buffer.getvalue()
+            previews.append(preview)
+        state = {"photo_polls": 0, "clicks": 0, "selected": 0}
+        def find_elements(by, selector):
+            if by == "id":
+                return [photos[int(selector.removeprefix("dimg_"))]]
+            if "div[data-img-wrapper]" in selector:
+                state["photo_polls"] += 1
+                if cancel == "loading":
+                    app.stop_event.set()
+                if icons_only or (loading and state["photo_polls"] == 1):
+                    return [icon]
+                if loading and state["photo_polls"] == 2:
+                    return [icon, photos[0]]
+                return [icon, *photos]
+            if cancel == "preview":
+                app.stop_event.set()
+            if (preview_error == "always" or state["selected"] in blocked_previews
+                    or (preview_error == "timeout" and state["clicks"] == 1)):
+                return []
+            return [previews[state["selected"]]]
+        def execute(source, *arguments):
+            if "scrollIntoView" in source:
+                state["clicks"] += 1
+                state["selected"] = photos.index(arguments[0])
+                if preview_error == "stale" and state["clicks"] == 1:
+                    raise StaleElementReferenceException("Photo node replaced")
+            elif "complete:e.complete" in source:
+                return {"width": 800, "height": 480, "display_width": 400, "display_height": 240,
+                        "url": f"https://example.com/photo{state['selected']}.jpg?token=SECRET", "complete": True}
+            elif "const links=[]" in source:
+                return [f"https://example.com/photo{state['selected']}.html?token=SECRET"]
+            elif "Object.fromEntries" in source:
+                return {"img.sFlh5c": 0, "img.iPVvYb": 1, "img.n3VNCb": 0, "div[role='dialog'] img": 0}
+        driver.find_elements.side_effect = find_elements
+        driver.execute_script.side_effect = execute
+        return app, driver, state
+
+    def test_waits_for_late_photos_and_stable_list_instead_of_icon_ready(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, driver, state = self.setup_capture(folder)
+            with patch("naver_automation.WebDriverWait", self.PollingWait):
+                images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=2)
+            self.assertEqual(len(images), 2)
+            self.assertGreaterEqual(state["photo_polls"], 5)
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual([sample["photos"] for sample in record["result_load_samples"][:3]], [0, 1, 2])
+            self.assertTrue(record["results_stabilized"])
+            self.assertEqual(record["final_url"], "https://www.google.com/search")
+            self.assertEqual(record["final_title"], "Google photo results")
+            self.assertEqual(record["photo_candidates"][0]["src"], "https://example.com/photo0.jpg")
+            self.assertEqual(record["photo_candidates"][0]["id"], "dimg_0")
+            self.assertEqual(record["preview_attempts"][0]["selector_counts"]["img.iPVvYb"], 1)
+            serialized = json.dumps(record)
+            for private in ("SECRET", "password", "access_token", "#session"):
+                self.assertNotIn(private, serialized)
+
+    def test_icon_only_results_never_open_a_preview_and_wait_is_bounded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, _, state = self.setup_capture(folder, icons_only=True)
+            with patch("naver_automation.WebDriverWait", self.PollingWait):
+                self.assertEqual(app.capture_google_reference_candidates("wallet coins photograph", Path(folder)), [])
+            self.assertEqual(state["clicks"], 0)
+            self.assertEqual(state["photo_polls"], 8)
+            app._inspect_reference_license.assert_not_called()
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["status"], "no_results")
+            self.assertFalse(record["results_stabilized"])
+            self.assertEqual(record["eligible_thumbnails"], 0)
+
+    def test_preview_timeout_or_stale_click_retries_the_same_photo_once(self):
+        for error in ("timeout", "stale", "always"):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as folder:
+                app, _, state = self.setup_capture(folder, loading=False, preview_error=error)
+                with patch("naver_automation.WebDriverWait", self.PollingWait):
+                    images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=1)
+                record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+                self.assertEqual(len(images), 0 if error == "always" else 1)
+                self.assertEqual(state["clicks"], 4 if error == "always" else 2)
+                attempts = [attempt for attempt in record["preview_attempts"] if attempt["rank"] == 2]
+                self.assertEqual([attempt["attempt"] for attempt in attempts], [1, 2])
+                self.assertEqual([attempt["status"] for attempt in attempts], ["retry", "failed" if error == "always" else "ready"])
+
+    def test_stop_during_loading_or_preview_never_retries_or_checks_license(self):
+        for phase in ("loading", "preview"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as folder:
+                app, _, state = self.setup_capture(folder, cancel=phase)
+                with patch("naver_automation.WebDriverWait", self.PollingWait), self.assertRaisesRegex(RuntimeError, "중지"):
+                    app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=1)
+                self.assertLessEqual(state["clicks"], 1)
+                app._inspect_reference_license.assert_not_called()
+                record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+                self.assertEqual(record["status"], "cancelled")
+
+    def test_navigation_error_is_recorded_without_credentials_or_query_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, driver, _ = self.setup_capture(folder)
+            driver.get.side_effect = WebDriverException("Blocked https://user:password@example.com/search?token=SECRET")
+            with self.assertRaises(WebDriverException):
+                app.capture_google_reference_candidates("wallet coins photograph", Path(folder))
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["status"], "search_error")
+            self.assertEqual(record["rejection_counts"], {"search_navigation_error": 1})
+            self.assertNotIn("SECRET", json.dumps(record))
+            self.assertNotIn("password", json.dumps(record))
+            self.assertEqual(NaverAutomation._reference_diagnostic_url("data:image/png;base64,private"), "data:(omitted)")
+            self.assertEqual(NaverAutomation._reference_diagnostic_url("file:///C:/Users/private/photo.jpg"), "file:(omitted)")
+
+    def test_three_failed_previews_end_query_before_remaining_candidates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, _, state = self.setup_capture(folder, loading=False, photo_count=8, preview_error="always")
+            with patch("naver_automation.WebDriverWait", self.PollingWait):
+                images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4)
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(images, [])
+            self.assertEqual(record["status"], "preview_unavailable")
+            self.assertEqual(record["consecutive_preview_failures"], 3)
+            self.assertEqual(record["scanned_count"], 3)
+            self.assertEqual(state["clicks"], 6)
+            app._inspect_reference_license.assert_not_called()
+            self.assertFalse(app.stop_event.is_set())
+
+    def test_loaded_preview_resets_failures_even_when_license_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, _, state = self.setup_capture(folder, loading=False, photo_count=8, blocked_previews={0, 1, 3, 4, 5})
+            with patch("naver_automation.WebDriverWait", self.PollingWait):
+                images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4, reuse_only=True)
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(images, [])
+            self.assertEqual(record["status"], "preview_unavailable")
+            self.assertEqual(record["scanned_count"], 6)
+            self.assertEqual(record["rejection_counts"]["reuse_rights_unverified"], 1)
+            self.assertEqual(record["consecutive_preview_failures"], 3)
+            self.assertEqual(app._inspect_reference_license.call_count, 1)
+
+    def test_license_rejections_do_not_trigger_preview_failure_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, _, state = self.setup_capture(folder, loading=False, photo_count=7)
+            with patch("naver_automation.WebDriverWait", self.PollingWait):
+                self.assertEqual(app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4, reuse_only=True), [])
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["status"], "no_eligible_candidates")
+            self.assertEqual(record["scanned_count"], 7)
+            self.assertEqual(record["consecutive_preview_failures"], 0)
+            self.assertEqual(app._inspect_reference_license.call_count, 7)
+
+    def test_query_time_budget_preserves_captured_files_and_returns_partial_without_stop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app, _, state = self.setup_capture(folder, loading=False, photo_count=4)
+            with patch("naver_automation.WebDriverWait", self.PollingWait), \
+                 patch("naver_automation.time.monotonic", side_effect=[0, 0, 91, 91]):
+                images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4)
+            record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(images), 1)
+            self.assertTrue(Path(images[0]["path"]).is_file())
+            self.assertEqual(record["status"], "time_budget_exhausted")
+            self.assertEqual(record["candidate_elapsed_seconds"], 91)
+            self.assertEqual(record["scanned_count"], 1)
+            self.assertEqual(state["clicks"], 1)
+            self.assertFalse(app.stop_event.is_set())
+            self.assertEqual(json.loads((Path(folder) / "google_reference_manifest.json").read_text(encoding="utf-8")), images)
+
+
 class PublishControlTests(unittest.TestCase):
     def test_observed_css_module_publish_panel_without_dialog_role_finds_final_button(self):
         # Minimal actual 2026-09-12 Naver DOM: CSS-module suffixes, no role=dialog.

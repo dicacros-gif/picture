@@ -8,6 +8,7 @@ import math
 import os
 import shutil
 import threading
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, messagebox, ttk
@@ -469,12 +470,47 @@ class BlogWorkflowControls(UnattendedControls):
                 search = workflow.plan_google_image_search(topic, keywords, config["steps"],
                     config["models"], stage_configs=config.get("stage_configs"))
                 search_folder = search.get("run_dir")
-                self._naver_log(f"Google 영어 이미지 검색: {search['query']}")
-                folder = self.cli_app_dir / "google-reference-candidates" / datetime.now().strftime("%Y%m%d-%H%M%S")
+                queries = list(dict.fromkeys([search["query"], *search.get("queries", [])]))[:3]
+                folder = self.cli_app_dir / "google-reference-candidates" / (
+                    datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
                 google_folder = folder
-                google = self.naver_bot.capture_google_reference_candidates(search["query"], folder,
-                    count=config.get("google_reference_count", 4), reuse_only=True, english_only=True)
+                goal = config.get("google_reference_count", 4)
+                seen_sources, seen_files = set(), set()
+                for number, query in enumerate(queries, 1):
+                    if self.full_auto_stop.is_set():
+                        raise WorkflowError("사용자가 작업을 중지했습니다.")
+                    self._naver_log(f"Google 영어 이미지 검색 {number}/{len(queries)}: {query}")
+                    try:
+                        # A later query can start with already captured photos.
+                        # Scan a full bounded batch, then retain only the missing unique photos.
+                        candidates = self.naver_bot.capture_google_reference_candidates(query, folder / f"query-{number}",
+                            count=goal, reuse_only=True, english_only=True)
+                    except Exception as exc:
+                        if self.full_auto_stop.is_set():
+                            raise
+                        self._naver_log(f"Google 검색 {number} 처리 실패 · 다음 검색어 확인: {exc}")
+                        continue
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        source_key = item.get("image_url") or item.get("source_url")
+                        file_key = item.get("capture_sha256") or item.get("path")
+                        if (source_key and source_key in seen_sources) or (file_key and file_key in seen_files):
+                            continue
+                        google.append(item)
+                        if source_key:
+                            seen_sources.add(source_key)
+                        if file_key:
+                            seen_files.add(file_key)
+                        if len(google) >= goal:
+                            break
+                    if len(google) >= goal:
+                        break
+                    if number < len(queries):
+                        self._naver_log(f"Google 후보 {len(google)}/{goal}장 확보 · 같은 주제의 다음 영어 검색어로 보충합니다.")
             except Exception as exc:
+                if self.full_auto_stop.is_set():
+                    raise WorkflowError("사용자가 작업을 중지했습니다.") from exc
                 self._naver_log(f"Google 참고 이미지 생략: {exc}")
         resume_options = {"resume_run_dir": config["resume_run_dir"]} if config.get("resume_run_dir") else {}
         resume_options["quality_checks"] = True
@@ -485,6 +521,7 @@ class BlogWorkflowControls(UnattendedControls):
             resume_options["revision_feedback"] = config["revision_feedback"]
         if config.get("stage_configs"):
             resume_options["stage_configs"] = config["stage_configs"]
+        resume_options["on_run_created"] = lambda run_dir: self._remember_preparing_run(topic, run_dir)
         brief = config["base_prompt"]
         if config.get("selection_intent") or config.get("selection_question"):
             brief += "\n확정된 검색 의도(주제를 바꾸지 말고 이 궁금증에 답한다): " + json.dumps({
@@ -500,6 +537,23 @@ class BlogWorkflowControls(UnattendedControls):
             *[str(Path(item["path"]).resolve().parent) for item in google if item.get("path")]]))
         self.events.put(("cli_article", article))
         return article
+
+    def _remember_preparing_run(self, topic, run_dir):
+        """Save the resume pointer before the first slow/charged CLI request."""
+        path = Path(run_dir).resolve()
+        parent = (self.cli_app_dir / "blog-runs").resolve()
+        if parent not in path.parents or not all((path / name).is_file() for name in ("request.json", "manifest.json")):
+            raise WorkflowError("회차 재개 위치를 확인하지 못했습니다.", path)
+        pending_path = self.cli_app_dir / "pending-blog-topic.json"
+        if not pending_path.exists():
+            return  # Manual preparation has no automatic-cycle receipt.
+        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        if (pending.get("choice", {}).get("topic") != topic
+                or pending.get("phase") not in {None, "preparing"}):
+            raise WorkflowError("현재 확정 주제와 회차 재개 위치가 일치하지 않습니다.", path)
+        pending["resume_run_dir"] = str(path)
+        self._save_pending_topic(pending)
+        self._naver_log(f"회차 재개 위치 저장: {path.name}")
 
     def _preflight_cli_accounts(self, config):
         """Fail before image capture or generation when a required CLI cannot sign in."""
