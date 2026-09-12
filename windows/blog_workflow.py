@@ -1189,6 +1189,9 @@ class BlogWorkflow:
             keywords = list(dict.fromkeys(_flatten_strings(keywords)))
             if not topic or not keywords:
                 raise WorkflowError("주제와 실제 연관 검색어가 있어야 원고를 준비할 수 있습니다.")
+            # The manifest is the prepared publication payload, including after
+            # restart. Preserve the actual request words for consumption history.
+            manifest["keywords"] = list(keywords)
             models = models or {}
             manifest["stage_configs"] = stage_configs
             if stage_configs is not None:

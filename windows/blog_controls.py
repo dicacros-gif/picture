@@ -686,7 +686,35 @@ class BlogWorkflowControls(UnattendedControls):
             publish=config["publish"], save_draft=config.get("save_draft", False))
         return self._record_cli_publication(article, config, result)
 
+    def _recover_article_keywords(self, article):
+        """Fill old manifests only from their app-owned, matching request."""
+        existing = article.get("keywords")
+        if isinstance(existing, list) and existing and all(isinstance(word, str) and word.strip() for word in existing):
+            return  # Explicit article metadata remains authoritative.
+        article.pop("keywords", None)
+        raw_run, topic = article.get("run_dir"), article.get("topic")
+        app_dir = getattr(self, "cli_app_dir", None)
+        if not app_dir or not isinstance(raw_run, (str, Path)) or not raw_run or not isinstance(topic, str) or not topic.strip():
+            return
+        try:
+            run = Path(raw_run).resolve()
+            if (Path(app_dir) / "blog-runs").resolve() not in run.parents:
+                return
+            request_path = (run / "request.json").resolve()
+            if request_path.parent != run:
+                return
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            requested_topic, keywords = request.get("topic"), request.get("keywords")
+            if (not isinstance(requested_topic, str) or " ".join(requested_topic.split()) != " ".join(topic.split())
+                    or not isinstance(keywords, list) or not keywords
+                    or any(not isinstance(word, str) or not word.strip() for word in keywords)):
+                return
+            article["keywords"] = list(dict.fromkeys(word.strip() for word in keywords))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return  # Invalid legacy metadata cannot consume unrelated candidates.
+
     def _record_cli_publication(self, article, config, result):
+        self._recover_article_keywords(article)
         article["publication"] = result
         # A bookkeeping failure must never hide an already successful publish.
         self.events.put(("cli_article", article))
@@ -803,6 +831,7 @@ class BlogWorkflowControls(UnattendedControls):
                     prepared["run_dir"] = str(run_dir)
                     prepared.setdefault("source_topic", pending.get("choice", {}).get("source_topic")
                                         or pending.get("choice", {}).get("topic", prepared.get("topic", "")))
+                    self._recover_article_keywords(prepared)
                     pending["prepared_article"] = prepared
             if not isinstance(prepared, dict):
                 raise WorkflowError("이전 발행 결과와 준비된 원고를 확인할 자료가 필요합니다.")
@@ -958,6 +987,7 @@ class BlogWorkflowControls(UnattendedControls):
         if article is None:
             raise WorkflowError(f"확정 주제 '{topic}'의 준비를 {len(attempts)}회 시도했지만 준비되지 않았습니다. 주제를 바꾸지 않고 검토 자료를 보존합니다.", recovery_config.get("resume_run_dir"))
         # Browser publication/draft failures never enter the candidate retry loop.
+        self._recover_article_keywords(article)
         pending["prepared_article"] = copy.deepcopy(article)
         pending["phase"] = "publishing"
         pending["publication_started"] = False
