@@ -40,9 +40,9 @@ class BlogWorkflowControls(UnattendedControls):
         )
         pref = self.cli_preferences
         self._init_unattended_controls(pref)
-        if pref.get("default_revision") != "user-20260912-visual-v2":
+        if pref.get("default_revision") != "user-20260912-thumbnail-v3":
             if self.settings.get("cli_workflow"):
-                supplied = {"id": "user-default-20260912-visual-v2", "name": "사용자 기본 프롬프트 · 인용구 6종", "text": default_prompt.strip()}
+                supplied = {"id": "user-default-20260912-thumbnail-v3", "name": "사용자 기본 프롬프트 · 1:1 한글 썸네일", "text": default_prompt.strip()}
                 for field in ("id", "name"):
                     original, suffix = supplied[field], 2
                     while any(p[field] == supplied[field] for p in pref["prompts"]):
@@ -50,7 +50,7 @@ class BlogWorkflowControls(UnattendedControls):
                         suffix += 1
                 pref["prompts"] = [supplied, *pref["prompts"]]
                 pref["selected_prompt_id"] = supplied["id"]
-            pref["default_revision"] = "user-20260912-visual-v2"
+            pref["default_revision"] = "user-20260912-thumbnail-v3"
         self.cli_active_prompt = pref["selected_prompt_id"]
         selected = next(p for p in pref["prompts"] if p["id"] == self.cli_active_prompt)
         self.cli_preset_choice = StringVar(value=selected["name"])

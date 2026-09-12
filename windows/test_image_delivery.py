@@ -46,8 +46,10 @@ class ImageDeliveryTests(unittest.TestCase):
             Image.new('RGB',(1024,1024),(87,102,96)).save(source)
             original=source.read_bytes()
             clean_export(source,plain)
-            result=clean_export(source,cover,headline='기부\n무엇부터 확인할까요?')
+            result=clean_export(source,cover,headline='기부의 기준')
             self.assertTrue(result['cover_text_applied'])
+            self.assertIn(result['cover_text_color'], {'#8CE88C', '#EF3340'})
+            self.assertEqual(result['cover_aspect_ratio'], '1:1')
             self.assertNotEqual(plain.read_bytes(),cover.read_bytes())
             self.assertEqual(original,source.read_bytes())
             with Image.open(cover) as picture:
@@ -60,6 +62,21 @@ class ImageDeliveryTests(unittest.TestCase):
             Image.new('RGB',(1024,1024),'white').save(source)
             with self.assertRaisesRegex(ValueError,'한글 글꼴'):
                 clean_export(source,target,headline='기부',font_path=Path(directory)/'missing.ttf')
+
+    def test_cover_is_center_cropped_to_exact_square(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source,target=Path(directory)/'wide.png',Path(directory)/'cover.jpg'
+            Image.new('RGB',(1600,900),'gray').save(source)
+            result=clean_export(source,target,headline='고르는 기준')
+            self.assertEqual(result['width'],result['height'])
+            self.assertGreaterEqual(result['width'],900)
+
+    def test_cover_rejects_long_or_multiline_caption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source=Path(directory)/'source.png';Image.new('RGB',(1024,1024),'white').save(source)
+            for headline in ('열세글자이상으로너무긴후킹문구입니다','두 줄\n문구'):
+                with self.subTest(headline=headline), self.assertRaises(ValueError):
+                    clean_export(source,Path(directory)/(str(len(headline))+'.jpg'),headline=headline)
 
 
 if __name__ == "__main__":

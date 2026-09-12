@@ -2915,16 +2915,19 @@ class NaverAutomation:
         # Stable sort retains caller order when more than one picture shares a paragraph.
         checked.sort(key=lambda item: item["paragraph_index"])
         if article.get("image_policy") == IMAGE_POLICY:
-            expected_headline = cover_headline(article.get("topic", ""))
+            expected_headline = cover_headline(article.get("cover_headline", ""))
             if (not checked or checked[0].get("provider") == "google" or checked[0]["paragraph_index"] != 0
-                    or checked[0].get("cover_headline") != expected_headline or checked[0].get("cover_text_applied") is not True):
+                    or checked[0].get("cover_headline") != expected_headline or checked[0].get("cover_text_applied") is not True
+                    or checked[0].get("cover_aspect_ratio") != "1:1" or checked[0].get("width") != checked[0].get("height")
+                    or checked[0].get("cover_text_color") not in {"#8CE88C", "#EF3340"}):
                 raise ValueError("첫 생성 사진의 한글 후킹 문구를 확인하지 못했습니다.")
             for index, item in enumerate(checked):
                 if item.get("provider") != "google" and item.get("image_policy") != IMAGE_POLICY:
                     raise ValueError("새 이미지 생성 규칙과 다른 사진이 포함되어 있습니다.")
                 for review in item["reviews"]:
                     if index == 0:
-                        if (any(review.get(key) is not True for key in ("cover_text_exact", "cover_text_legible", "no_other_text"))
+                        if (any(review.get(key) is not True for key in ("cover_text_exact", "cover_text_legible", "no_other_text",
+                                "square_1_to_1", "no_human_face", "bold_gothic", "text_shadow_visible", "approved_text_color"))
                                 or review.get("text_free") is not False
                                 or re.sub(r"\s+", "", str(review.get("detected_text", ""))) != re.sub(r"\s+", "", expected_headline)):
                             raise ValueError("첫 사진의 한글 문구 정확성 검수가 필요합니다.")

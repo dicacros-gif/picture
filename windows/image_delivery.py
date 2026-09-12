@@ -7,15 +7,15 @@ from pathlib import Path
 from PIL import Image, ImageOps, ImageDraw, ImageFont
 
 
-def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None = None) -> Image.Image:
+def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None = None) -> tuple[Image.Image, str]:
     font_path = Path(font_path or "C:/Windows/Fonts/malgunbd.ttf")
     if not font_path.is_file():
         raise ValueError("첫 사진의 한글 문구에 필요한 한글 글꼴을 찾지 못했습니다.")
-    if not headline.strip() or len(headline) > 90:
+    if not headline.strip() or len(headline) > 12 or "\n" in headline:
         raise ValueError("첫 사진의 한글 문구가 비어 있거나 너무 깁니다.")
     width, height = pixels.size
     margin, maximum_width = round(width * .065), round(width * .86)
-    size = max(24, round(min(width, height) * .065))
+    size = max(24, round(min(width, height) * .095))
     drawing = ImageDraw.Draw(pixels)
     while True:
         font = ImageFont.truetype(str(font_path), size)
@@ -40,10 +40,11 @@ def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None
     overlay = Image.new("RGBA", pixels.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     panel_height = text_height + margin * 2
-    draw.rectangle((0, 0, width, panel_height), fill=(12, 22, 29, 165))
+    draw.rectangle((0, 0, width, panel_height), fill=(12, 22, 29, 150))
+    text_color = "#8CE88C" if int(hashlib.sha256(headline.encode("utf-8")).hexdigest(), 16) % 2 == 0 else "#EF3340"
     draw.multiline_text((margin, margin - bounds[1]), text, font=font, spacing=spacing,
-                        fill=(255, 250, 224, 255), stroke_width=1, stroke_fill=(20, 25, 30, 255))
-    return Image.alpha_composite(pixels.convert("RGBA"), overlay).convert("RGB")
+                        fill=text_color, stroke_width=max(2, round(size * .035)), stroke_fill=(20, 25, 30, 210))
+    return Image.alpha_composite(pixels.convert("RGBA"), overlay).convert("RGB"), text_color
 
 
 def clean_export(source: str | Path, destination: str | Path, *, target_long_side: int = 2048,
@@ -62,8 +63,12 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
         if max(pixels.size) < target_long_side:
             scale = target_long_side / max(pixels.size)
             pixels = pixels.resize((round(pixels.width * scale), round(pixels.height * scale)), Image.Resampling.LANCZOS)
+        cover_color = ""
         if headline:
-            pixels = _draw_cover(pixels, headline, font_path)
+            side = min(pixels.size)
+            left, top = (pixels.width - side) // 2, (pixels.height - side) // 2
+            pixels = pixels.crop((left, top, left + side, top + side))
+            pixels, cover_color = _draw_cover(pixels, headline, font_path)
         # Retain the source file and generation history separately from the upload copy.
         clean = Image.frombytes("RGB", pixels.size, pixels.tobytes())
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -75,4 +80,5 @@ def clean_export(source: str | Path, destination: str | Path, *, target_long_sid
     return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
             "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(), "metadata_stripped": True,
             "delivery_format": "JPEG", "image_style": "photorealistic",
-            "cover_headline": headline, "cover_text_applied": bool(headline)}
+            "cover_headline": headline, "cover_text_applied": bool(headline),
+            "cover_text_color": cover_color, "cover_aspect_ratio": "1:1" if headline else ""}

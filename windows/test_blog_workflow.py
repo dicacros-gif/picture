@@ -36,6 +36,7 @@ def valid_article():
         "paragraphs": sections,
         "image_prompts": [f"문단 {index + 1}의 내용을 표현하는 이름 없는 노트북과 깔끔한 작업 공간, 자연광, 글자 없는 독창적인 사진" for index in range(8)],
         "highlight_phrases": [important], "bold_phrases": [important],
+        "cover_headline": "배터리 수명비밀",
         "sources": [{"title": "Manufacturer battery guidance", "url": "https://support.example.com/battery",
                      "verified": True, "is_primary": True, "supports": ["기기별 지원 기능과 사용 조건이 다를 수 있다."]}],
         "review": {"approved": True, "facts_verified": True, "sources_verified": True,
@@ -79,6 +80,8 @@ class FakeBridge:
             context = json.loads(prompt.split('BEGIN_UNTRUSTED_IMAGE_CONTEXT_JSON\n')[1].split('\nEND_UNTRUSTED_IMAGE_CONTEXT_JSON')[0])
             if context.get('expected_cover_headline'):
                 result.update(text_free=False, cover_text_exact=True, cover_text_legible=True, no_other_text=True,
+                              square_1_to_1=True, no_human_face=True, bold_gothic=True,
+                              text_shadow_visible=True, approved_text_color=True,
                               detected_text=context['expected_cover_headline'])
             result["quality_score"] = 80 + image_index % 10
             if image_index in self.bad_image_indices:
@@ -120,7 +123,8 @@ class BlogWorkflowTests(unittest.TestCase):
                 picture.convert("RGB").save(destination, format="JPEG", quality=95)
             return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
                     "metadata_stripped": True, "delivery_format": "JPEG", "image_style": "photorealistic",
-                    "cover_headline": headline, "cover_text_applied": bool(headline)}
+                    "cover_headline": headline, "cover_text_applied": bool(headline),
+                    "cover_text_color": "#8CE88C" if headline else "", "cover_aspect_ratio": "1:1" if headline else ""}
         self.export_patch = patch("blog_workflow.clean_export", side_effect=delivery)
         self.export_patch.start()
         self.addCleanup(self.export_patch.stop)
@@ -324,6 +328,14 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assert_blocked('highlight_phrases')
         self.assertEqual(len(self.bridge.calls),2)
 
+    def test_long_or_non_korean_cover_hook_is_repairable_format_error(self):
+        for value in ('x', '열세글자이상으로너무긴후킹문구입니다'):
+            with self.subTest(value=value):
+                self.bridge.calls.clear()
+                self.bridge.article['cover_headline'] = value
+                self.assert_blocked('후킹 문구')
+                self.assertEqual(len(self.bridge.calls), 2)
+
     def test_more_than_one_heading_per_section_fails_before_images(self):
         self.bridge.article['paragraphs'][0]+='\n❝ 또 다른 기준인가요?'
         self.assert_blocked('정확히 하나')
@@ -343,10 +355,14 @@ class BlogWorkflowTests(unittest.TestCase):
             self.assertIn('fictional Korean adults', item['prompt'])
             self.assertIn('VERY SUBTLE fine film grain', item['prompt'])
             self.assertIn('Avoid heavy noise', item['prompt'])
-        self.assertIn('upper 30 percent', self.bridge.generations[0]['prompt'])
-        self.assertNotIn('upper 30 percent', self.bridge.generations[1]['prompt'])
+        self.assertIn('upper 32 percent', self.bridge.generations[0]['prompt'])
+        self.assertIn('1:1 square', self.bridge.generations[0]['prompt'])
+        self.assertIn('Show no human face', self.bridge.generations[0]['prompt'])
+        self.assertNotIn('upper 32 percent', self.bridge.generations[1]['prompt'])
         self.assertTrue(result['images'][0]['cover_text_applied'])
-        self.assertEqual(result['images'][0]['cover_headline'], cover_headline(TOPIC))
+        self.assertEqual(result['images'][0]['cover_headline'], self.bridge.article['cover_headline'])
+        self.assertEqual(result['images'][0]['cover_aspect_ratio'], '1:1')
+        self.assertIn(result['images'][0]['cover_text_color'], {'#8CE88C', '#EF3340'})
         self.assertTrue(all(not item['cover_text_applied'] for item in result['images'][1:]))
         saved=json.loads(Path(result['run_dir'],'manifest.json').read_text(encoding='utf-8'))
         self.assertEqual(saved['visual_style'],result['visual_style'])
@@ -419,7 +435,7 @@ class BlogWorkflowTests(unittest.TestCase):
             make_image(path, 100 + index)
             seeds.append({"provider": provider, "paragraph_index": index, "path": str(path), "status": "generated",
                           "metadata_stripped": True, "approved": False, "image_policy": IMAGE_POLICY,
-                          "cover_headline": cover_headline(TOPIC) if index == 0 else "",
+                          "cover_headline": self.bridge.article['cover_headline'] if index == 0 else "",
                           "cover_text_applied": index == 0, **_fingerprint(path)})
         (run / "provisional-images.json").write_text(json.dumps({"candidates": seeds}), encoding="utf-8")
         self.bridge.run_text = call
