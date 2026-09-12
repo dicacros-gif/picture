@@ -15,9 +15,11 @@ def role_prompt(role, has_draft):
         "작성": "사용자 프롬프트에 따라 기존 초고를 완성한다.",
         "교차 검수": "논리·중복·구성·검색 의도 충족 여부를 점검하고 문제를 수정한 완성 원고 전체를 반환한다.",
         "팩트·최신 정보 보강": (
-            "기존 제목과 각 paragraphs 문자열 전체를 그대로 유지한다. 문단을 삭제하거나 재작성하지 않는다. "
+            "기존 제목과 각 paragraphs 문자열을 유지한다. 문단을 통째로 삭제하거나 재작성하지 않는다. "
             "직접 확인한 최신 정보를 해당 문단 뒤에 추가하는 방식만 허용한다. 문단 개수는 유지한다. "
-            "기존 사실에 오류가 있으면 고치지 말고 review.issues에 구체적 주장과 근거를 기록해 후속 수정 단계로 넘긴다. "
+            "예외적으로 확인할 수 없거나 틀린 수치·기간·조건 문장은 제거하고 확인된 정보로 교체한다. "
+            "이 부분 수정은 fact_corrections 배열에 index(0부터), old(기존 문장 250자 이내), new(교체문), reason, source_urls를 기록한다. "
+            "새 사실을 담은 교체문에는 sources에서 확인된 1차 자료 URL을 반드시 연결한다. "
             "확인하지 못한 자료를 확인했다고 표시하지 않는다."
         ),
         "문체 다듬기": (
@@ -34,8 +36,21 @@ def check_role_change(role, previous, result):
         return
     if role == "팩트·최신 정보 보강":
         old, new = previous.get("paragraphs", []), result.get("paragraphs", [])
+        corrected = list(old)
+        verified = {source.get('url') for source in result.get('sources', []) if isinstance(source, dict)
+                    and source.get('verified') is True and source.get('is_primary') is True}
+        for patch in result.get('fact_corrections', []):
+            index, before, after = patch.get('index'), patch.get('old'), patch.get('new')
+            if (type(index) is not int or not 0 <= index < len(corrected)
+                    or not isinstance(before, str) or not 5 <= len(before) <= 250
+                    or not isinstance(after, str) or corrected[index].count(before) != 1 or not patch.get('reason')):
+                raise ValueError('팩트 부분 수정의 원문·구역·사유가 올바르지 않습니다.')
+            urls = patch.get('source_urls', [])
+            if after and (not isinstance(urls, list) or not urls or any(url not in verified for url in urls)):
+                raise ValueError('팩트 교체문에 확인된 1차 자료가 필요합니다.')
+            corrected[index] = corrected[index].replace(before, after, 1)
         if previous.get("title") != result.get("title") or len(old) != len(new) or any(
-                not after.startswith(before) for before, after in zip(old, new)):
+                not after.startswith(before) for before, after in zip(corrected, new)):
             raise ValueError("팩트 보강 단계가 기존 제목·문단을 변경했습니다. 기존 문장을 유지하고 확인된 정보만 덧붙여야 합니다.")
     if role == "문체 다듬기":
         def numbers(article):

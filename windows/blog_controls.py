@@ -104,7 +104,6 @@ class BlogWorkflowControls(UnattendedControls):
         settings.columnconfigure(1, weight=1)
         ttk.Label(settings, text="주제 입력어").grid(row=0, column=0, sticky="w")
         ttk.Entry(settings, textvariable=self.topic).grid(row=0, column=1, columnspan=5, sticky="ew", padx=7)
-        ttk.Button(settings, text="관심 주제 자동 선정", command=self.select_cli_topic).grid(row=0, column=6)
         sequence = ttk.Frame(settings)
         sequence.grid(row=1, column=0, columnspan=7, sticky="ew", pady=6)
         ttk.Label(sequence, text="실행 단계").grid(row=0, column=0)
@@ -137,11 +136,6 @@ class BlogWorkflowControls(UnattendedControls):
         review.pack(side="left", padx=5)
         review.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Checkbutton(options, text="Google 후보 2장도 검수", variable=self.cli_google, command=self._save_cli_selection).pack(side="left", padx=8)
-        ttk.Label(options, text="완료 후").pack(side="left", padx=(8, 0))
-        mode = ttk.Combobox(options, textvariable=self.cli_publication, values=["자동 발행", "임시저장까지만", "편집기에 입력만"], state="readonly", width=16)
-        mode.pack(side="left", padx=5)
-        self.cli_runtime_selectors.append(mode)
-        mode.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Button(options, text="CLI 연결 확인", command=self.check_blog_cli).pack(side="left", padx=8)
         ttk.Button(options, text="CLI 로그인 안내", command=self.show_cli_login_help).pack(side="left")
         ttk.Button(options, text="프로그램 다시 시작", command=self.restart_program).pack(side="left", padx=5)
@@ -205,12 +199,9 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_log.pack(fill="x", padx=(5, 0), pady=(5, 0))
         actions = ttk.Frame(self.blog_tab)
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(actions, text="글·이미지 준비", command=self.prepare_cli_article, style="Accent.TButton").pack(side="left")
-        ttk.Button(actions, text="준비된 글 네이버에 입력·실행", command=self.publish_cli_article, style="Copy.TButton").pack(side="left", padx=6)
         ttk.Button(actions, text="실행 자료 폴더", command=self.open_cli_artifacts).pack(side="left")
         ttk.Button(actions, text="결과 복사", command=lambda: self.copy_widget(self.blog_result)).pack(side="left", padx=6)
         ttk.Button(actions, text="웨일 네이버 로그인", command=self.open_naver_login).pack(side="left")
-        ttk.Button(actions, text="작업 중지", command=self.stop_full_automation, style="Danger.TButton").pack(side="right")
         self._sync_cli_step_boxes()
 
     def _sync_cli_step_boxes(self):
@@ -327,6 +318,7 @@ class BlogWorkflowControls(UnattendedControls):
         pref = copy.deepcopy(self.cli_preferences)
         selected = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
         return {"steps": pref["order"][:pref["step_count"]], "review_mode": pref["review_mode"],
+                "quality_checks": True,
                 "stage_configs": pref["stages"][:pref["step_count"]],
                 "models": pref["models"], "base_prompt": selected["text"],
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
@@ -413,6 +405,8 @@ class BlogWorkflowControls(UnattendedControls):
                 self._naver_log(f"Google 참고 이미지 생략: {exc}")
         workflow = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         resume_options = {"resume_run_dir": config["resume_run_dir"]} if config.get("resume_run_dir") else {}
+        resume_options["quality_checks"] = True
+        resume_options["quality_topic"] = config.get("quality_topic", topic)
         if config.get("stage_configs"):
             resume_options["stage_configs"] = config["stage_configs"]
         brief = config["base_prompt"]
@@ -592,6 +586,10 @@ class BlogWorkflowControls(UnattendedControls):
                                                  pending["choice"], pending)
         groups = self._cli_realtime_groups()
         ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
+        if config.get("quality_checks"):
+            ranked = [candidate for candidate in ranked if len(set(candidate.get("keywords", []))) >= 8]
+            if not ranked:
+                raise WorkflowError("소제목 8개에 배치할 실제 연관어가 충분한 후보를 수집 중입니다. 아직 주제를 확정하지 않았습니다.")
         selector = BlogWorkflow(self.cli_bridge, self.cli_app_dir / "blog-runs", self._naver_log, self.full_auto_stop)
         provider = config["steps"][0]
         attempts, article, choice = [], None, None
@@ -636,6 +634,8 @@ class BlogWorkflowControls(UnattendedControls):
         attempts, article = [], None
         # Once selected, keep the topic fixed throughout preparation and recovery.
         recovery_config = dict(config)
+        if choice.get("source_topic"):
+            recovery_config["quality_topic"] = choice["source_topic"]
         if choice.get("intent"):
             recovery_config["selection_intent"] = choice["intent"]
         if choice.get("semantic_selection", {}).get("intent_question"):

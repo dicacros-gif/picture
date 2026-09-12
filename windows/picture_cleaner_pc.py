@@ -1282,12 +1282,6 @@ class PictureCleanerApp(BlogWorkflowControls):
         ).pack(side="left")
         ttk.Button(
             toolbar,
-            text="선택 검색어 → Google 이미지 검색",
-            style="Accent.TButton",
-            command=self.start_google_image_search,
-        ).pack(side="left", padx=8)
-        ttk.Button(
-            toolbar,
             text="두 결과 모두 복사",
             style="Copy.TButton",
             command=self.copy_all_related,
@@ -1445,12 +1439,6 @@ class PictureCleanerApp(BlogWorkflowControls):
             style="Copy.TButton",
             command=self.start_neighbor_comments,
         ).pack(side="left")
-        ttk.Button(
-            actions,
-            text="작업 중지",
-            style="Danger.TButton",
-            command=self.naver_bot.stop,
-        ).pack(side="left", padx=8)
         ttk.Label(self.comment_tab, text="댓글 작업 상황은 모든 탭 하단의 전체 진행 상황에서 확인합니다.").pack(anchor="w")
 
     def _naver_log(self, message):
@@ -1687,7 +1675,7 @@ class PictureCleanerApp(BlogWorkflowControls):
     def stop_full_automation(self):
         self._cancel_automatic_resume()
         self.full_auto_stop.set()
-        self.naver_bot.stop_event.set()
+        self.naver_bot.stop()
         self.status.set("전체 자동화 중지를 요청했습니다.")
 
     def _full_automation_loop(self, config: dict):

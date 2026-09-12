@@ -404,7 +404,8 @@ class BlogWorkflowTests(unittest.TestCase):
                                                "reason": "관리 방법을 설명할 수 있습니다."})
         selected = self.workflow.select_topic([{"topic": TOPIC, "keywords": KEYWORDS, "score": 90}], provider="antigravity")
         self.assertEqual(selected["topic"], TOPIC)
-        self.assertEqual(selected["keywords"], KEYWORDS[:2])
+        self.assertEqual(selected["keywords"], KEYWORDS)
+        self.assertEqual(selected["semantic_selection"]["keywords"], KEYWORDS[:2])
         self.assertEqual(self.bridge.calls[0]["provider"], "antigravity")
 
     def test_resume_reuses_approved_stage_before_failed_cli(self):
