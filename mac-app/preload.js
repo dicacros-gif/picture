@@ -18,6 +18,18 @@ contextBridge.exposeInMainWorld("picture", {
   stopNeighborComments: () => ipcRenderer.invoke("stop-neighbor-comments"),
   getSettings: () => ipcRenderer.invoke("get-settings"),
   setSettings: settings => ipcRenderer.invoke("set-settings", settings),
+  getBlogState: () => ipcRenderer.invoke("blog-state"),
+  startManualBlog: options => ipcRenderer.invoke("blog-manual", options),
+  setBlogAutomation: enabled => ipcRenderer.invoke("blog-automation", enabled),
+  stopBlog: () => ipcRenderer.invoke("blog-stop"),
+  getCliStatus: () => ipcRenderer.invoke("blog-cli-status"),
+  loginCli: provider => ipcRenderer.invoke("blog-cli-login", provider),
+  openBlogFolder: () => ipcRenderer.invoke("blog-open-folder"),
+  onBlogProgress: callback => {
+    const listener = (_event, value) => callback(value);
+    ipcRenderer.on("blog-progress", listener);
+    return () => ipcRenderer.removeListener("blog-progress", listener);
+  },
   onReplyProgress: callback => ipcRenderer.on("reply-progress", (_e, value) => callback(value)),
   onHeartProgress: callback => ipcRenderer.on("heart-progress", (_e, value) => callback(value)),
   onNeighborProgress: callback => ipcRenderer.on("neighbor-progress", (_e, value) => callback(value)),

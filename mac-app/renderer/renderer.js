@@ -97,7 +97,7 @@ function isEphemeral(keyword) {
 }
 
 function comparisonKey(value) {
-  return String(value || "").normalize("NFC").toLocaleLowerCase("ko-KR").replace(/[\W_]+/gu, "");
+  return String(value || "").normalize("NFC").toLocaleLowerCase("ko-KR").replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
 function mergedWords(items, excluded = new Set()) {
@@ -118,6 +118,7 @@ async function loadRelated(rawSeed) {
     return;
   }
   selectedRealtime = seed;
+  $("useBlogKeyword").disabled = false;
   document.querySelectorAll(".keyword-option").forEach(row =>
     row.classList.toggle("selected", row.dataset.keyword === seed));
   $("manualKeyword").value = seed;
@@ -174,6 +175,8 @@ const realtimeSources = ["다음", "구글", "크리에이터 어드바이저", 
 const creatorAdvisorCategories = ["세계여행", "비즈니스·경제", "IT·컴퓨터", "교육·학문", "자동차", "게임"];
 let realtimeTotals = { crawled: 0, usable: 0, creator: 0 };
 let creatorAdvisorLoading = false;
+let realtimeLoaded = false;
+let realtimeLoading = false;
 
 function keywordSourceGroup(source, input, limit, options = {}) {
   const raw = [...new Set((input || [])
@@ -206,6 +209,14 @@ function renderRealtimeSummary(extra = "") {
 }
 
 async function loadRealtime() {
+  if (realtimeLoading) return;
+  if (!hydrated) return;
+  if (blogRuntime.busy) {
+    $("sourceSummary").textContent = "글 작성이 끝난 뒤 새로고침하면 실시간 검색어를 확인할 수 있습니다.";
+    return;
+  }
+  realtimeLoading = true;
+  realtimeLoaded = true;
   $("realtimeSources").innerHTML = '<div class="loading"><span></span>4개 출처 연결 중</div>';
   $("sourceSummary").textContent = "실시간 검색어를 자동으로 불러오는 중입니다…";
   setBusy($("refreshRealtime"), true);
@@ -243,7 +254,7 @@ async function loadRealtime() {
 
   creatorAdvisorLoading = true;
   try {
-    const result = await window.picture.collectCreatorAdvisor("macdcross");
+    const result = await window.picture.collectCreatorAdvisor($("blogId").value.trim());
     const rendered = creatorAdvisorCategories.map(category =>
       keywordSourceGroup(category, result.groups?.[category], 20, {
         creator: true,
@@ -273,6 +284,7 @@ async function loadRealtime() {
     renderRealtimeSummary(` · 검색 유입 트렌드 조회 실패: ${error.message}`);
   } finally {
     creatorAdvisorLoading = false;
+    realtimeLoading = false;
     setBusy($("refreshRealtime"), false);
   }
 }
@@ -324,15 +336,10 @@ function activateTab(tab) {
     }
   });
   window.scrollTo({ top: 0, behavior: "smooth" });
+  if (String(tab) === "1" && hydrated && !realtimeLoaded && !blogRuntime.smokeTest) loadRealtime();
 }
 document.querySelectorAll(".tab-button").forEach(button => {
-  button.onclick = () => {
-    document.querySelectorAll(".tab-button").forEach(item => item.classList.toggle("active", item === button));
-    document.querySelectorAll(".tab-panel").forEach(panel =>
-      panel.classList.toggle("active", panel.dataset.panel === button.dataset.tab));
-    document.querySelector("header h1").textContent = tabTitles[button.dataset.tab];
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  button.onclick = () => activateTab(button.dataset.tab);
 });
 $("goGoogleImages").onclick = () => activateTab(2);
 
@@ -402,22 +409,30 @@ $("captureEnhanceGoogleImages").onclick = () =>
     () => window.picture.captureEnhanceGoogleImages(selectedImageKeyword));
 window.picture.onGoogleImageProgress(progress => {
   $("googleImageStatus").textContent = progress.status;
+  appendProgress(progress.status);
 });
 
 function settings() {
   return {
+    ...savedSettings,
     blogId: $("blogId").value.trim() || "dicajohn",
     phrases: $("phrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
     neighborPhrases: $("neighborPhrases").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
     commentDays: Number($("commentDays").value) || 10,
     replyInterval: Math.max(0, Number($("replyInterval").value) || 0),
     intervalSeconds: Number($("intervalSeconds").value) || 30,
-    maxPosts: Number($("maxPosts").value) || 20
+    maxPosts: Number($("maxPosts").value) || 20,
+    blog: collectBlogSettings()
   };
 }
-async function saveSettings() { await window.picture.setSettings(settings()); }
-$("login").onclick = async () => { await saveSettings(); await window.picture.openNaverLogin($("blogId").value.trim()); };
-$("write").onclick = () => window.picture.openBlogWrite();
+$("login").onclick = async () => {
+  try { await saveSettings(); await window.picture.openNaverLogin($("blogId").value.trim()); }
+  catch (error) { showBlogError(error); }
+};
+$("write").onclick = async () => {
+  try { await saveSettings(); await window.picture.openBlogWrite(); }
+  catch (error) { showBlogError(error); }
+};
 $("reply").onclick = async () => {
   setBusy($("reply"), true);
   $("replyStatus").textContent = `최근 ${settings().commentDays}일 글의 댓글·하트를 확인하는 중...`;
@@ -448,18 +463,449 @@ $("neighborStop").onclick = async () => {
 };
 window.picture.onReplyProgress(p => {
   $("replyStatus").textContent = `${p.status} · 답글 ${p.done || 0} · 하트 ${p.liked || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
+  appendProgress($("replyStatus").textContent);
 });
 window.picture.onNeighborProgress(p => {
   $("neighborStatus").textContent = `${p.status} · 댓글 ${p.done || 0} · 건너뜀 ${p.skipped || 0} · 실패 ${p.failed || 0}`;
+  appendProgress($("neighborStatus").textContent);
 });
+
+const PROVIDERS = { chatgpt: "ChatGPT", claude: "Claude", antigravity: "Antigravity" };
+const ROLES = ["작성", "교차 검수", "팩트·최신 정보 보강", "문체 다듬기"];
+const DEFAULT_STAGES = ["chatgpt", "claude", "antigravity", "chatgpt"].map((provider, index) =>
+  ({ provider, role: ROLES[index], model: "" }));
+let savedSettings = {};
+let blogPreferences = {};
+let stageDrafts = DEFAULT_STAGES.map(stage => ({ ...stage }));
+let hydrated = false;
+let saveTimer = null;
+let saveChain = Promise.resolve();
+let saveRevision = 0;
+let savedRevision = 0;
+let savePending = 0;
+let closeAfterSave = false;
+let blogRuntime = { busy: false, automationEnabled: false };
+let blogStarting = false;
+let automationChanging = false;
+let cliChecking = false;
+const cliLoggingIn = new Set();
+let progressHeight = 178;
+let progressCollapsed = false;
+const progressLines = [];
+let lastProgressLine = "";
+
+function currentPrompt() {
+  return blogPreferences.prompts?.find(prompt => prompt.id === blogPreferences.selectedPromptId);
+}
+
+function commitPrompt() {
+  const prompt = currentPrompt();
+  if (!prompt) return;
+  prompt.name = $("blogPromptName").value.trim() || "이름 없는 프롬프트";
+  prompt.text = $("blogPromptText").value;
+}
+
+function collectBlogSettings() {
+  commitPrompt();
+  const stageCount = Math.max(1, Math.min(4, Number($("blogStageCount").value) || 1));
+  return {
+    ...blogPreferences,
+    automationEnabled: Boolean(blogRuntime.automationEnabled),
+    intervalHours: Number($("blogInterval").value) || 1,
+    mode: $("blogMode").value || "draft",
+    keyword: $("blogKeyword").value.trim(),
+    prompts: blogPreferences.prompts.map(prompt => ({ ...prompt })),
+    stages: stageDrafts.slice(0, stageCount).map(stage => ({ ...stage })),
+    imageRetryLimit: Number($("blogImageRetries").value),
+    includeGoogle: $("blogIncludeGoogle").checked,
+    googleReferenceCount: Math.max(0, Math.min(12, Number($("blogGoogleCount").value) || 0)),
+    progressHeight,
+    progressCollapsed
+  };
+}
+
+function markSettingsDirty() {
+  if (!hydrated) return;
+  saveRevision += 1;
+  $("settingsStatus").textContent = "변경 내용 저장 중…";
+  $("settingsStatus").classList.remove("error");
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { saveSettings().catch(() => {}); }, 500);
+}
+
+async function saveSettings() {
+  if (!hydrated) throw new Error("설정을 불러온 뒤 다시 실행해 주세요.");
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const revision = saveRevision;
+  // Capture an immutable snapshot now; serialize writes so an older edit cannot win.
+  const snapshot = JSON.parse(JSON.stringify(settings()));
+  savePending += 1;
+  const write = saveChain.catch(() => {}).then(() => window.picture.setSettings(snapshot));
+  saveChain = write;
+  try {
+    await write;
+    savedRevision = Math.max(savedRevision, revision);
+    savedSettings = snapshot;
+    if (revision === saveRevision) {
+      $("settingsStatus").textContent = "자동 저장 완료";
+      $("settingsStatus").classList.remove("error");
+    }
+  } catch (error) {
+    $("settingsStatus").textContent = "저장 실패 · 다시 수정해 재시도";
+    $("settingsStatus").classList.add("error");
+    appendProgress(`설정 저장 실패: ${error.message}`);
+    throw error;
+  } finally { savePending -= 1; }
+}
+
+function renderPrompts() {
+  $("blogPromptSelect").replaceChildren(...blogPreferences.prompts.map(prompt => {
+    const option = document.createElement("option");
+    option.value = prompt.id;
+    option.textContent = prompt.name;
+    return option;
+  }));
+  $("blogPromptSelect").value = blogPreferences.selectedPromptId;
+  const prompt = currentPrompt();
+  $("blogPromptName").value = prompt?.name || "";
+  $("blogPromptText").value = prompt?.text || "";
+  $("blogPromptDelete").disabled = blogPreferences.prompts.length < 2;
+}
+
+function renderStages() {
+  const count = Number($("blogStageCount").value) || 1;
+  $("blogStages").replaceChildren(...stageDrafts.slice(0, count).map((stage, index) => {
+    const row = document.createElement("div");
+    row.className = "stage-row";
+    row.innerHTML = `<div class="stage-heading"><span>${index + 1}</span><select aria-label="${index + 1}단계 CLI"></select><select aria-label="${index + 1}단계 역할"></select></div><label for="stageModel${index}">모델</label><input id="stageModel${index}" maxlength="160" autocomplete="off" placeholder="CLI 기본 모델 사용">`;
+    const [provider, role] = row.querySelectorAll("select");
+    for (const [value, label] of Object.entries(PROVIDERS)) provider.add(new Option(label, value));
+    for (const value of ROLES) role.add(new Option(value, value));
+    if (!ROLES.includes(stage.role)) role.add(new Option(stage.role, stage.role));
+    provider.value = stage.provider;
+    role.value = stage.role;
+    row.querySelector("input").value = stage.model || "";
+    provider.onchange = () => { stageDrafts[index].provider = provider.value; markSettingsDirty(); };
+    role.onchange = () => { stageDrafts[index].role = role.value; markSettingsDirty(); };
+    row.querySelector("input").oninput = event => { stageDrafts[index].model = event.target.value; markSettingsDirty(); };
+    return row;
+  }));
+}
+
+function appendProgress(message, time) {
+  if (!message) return;
+  const value = String(message).slice(0, 32768);
+  const stamp = time || new Date().toLocaleTimeString("ko-KR", { hour12: false });
+  const line = /^\[\d/.test(value) ? value : `[${stamp}] ${value}`;
+  if (line === lastProgressLine) return;
+  lastProgressLine = line;
+  progressLines.push(...line.split(/\r?\n/));
+  if (progressLines.length > 5000) progressLines.splice(0, progressLines.length - 5000);
+  $("progressLog").textContent = progressLines.join("\n");
+  $("progressLog").scrollTop = $("progressLog").scrollHeight;
+}
+
+function showBlogError(error) {
+  const message = error?.message || String(error);
+  $("blogStatus").textContent = message;
+  $("progressSummary").textContent = message;
+  $("blogStatusDot").className = "status-dot error";
+  appendProgress(message);
+}
+
+function updateBlogButtons() {
+  const busy = Boolean(blogRuntime.busy || blogStarting);
+  $("blogManual").disabled = !hydrated || busy;
+  $("blogStop").disabled = !hydrated || !(busy || blogRuntime.automationEnabled);
+  $("blogAutomation").disabled = !hydrated || automationChanging;
+  $("blogCheckCli").disabled = !hydrated || cliChecking;
+  document.querySelectorAll(".cli-login").forEach(button => {
+    button.disabled = busy || cliLoggingIn.has(button.dataset.provider);
+  });
+  for (const id of ["login", "write", "reply", "neighborStart"]) $(id).disabled = busy;
+  $("blogStatusDot").classList.toggle("busy", busy);
+}
+
+function renderResult(result) {
+  if (!result || typeof result !== "object") return;
+  $("blogResult").hidden = false;
+  const article = result.article || result.draft || {};
+  $("blogResultTitle").textContent = result.title || article.title || "작성 결과";
+  $("blogResultLocation").textContent = result.runDir || result.run_dir || result.folder || result.path || "";
+  let safeUrl = "";
+  try {
+    const url = new URL(result.url || result.publicationUrl || "");
+    if (["http:", "https:"].includes(url.protocol)) safeUrl = url.href;
+  } catch {}
+  $("blogResultUrl").hidden = !safeUrl;
+  $("blogResultUrl").href = safeUrl || "#";
+  const paragraphs = result.paragraphs || article.paragraphs || [];
+  $("blogResultText").textContent = result.text || article.text || paragraphs.map(paragraph => {
+    if (typeof paragraph === "string") return paragraph;
+    return [paragraph.subheading || paragraph.heading, paragraph.body || paragraph.content || paragraph.text]
+      .filter(Boolean).join("\n\n");
+  }).join("\n\n");
+  $("blogResultText").parentElement.hidden = !$("blogResultText").textContent;
+}
+
+function receiveBlogState(state = {}, { replayLogs = false } = {}) {
+  if (!state || typeof state !== "object") return;
+  blogRuntime = { ...blogRuntime, ...state };
+  if (typeof state.automationEnabled === "boolean") $("blogAutomation").checked = state.automationEnabled;
+  $("blogAutomation").nextElementSibling.textContent = blogRuntime.automationEnabled ? "자동화 켜짐" : "자동화 꺼짐";
+  const labels = { idle: "수동 작성 대기", running: "글 작성 진행 중", waiting: "다음 자동 실행 대기", stopped: "작업 중지됨", completed: "작성 완료", error: "작업 확인 필요", auth_required: "CLI 로그인 필요" };
+  const message = state.message || (state.status ? (labels[state.status] || state.status) : "");
+  if (message) {
+    $("blogStatus").textContent = message;
+    $("progressSummary").textContent = message;
+    if (!replayLogs || !state.logs?.length) appendProgress(message, state.time);
+  }
+  if (replayLogs && Array.isArray(state.logs)) {
+    for (const item of state.logs) appendProgress(typeof item === "string" ? item : item.message, item.time);
+  }
+  const next = blogRuntime.nextRunAt ? new Date(blogRuntime.nextRunAt) : null;
+  $("blogNextRun").textContent = next && !Number.isNaN(next.valueOf()) && blogRuntime.automationEnabled
+    ? `다음 실행 ${next.toLocaleString("ko-KR", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}` : "";
+  $("blogStatusDot").classList.toggle("error", ["error", "auth_required", "failed"].includes(blogRuntime.status));
+  if (state.lastResult) renderResult(state.lastResult);
+  updateBlogButtons();
+}
+
+function renderCliAccounts(response = {}) {
+  const values = Array.isArray(response) ? response : (Array.isArray(response.accounts) ? response.accounts : []);
+  $("blogCliAccounts").replaceChildren(...Object.entries(PROVIDERS).map(([provider, label]) => {
+    const record = values.find(item => item.provider === provider || item.name?.toLowerCase() === provider)
+      || response.accounts?.[provider] || response[provider] || {};
+    const status = typeof record === "string" ? record : record.status;
+    const ready = ["ready", "authenticated", "logged_in", "ok", "connected"].includes(status);
+    const statuses = { ready: "연결됨", authenticated: "연결됨", logged_in: "연결됨", ok: "연결됨", connected: "연결됨", auth_required: "로그인 필요", not_logged_in: "로그인 필요", missing: "CLI 설치 필요", not_found: "CLI 설치 필요", error: "연결 확인 필요" };
+    const node = document.createElement("div");
+    node.className = "cli-account";
+    const name = document.createElement("strong");
+    name.textContent = label;
+    const detail = document.createElement("p");
+    detail.textContent = [statuses[status] || status || "연결 확인 전", record.message || record.detail].filter(Boolean).join(" · ");
+    detail.className = ready ? "account-ready" : "account-error";
+    const login = document.createElement("button");
+    login.type = "button";
+    login.className = "secondary cli-login";
+    login.dataset.provider = provider;
+    login.textContent = cliLoggingIn.has(provider) ? "로그인 여는 중…" : "로그인";
+    login.onclick = async () => {
+      cliLoggingIn.add(provider);
+      updateBlogButtons();
+      try {
+        const result = await window.picture.loginCli(provider);
+        appendProgress(result?.message || `${label} 로그인 창을 열었습니다. 로그인 완료 후 CLI 로그인 재확인을 눌러 주세요.`);
+      } catch (error) { showBlogError(error); }
+      finally { cliLoggingIn.delete(provider); updateBlogButtons(); }
+    };
+    node.append(name, detail, login);
+    return node;
+  }));
+  updateBlogButtons();
+}
+
+async function checkCliAccounts() {
+  if (cliChecking) return;
+  cliChecking = true;
+  $("blogCheckCli").textContent = "CLI 확인 중…";
+  updateBlogButtons();
+  try { renderCliAccounts(await window.picture.getCliStatus()); }
+  catch (error) { showBlogError(error); }
+  finally {
+    cliChecking = false;
+    $("blogCheckCli").textContent = "CLI 로그인 재확인";
+    updateBlogButtons();
+  }
+}
+
+function applyProgressHeight() {
+  const max = Math.max(110, Math.floor(window.innerHeight * 0.7));
+  progressHeight = Math.max(110, Math.min(max, progressHeight));
+  const height = progressCollapsed ? 52 : progressHeight;
+  document.documentElement.style.setProperty("--progress-height", `${height}px`);
+  $("progressDock").style.height = `${height}px`;
+  $("progressDock").classList.toggle("collapsed", progressCollapsed);
+  $("progressToggle").textContent = progressCollapsed ? "펼치기" : "접기";
+  $("progressToggle").setAttribute("aria-expanded", String(!progressCollapsed));
+  $("progressResize").setAttribute("aria-valuenow", String(Math.round(height)));
+}
+
+$("progressToggle").onclick = () => { progressCollapsed = !progressCollapsed; applyProgressHeight(); markSettingsDirty(); };
+$("progressResize").onpointerdown = event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  const startY = event.clientY;
+  const startHeight = $("progressDock").getBoundingClientRect().height;
+  progressCollapsed = false;
+  const drag = move => { progressHeight = startHeight + startY - move.clientY; applyProgressHeight(); };
+  const end = () => {
+    window.removeEventListener("pointermove", drag);
+    window.removeEventListener("pointerup", end);
+    window.removeEventListener("pointercancel", end);
+    markSettingsDirty();
+  };
+  window.addEventListener("pointermove", drag);
+  window.addEventListener("pointerup", end, { once: true });
+  window.addEventListener("pointercancel", end, { once: true });
+};
+$("progressResize").onkeydown = event => {
+  if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+  event.preventDefault();
+  progressCollapsed = false;
+  progressHeight += event.key === "ArrowUp" ? 20 : -20;
+  applyProgressHeight();
+  markSettingsDirty();
+};
+window.addEventListener("resize", applyProgressHeight);
+const progressObserver = new ResizeObserver(() => {
+  if (!hydrated || progressCollapsed) return;
+  const actual = Math.round($("progressDock").getBoundingClientRect().height);
+  if (Math.abs(actual - progressHeight) < 2) return;
+  progressHeight = actual;
+  document.documentElement.style.setProperty("--progress-height", `${actual}px`);
+  markSettingsDirty();
+});
+progressObserver.observe($("progressDock"));
+
+$("blogPromptSelect").onchange = event => {
+  commitPrompt();
+  blogPreferences.selectedPromptId = event.target.value;
+  renderPrompts();
+  markSettingsDirty();
+};
+$("blogPromptName").oninput = () => {
+  commitPrompt();
+  const option = $("blogPromptSelect").selectedOptions[0];
+  if (option) option.textContent = currentPrompt().name;
+  markSettingsDirty();
+};
+$("blogPromptText").oninput = markSettingsDirty;
+$("blogPromptAdd").onclick = () => {
+  commitPrompt();
+  const source = currentPrompt();
+  const prompt = { id: crypto.randomUUID(), name: `${source?.name || "새 프롬프트"} 복사`, text: source?.text || "" };
+  blogPreferences.prompts.push(prompt);
+  blogPreferences.selectedPromptId = prompt.id;
+  renderPrompts();
+  $("blogPromptName").focus();
+  $("blogPromptName").select();
+  markSettingsDirty();
+};
+$("blogPromptDelete").onclick = () => {
+  if (blogPreferences.prompts.length < 2) return;
+  blogPreferences.prompts = blogPreferences.prompts.filter(prompt => prompt.id !== blogPreferences.selectedPromptId);
+  blogPreferences.selectedPromptId = blogPreferences.prompts[0].id;
+  renderPrompts();
+  markSettingsDirty();
+};
+$("blogStageCount").onchange = () => { renderStages(); markSettingsDirty(); };
+for (const id of ["blogKeyword", "blogGoogleCount", "blogId", "phrases", "neighborPhrases", "commentDays", "replyInterval", "intervalSeconds", "maxPosts"]) {
+  $(id).addEventListener("input", markSettingsDirty);
+}
+for (const id of ["blogInterval", "blogMode", "blogImageRetries", "blogIncludeGoogle"]) {
+  $(id).addEventListener("change", markSettingsDirty);
+}
+$("useBlogKeyword").onclick = () => {
+  $("blogKeyword").value = selectedImageKeyword || selectedRealtime;
+  markSettingsDirty();
+  activateTab(3);
+  $("blogKeyword").focus();
+};
+$("blogManual").onclick = async () => {
+  const keyword = $("blogKeyword").value.trim();
+  if (!keyword) { $("blogKeyword").focus(); showBlogError("글을 작성할 키워드를 입력해 주세요."); return; }
+  if (blogRuntime.busy || blogStarting) return;
+  blogStarting = true;
+  updateBlogButtons();
+  try {
+    await saveSettings();
+    receiveBlogState(await window.picture.startManualBlog({ keyword, mode: $("blogMode").value }));
+  } catch (error) { showBlogError(error); }
+  finally { blogStarting = false; updateBlogButtons(); }
+};
+$("blogKeyword").onkeydown = event => {
+  if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); $("blogManual").click(); }
+};
+$("blogAutomation").onchange = async event => {
+  const desired = event.target.checked;
+  automationChanging = true;
+  updateBlogButtons();
+  try {
+    await saveSettings();
+    receiveBlogState(await window.picture.setBlogAutomation(desired));
+  } catch (error) {
+    $("blogAutomation").checked = blogRuntime.automationEnabled;
+    showBlogError(error);
+  } finally { automationChanging = false; updateBlogButtons(); }
+};
+$("blogStop").onclick = async () => {
+  try { receiveBlogState(await window.picture.stopBlog()); }
+  catch (error) { showBlogError(error); }
+};
+$("blogCheckCli").onclick = checkCliAccounts;
+$("blogOpenFolder").onclick = async () => {
+  try { await window.picture.openBlogFolder(); }
+  catch (error) { showBlogError(error); }
+};
+const unsubscribeBlogProgress = window.picture.onBlogProgress(state => receiveBlogState(state));
+
+window.addEventListener("beforeunload", event => {
+  if (!hydrated || closeAfterSave) { unsubscribeBlogProgress(); return; }
+  if (saveTimer || savePending || savedRevision < saveRevision) {
+    event.preventDefault();
+    event.returnValue = false;
+    saveSettings().then(() => { closeAfterSave = true; window.close(); }).catch(() => {});
+  } else unsubscribeBlogProgress();
+});
+
 (async () => {
-  loadRealtime();
-  const saved = await window.picture.getSettings();
-  if (saved.blogId) $("blogId").value = saved.blogId;
-  if (saved.phrases?.length) $("phrases").value = saved.phrases.join("\n");
-  if (saved.neighborPhrases?.length) $("neighborPhrases").value = saved.neighborPhrases.join("\n");
-  if (saved.commentDays) $("commentDays").value = saved.commentDays;
-  if (saved.replyInterval !== undefined) $("replyInterval").value = saved.replyInterval;
-  if (saved.intervalSeconds) $("intervalSeconds").value = saved.intervalSeconds;
-  if (saved.maxPosts) $("maxPosts").value = saved.maxPosts;
+  try {
+    const saved = await window.picture.getSettings();
+    savedSettings = saved;
+    if (saved.blogId) $("blogId").value = saved.blogId;
+    if (Array.isArray(saved.phrases)) $("phrases").value = saved.phrases.join("\n");
+    if (Array.isArray(saved.neighborPhrases)) $("neighborPhrases").value = saved.neighborPhrases.join("\n");
+    for (const key of ["commentDays", "replyInterval", "intervalSeconds", "maxPosts"]) {
+      if (saved[key] !== undefined) $(key).value = saved[key];
+    }
+    const preferences = saved.blog || {};
+    blogPreferences = {
+      ...preferences,
+      prompts: preferences.prompts?.length ? preferences.prompts.map(prompt => ({ ...prompt })) : [{ id: "default", name: "기본 글쓰기", text: "" }],
+      selectedPromptId: preferences.selectedPromptId || "default"
+    };
+    if (!currentPrompt()) blogPreferences.selectedPromptId = blogPreferences.prompts[0].id;
+    const savedStages = preferences.stages?.length ? preferences.stages.slice(0, 4) : DEFAULT_STAGES;
+    stageDrafts = DEFAULT_STAGES.map((stage, index) => ({ ...stage, ...savedStages[index] }));
+    $("blogStageCount").value = String(savedStages.length);
+    $("blogInterval").value = String(preferences.intervalHours || 1);
+    $("blogMode").value = preferences.mode || "draft";
+    $("blogKeyword").value = preferences.keyword || "";
+    $("blogIncludeGoogle").checked = preferences.includeGoogle !== false;
+    $("blogImageRetries").value = String(preferences.imageRetryLimit ?? 2);
+    $("blogGoogleCount").value = preferences.googleReferenceCount ?? 4;
+    progressHeight = Number(preferences.progressHeight) || 178;
+    progressCollapsed = Boolean(preferences.progressCollapsed);
+    blogRuntime.automationEnabled = Boolean(preferences.automationEnabled);
+    renderPrompts();
+    renderStages();
+    applyProgressHeight();
+    hydrated = true;
+    for (const id of ["blogInterval", "blogMode", "blogKeyword", "blogPromptSelect", "blogPromptName", "blogPromptText", "blogPromptAdd", "blogStageCount", "blogIncludeGoogle", "blogImageRetries", "blogGoogleCount"]) $(id).disabled = false;
+    $("settingsStatus").textContent = "이전 설정 불러옴";
+    receiveBlogState(await window.picture.getBlogState(), { replayLogs: true });
+    renderCliAccounts();
+    if (!blogRuntime.smokeTest) {
+      // Backend owns automation startup. Merely opening the UI never starts a run.
+      if (!blogRuntime.busy) checkCliAccounts();
+      $("sourceSummary").textContent = "1번 탭을 열면 실시간 검색어를 가져옵니다.";
+    }
+  } catch (error) {
+    showBlogError(`프로그램 초기화 실패: ${error.message}`);
+    $("settingsStatus").textContent = "초기화 확인 필요";
+    $("settingsStatus").classList.add("error");
+  }
 })();

@@ -3,16 +3,32 @@ const fs = require("fs");
 const path = require("path");
 const { spawn, execFileSync } = require("child_process");
 const crypto = require("crypto");
+const { SettingsStore, BackendRunner, BlogController, atomicJson, safeLog } = require('./blog-runtime');
 const isSmokeTest = process.argv.includes("--smoke-test");
+// Preserve the old Mac settings location even though the visible app name is Blog.
+if (isSmokeTest) {
+  app.setPath('userData', path.join(app.getPath('temp'), `blog-mac-smoke-${process.pid}`));
+} else if (process.platform === 'darwin') {
+  const existing = [app.getPath('userData'), path.join(app.getPath('appData'), 'Picture Cleaner'),
+    path.join(app.getPath('appData'), 'picture-cleaner-mac')].find(root => fs.existsSync(path.join(root, 'settings.json')));
+  if (existing) app.setPath('userData', existing);
+}
+// Two processes must never submit or resume the same saved publication.
+const ownsInstance = isSmokeTest || app.requestSingleInstanceLock();
+if (!ownsInstance) app.quit();
+let blogController;
+let backend;
+let settingsStore;
 
 let mainWindow;
 let naverWindow;
 let neighborJobCancelled = false;
 let whaleProcess;
+let whaleStarting;
 let lastGoogleImageSearch = null;
 let lastGoogleCaptureFolder = "";
 let activeNaverTask = "";
-const WHALE_DEBUG_PORT = 9339;
+const WHALE_DEBUG_PORT = 9449;
 const CREATOR_ADVISOR_BLOG_ID = "macdcross";
 const CREATOR_ADVISOR_CATEGORIES = [
   "세계여행",
@@ -42,25 +58,47 @@ class CdpPage {
   constructor(webSocketUrl) {
     this.nextId = 1;
     this.pending = new Map();
+    this.closed = false;
     this.socket = new WebSocket(webSocketUrl);
     this.ready = new Promise((resolve, reject) => {
-      this.socket.onopen = resolve;
-      this.socket.onerror = () => reject(new Error("네이버 웨일 자동화 연결에 실패했습니다."));
+      this.rejectConnection = reject;
+      this.connectionTimer = setTimeout(() => {
+        reject(new Error('웨일 연결 시간이 초과되었습니다.'));
+        this.disconnect();
+      }, 15000);
+      this.socket.onopen = () => { clearTimeout(this.connectionTimer); resolve(); };
+      this.socket.onerror = () => {
+        clearTimeout(this.connectionTimer);
+        reject(new Error("네이버 웨일 자동화 연결에 실패했습니다."));
+        this.disconnect();
+      };
     });
+    this.socket.onclose = () => {
+      this.closed = true;
+      clearTimeout(this.connectionTimer);
+      this.rejectConnection(new Error('웨일 연결이 닫혔습니다. 다시 로그인 창을 열어 주세요.'));
+      for (const item of this.pending.values()) { clearTimeout(item.timer); item.reject(new Error('웨일 연결이 닫혔습니다. 다시 로그인 창을 열어 주세요.')); }
+      this.pending.clear();
+    };
     this.socket.onmessage = event => {
-      const message = JSON.parse(event.data);
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
       if (!message.id || !this.pending.has(message.id)) return;
-      const { resolve, reject } = this.pending.get(message.id);
+      const { resolve, reject, timer } = this.pending.get(message.id);
+      clearTimeout(timer);
       this.pending.delete(message.id);
       if (message.error) reject(new Error(message.error.message)); else resolve(message.result || {});
     };
   }
   async send(method, params = {}) {
     await this.ready;
+    if (this.closed || this.socket.readyState !== 1) throw new Error('웨일 연결이 닫혔습니다. 다시 로그인 창을 열어 주세요.');
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`웨일 작업 응답 시간 초과: ${method}`)); }, 90000);
+      this.pending.set(id, { resolve, reject, timer });
+      try { this.socket.send(JSON.stringify({ id, method, params })); }
+      catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error); }
     });
   }
   async initialize() {
@@ -150,63 +188,60 @@ function whaleExecutable() {
   return candidates.find(candidate => fs.existsSync(candidate));
 }
 
-function whaleDefaultProfile() {
-  const root = path.join(app.getPath("home"), "Library/Application Support/Naver/Whale");
-  if (!fs.existsSync(root)) return null;
-  let profileName = "Default";
-  try {
-    const localState = JSON.parse(fs.readFileSync(path.join(root, "Local State"), "utf8"));
-    profileName = localState?.profile?.last_used || "Default";
-  } catch {}
-  const profile = path.join(root, profileName);
-  return fs.existsSync(profile) ? { root, profile } : null;
-}
-
-function copyWhaleSession(source, destination) {
-  if (!fs.existsSync(source)) return;
-  fs.mkdirSync(path.dirname(destination), { recursive: true });
-  try {
-    const sourceStat = fs.statSync(source);
-    if (sourceStat.isDirectory()) {
-      fs.cpSync(source, destination, { recursive: true, force: true });
-    } else {
-      fs.copyFileSync(source, destination);
-    }
-  } catch {}
-}
-
-function syncExistingWhaleLogin(targetRoot) {
-  const source = whaleDefaultProfile();
-  if (!source) return false;
-  const targetProfile = path.join(targetRoot, "Default");
-  fs.mkdirSync(targetProfile, { recursive: true });
-  copyWhaleSession(path.join(source.root, "Local State"), path.join(targetRoot, "Local State"));
-  const items = [
-    "Cookies", "Cookies-wal", "Cookies-shm",
-    "Network/Cookies", "Network/Cookies-wal", "Network/Cookies-shm",
-    "Local Storage", "Session Storage", "IndexedDB", "WebStorage",
-    "Preferences", "Secure Preferences", "Web Data", "Login Data"
-  ];
-  for (const item of items) {
-    copyWhaleSession(path.join(source.profile, item), path.join(targetProfile, item));
-  }
-  return true;
-}
-
 async function ensureWhale() {
   if (process.platform !== "darwin") return null;
+  // Login, search, and scheduled work can request the same browser concurrently.
+  if (!whaleStarting) whaleStarting = startWhale().finally(() => { whaleStarting = null; });
+  return whaleStarting;
+}
+
+function validateWhaleSocket(value, kind = 'browser') {
+  let socket;
+  try { socket = new URL(value); } catch { throw new Error('웨일 연결 주소가 올바르지 않습니다.'); }
+  if (socket.protocol !== 'ws:' || socket.hostname !== '127.0.0.1' || socket.port !== String(WHALE_DEBUG_PORT)
+      || socket.username || socket.password || !socket.pathname.startsWith(`/devtools/${kind}/`)) {
+    throw new Error('웨일 연결 주소가 앱 전용 로컬 포트와 일치하지 않습니다.');
+  }
+  return value;
+}
+
+async function readWhaleVersion(timeout) {
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${WHALE_DEBUG_PORT}/json/version`, {
+      signal: AbortSignal.timeout(timeout), redirect: 'error'
+    });
+  } catch (error) {
+    // Only a refused connection proves the port is unused. A stalled or broken
+    // listener must not be mistaken for permission to take ownership of it.
+    if (error.cause?.code === 'ECONNREFUSED' || error.code === 'ECONNREFUSED') return null;
+    throw new Error('웨일 전용 포트의 응답을 확인할 수 없습니다. 자동화 웨일을 닫은 뒤 다시 실행하세요.');
+  }
+  if (!response.ok) throw new Error('다른 프로그램이 맥 Blog의 웨일 연결 포트를 사용 중입니다.');
+  let version;
+  try { version = await response.json(); } catch { throw new Error('웨일 전용 포트에서 올바른 연결 정보를 받지 못했습니다.'); }
+  validateWhaleSocket(version?.webSocketDebuggerUrl);
+  return version;
+}
+
+async function startWhale() {
   const executable = whaleExecutable();
   if (!executable) throw new Error("네이버 웨일이 설치되어 있지 않습니다. 웨일을 설치한 뒤 다시 실행해 주세요.");
-  const versionUrl = `http://127.0.0.1:${WHALE_DEBUG_PORT}/json/version`;
-  try {
-    const response = await fetch(versionUrl);
-    if (response.ok) return;
-  } catch {}
-  const profile = path.join(app.getPath("userData"), "naver-whale-profile");
-  syncExistingWhaleLogin(profile);
+  const profile = path.join(app.getPath("userData"), "naver-whale-profile-v2");
+  const existingVersion = await readWhaleVersion(2000);
+  if (existingVersion) {
+    let owner;
+    try { owner = JSON.parse(fs.readFileSync(userDataFile('whale-debug-owner.json'), 'utf8')); }
+    catch { throw new Error('실행 중인 웨일의 앱 소유 정보를 확인할 수 없습니다. 자동화 웨일을 닫은 뒤 다시 실행하세요.'); }
+    if (owner?.profile !== profile || owner.webSocket !== existingVersion.webSocketDebuggerUrl) {
+      throw new Error('다른 프로그램이 맥 Blog의 웨일 연결 포트를 사용 중입니다. 해당 자동화 웨일을 닫은 뒤 다시 실행하세요.');
+    }
+    return;
+  }
+  fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
   whaleProcess = spawn(executable, [
     `--remote-debugging-port=${WHALE_DEBUG_PORT}`,
-    "--remote-allow-origins=*",
+    "--remote-debugging-address=127.0.0.1",
     `--user-data-dir=${profile}`,
     "--profile-directory=Default",
     "--start-maximized",
@@ -214,11 +249,16 @@ async function ensureWhale() {
     "--disable-notifications",
     "about:blank"
   ], { detached: false, stdio: "ignore" });
+  let launchError;
+  whaleProcess.on('error', error => { launchError = error; });
   for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      const response = await fetch(versionUrl);
-      if (response.ok) return;
-    } catch {}
+    if (launchError) throw new Error(`웨일 실행 실패: ${launchError.message}`);
+    if (whaleProcess.exitCode !== null || whaleProcess.signalCode) throw new Error('전용 웨일 프로세스가 종료되어 연결을 시작하지 못했습니다.');
+    const version = await readWhaleVersion(1000);
+    if (version) {
+      atomicJson(userDataFile('whale-debug-owner.json'), { profile, webSocket: version.webSocketDebuggerUrl, pid: whaleProcess.pid });
+      return;
+    }
     await wait(250);
   }
   throw new Error("네이버 웨일 자동화 연결을 시작하지 못했습니다.");
@@ -228,12 +268,13 @@ async function openWhalePage(url) {
   await ensureWhale();
   const response = await fetch(
     `http://127.0.0.1:${WHALE_DEBUG_PORT}/json/new?${encodeURIComponent(url)}`,
-    { method: "PUT" }
+    { method: "PUT", signal: AbortSignal.timeout(10000), redirect: 'error' }
   );
   if (!response.ok) throw new Error("네이버 웨일 탭을 열지 못했습니다.");
   const target = await response.json();
-  const page = new CdpPage(target.webSocketDebuggerUrl);
-  await page.initialize();
+  const page = new CdpPage(validateWhaleSocket(target.webSocketDebuggerUrl, 'page'));
+  try { await page.initialize(); }
+  catch (error) { page.disconnect(); throw error; }
   await wait(1800);
   return page;
 }
@@ -241,16 +282,25 @@ async function openWhalePage(url) {
 async function requireNaverWhaleLogin(page) {
   try {
     const result = await page.send("Storage.getCookies");
-    const loggedIn = (result.cookies || []).some(cookie =>
+    const cookies = (result.cookies || []).filter(cookie =>
       /(^|\.)naver\.com$/i.test(cookie.domain || "") &&
-      (cookie.name === "NID_SES" || cookie.name === "NID_AUT") &&
-      Boolean(cookie.value)
+      (cookie.name === "NID_SES" || cookie.name === "NID_AUT") && Boolean(cookie.value) &&
+      (!cookie.expires || cookie.expires === -1 || cookie.expires * 1000 > Date.now())
     );
-    if (loggedIn) return true;
+    if (new Set(cookies.map(cookie => cookie.name)).size === 2) {
+      const previous = await page.evaluateMain('location.href');
+      await page.navigate('https://blog.naver.com/MyBlog.naver');
+      const states = await page.evaluateFrames(`(() => ({loggedOut: Boolean(document.querySelector('input[type="password"],form[action*="nidlogin"]')),
+        loggedIn: [...document.querySelectorAll('a,button')].some(e => /로그아웃/.test(e.textContent || '') || /nidlogin.logout/.test(e.href || '')),
+        loginPage: /nid\\.naver\\.com\\/nidlogin/.test(location.href)}))()`);
+      if (!states.some(state => state?.loggedOut || state?.loginPage) && states.some(state => state?.loggedIn)) {
+        await page.navigate(previous); return true;
+      }
+    }
   } catch {}
   await page.navigate("https://nid.naver.com/nidlogin.login");
   throw new Error(
-    "네이버 로그인이 확인되지 않아 웨일 로그인 화면을 열었습니다. 로그인 후 작업 버튼을 다시 눌러 주세요."
+    "네이버 로그인이 확인되지 않아 전용 웨일 로그인 화면을 열었습니다. 최초 한 번 로그인한 뒤 작업을 다시 실행하세요. 일반 웨일의 인증 파일은 복사하지 않습니다."
   );
 }
 
@@ -678,7 +728,7 @@ ipcMain.handle("save-images", async (_event, images) => {
   return { canceled: false, folder: picked.filePaths[0], count: images.length };
 });
 
-ipcMain.handle("collect-keywords", async (_event, seed) => {
+async function collectKeywords(seed) {
   const q = encodeURIComponent((seed || "").trim());
   const endpoints = [
     ["네이버", `https://ac.search.naver.com/nx/ac?q=${q}&con=0&frm=nv&ans=2&r_format=json&r_enc=UTF-8&r_unicode=0&t_koreng=1&run=2&rev=4`],
@@ -713,7 +763,8 @@ ipcMain.handle("collect-keywords", async (_event, seed) => {
     }
   }
   return output.slice(0, 40);
-});
+}
+ipcMain.handle("collect-keywords", (_event, seed) => collectKeywords(seed));
 
 async function translateToEnglish(keyword) {
   const korean = unique([keyword])[0];
@@ -1023,9 +1074,9 @@ ipcMain.handle("capture-enhance-google-images", async (event, keyword) => {
 
 ipcMain.handle("open-naver-login", async (_event, blogId) => {
   if (process.platform === "darwin") {
-    await openWhalePage(blogId
-      ? `https://blog.naver.com/${encodeURIComponent(blogId)}`
-      : "https://nid.naver.com/nidlogin.login");
+    const target = blogId ? `https://blog.naver.com/${encodeURIComponent(blogId)}` : 'https://blog.naver.com/MyBlog.naver';
+    const page = await openWhalePage(`https://nid.naver.com/nidlogin.login?url=${encodeURIComponent(target)}`);
+    page.disconnect();
     return true;
   }
   const win = getNaverWindow();
@@ -1036,7 +1087,8 @@ ipcMain.handle("open-naver-login", async (_event, blogId) => {
 
 ipcMain.handle("open-blog-write", async () => {
   if (process.platform === "darwin") {
-    await openWhalePage("https://blog.naver.com/GoBlogWrite.naver");
+    const page = await openWhalePage("https://blog.naver.com/GoBlogWrite.naver");
+    page.disconnect();
     return true;
   }
   const win = getNaverWindow();
@@ -1045,13 +1097,11 @@ ipcMain.handle("open-blog-write", async () => {
   return true;
 });
 
-ipcMain.handle("get-settings", () => {
-  try { return JSON.parse(fs.readFileSync(userDataFile("settings.json"), "utf8")); }
-  catch { return {}; }
-});
+ipcMain.handle("get-settings", () => settingsStore.get());
 
 ipcMain.handle("set-settings", (_event, settings) => {
-  fs.writeFileSync(userDataFile("settings.json"), JSON.stringify(settings, null, 2));
+  settingsStore.set(settings);
+  blogController?.settingsChanged();
   return true;
 });
 
@@ -1616,8 +1666,97 @@ ipcMain.handle("comment-neighbor-feed", async (event, options) => {
   return summary;
 });
 
-app.whenReady().then(() => {
+function blogProgress(value) {
+  if (value.busy && !activeNaverTask) activeNaverTask = '블로그 글 작성';
+  if (!value.busy && activeNaverTask === '블로그 글 작성') activeNaverTask = '';
+  if (value.message) {
+    try {
+      const file = userDataFile('logs/blog-mac-ui.log');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      if (fs.existsSync(file) && fs.statSync(file).size > 2 * 1024 * 1024) {
+        if (fs.existsSync(`${file}.1`)) fs.unlinkSync(`${file}.1`);
+        fs.renameSync(file, `${file}.1`);
+      }
+      fs.appendFileSync(file, `${new Date().toISOString()} ${safeLog(value.message)}\n`, { mode: 0o600 });
+    } catch { /* The visible progress remains available when disk logging fails. */ }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('blog-progress', value);
+}
+
+async function collectBlogResearch(keyword, automatic) {
+  if (activeNaverTask && activeNaverTask !== '블로그 글 작성') throw new Error(`현재 ${activeNaverTask} 작업이 실행 중입니다.`);
+  const groups = automatic ? (await collectRealtimeDirect()).output : { '직접 입력': [keyword] };
+  // Compare multiple real candidates; fetch related phrases concurrently in small batches.
+  const seeds = [...new Set(Object.values(groups).flat())].filter(value => typeof value === 'string').slice(0, 24);
+  const relatedByTopic = {};
+  for (let index = 0; index < seeds.length && !blogController.stopping; index += 4) {
+    await Promise.all(seeds.slice(index, index + 4).map(async seed => {
+      const rows = await collectKeywords(seed);
+      relatedByTopic[seed] = rows.filter(row => !row.error && row.keyword).map(row => row.keyword);
+    }));
+  }
+  blogController.progress({ message: `실제 연관 검색어 조회 완료 · 주제 ${Object.keys(relatedByTopic).length}개. 연관어 수와 검색 의도를 비교합니다.` });
+  return { groups, relatedByTopic };
+}
+
+function initializeBlog() {
+  fs.mkdirSync(app.getPath('userData'), { recursive: true });
+  const prompt = fs.readFileSync(path.join(__dirname, 'assets', 'default_blog_prompt.txt'), 'utf8');
+  settingsStore = new SettingsStore(app.getPath('userData'), prompt);
+  const packagedEngine = path.join(process.resourcesPath, 'blog-backend', 'BlogEngine');
+  const localEngine = path.join(__dirname, 'backend-dist', 'BlogEngine', process.platform === 'win32' ? 'BlogEngine.exe' : 'BlogEngine');
+  const executable = app.isPackaged ? packagedEngine : fs.existsSync(localEngine) ? localEngine : (process.platform === 'win32' ? 'python' : 'python3');
+  const args = !app.isPackaged && !fs.existsSync(localEngine) ? [path.join(__dirname, 'backend', 'engine.py')] : [];
+  backend = new BackendRunner({ executable, args, dataDir: app.getPath('userData'), emit: value => blogController?.progress(value) });
+  blogController = new BlogController({ store: settingsStore, backend, collect: collectBlogResearch, ensureBrowser: ensureWhale, emit: blogProgress });
+  try { blogController.lastResult = JSON.parse(fs.readFileSync(userDataFile('mac-last-result.json'), 'utf8')); } catch {}
+}
+
+ipcMain.handle('blog-state', () => ({ ...blogController.state(), smokeTest: isSmokeTest }));
+ipcMain.handle('blog-manual', (_event, options = {}) => {
+  if (activeNaverTask) throw new Error(`현재 '${activeNaverTask}' 작업이 진행 중입니다.`);
+  return blogController.start(options);
+});
+ipcMain.handle('blog-automation', (_event, enabled) => {
+  if (enabled && activeNaverTask && !blogController.busy) throw new Error(`현재 '${activeNaverTask}' 작업이 진행 중입니다.`);
+  return blogController.setAutomation(enabled);
+});
+ipcMain.handle('blog-stop', () => blogController.stop());
+ipcMain.handle('blog-cli-status', () => backend.invoke('status'));
+ipcMain.handle('blog-cli-login', (_event, provider) => backend.invoke('login', { provider }));
+ipcMain.handle('blog-open-folder', async () => {
+  const error = await shell.openPath(app.getPath('userData'));
+  if (error) throw new Error(error);
+  return true;
+});
+
+if (ownsInstance) app.whenReady().then(() => {
+  initializeBlog();
   createMainWindow();
+  if (!isSmokeTest) mainWindow.webContents.once('did-finish-load', () => {
+    try { blogController.initialize(); }
+    catch (error) { blogController.progress({ status: 'error', message: error.message }); }
+  });
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createMainWindow(); });
+});
+if (ownsInstance && !isSmokeTest) app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (app.isReady()) createMainWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+let quitting = false;
+app.on('before-quit', event => {
+  neighborJobCancelled = true;
+  if (quitting || !blogController?.busy) return;
+  event.preventDefault(); quitting = true;
+  // Preserve the user's on/off preference while cancelling only this application's child work.
+  blogController.stopping = true;
+  clearTimeout(blogController.timer);
+  backend.terminate();
+  Promise.race([blogController.running, wait(12000)]).finally(() => app.quit());
 });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });

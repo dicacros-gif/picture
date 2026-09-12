@@ -7,9 +7,18 @@ import re
 import tempfile
 import time
 import unicodedata
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont
+
+
+def _default_korean_font() -> Path:
+    if sys.platform == "darwin":
+        for value in ("/System/Library/Fonts/AppleSDGothicNeo.ttc", "/Library/Fonts/AppleGothic.ttf"):
+            if Path(value).is_file():
+                return Path(value)
+    return Path("C:/Windows/Fonts/malgunbd.ttf")
 
 
 def _validated_caption(caption: str) -> str:
@@ -27,7 +36,7 @@ def _validated_caption(caption: str) -> str:
 
 def _draw_caption(pixels: Image.Image, caption: str, font_path: str | Path | None = None) -> tuple[Image.Image, dict]:
     """Add a separate top band; never cover or crop pixels from the reference photo."""
-    font_path = Path(font_path or "C:/Windows/Fonts/malgunbd.ttf")
+    font_path = Path(font_path) if font_path else _default_korean_font()
     if not font_path.is_file():
         raise ValueError("이미지 한글 설명에 필요한 한글 글꼴을 찾지 못했습니다.")
     width = pixels.width
@@ -55,7 +64,7 @@ def _draw_caption(pixels: Image.Image, caption: str, font_path: str | Path | Non
 
 
 def _draw_cover(pixels: Image.Image, headline: str, font_path: str | Path | None = None) -> tuple[Image.Image, str]:
-    font_path = Path(font_path or "C:/Windows/Fonts/malgunbd.ttf")
+    font_path = Path(font_path) if font_path else _default_korean_font()
     if not font_path.is_file():
         raise ValueError("첫 사진의 한글 문구에 필요한 한글 글꼴을 찾지 못했습니다.")
     if not headline.strip() or len(headline) > 12 or "\n" in headline:

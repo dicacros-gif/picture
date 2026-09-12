@@ -1,2 +1,7 @@
 node_modules/
 dist/
+backend-dist/
+__pycache__/
+backend/__pycache__/
+tests/__pycache__/
+build/backend/

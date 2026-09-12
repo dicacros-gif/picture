@@ -5,14 +5,18 @@ on:
   push:
     paths:
       - 'mac-app/**'
+      - 'windows/blog_*.py'
+      - 'windows/naver_automation.py'
+      - 'windows/image_delivery.py'
       - '.github/workflows/build_mac.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-mac:
     runs-on: macos-14
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -20,44 +24,52 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: mac-app/package-lock.json
-      - name: Install dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'arm64'
+          cache: pip
+          cache-dependency-path: mac-app/backend/requirements-mac.txt
+      - name: Verify Apple Silicon and install dependencies
         working-directory: mac-app
-        run: npm ci
+        run: |
+          test "$(uname -m)" = "arm64"
+          python -c "import platform; assert platform.machine() == 'arm64', platform.machine()"
+          npm ci
+          python -m pip install -r backend/requirements-mac.txt
+      - name: Test Mac settings, authentication and orchestration
+        working-directory: mac-app
+        run: |
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py' -q
+          node --check main.js
+          node --check renderer/renderer.js
+      - name: Bundle shared Blog engine for M1
+        working-directory: mac-app
+        run: bash scripts/build-backend.sh
       - name: Build Apple Silicon app
         working-directory: mac-app
         run: npm run build:mac
-      - name: Apply Apple Silicon ad-hoc signature
+      - name: Sign, verify and run on M1
         working-directory: mac-app
-        run: |
-          APP_PATH="dist/mac-arm64/Picture Cleaner.app"
-          codesign --force --deep --sign - --timestamp=none --options runtime \
-            --entitlements "entitlements.mac.plist" "$APP_PATH"
-      - name: Verify ad-hoc signature and launch
-        working-directory: mac-app
-        run: |
-          APP_PATH="dist/mac-arm64/Picture Cleaner.app"
-          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-          codesign -d --entitlements :- "$APP_PATH"
-          "$APP_PATH/Contents/MacOS/Picture Cleaner" --smoke-test
+        run: bash scripts/sign-and-verify.sh
       - name: Create Mac installation package
         working-directory: mac-app
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          PACKAGE_DIR="dist/Picture-Cleaner-M1-$VERSION"
-          ZIP_PATH="dist/Picture-Cleaner-M1-$VERSION.zip"
+          PACKAGE_DIR="dist/Blog-M1-$VERSION"
+          ZIP_PATH="dist/Blog-M1-$VERSION.zip"
           mkdir -p "$PACKAGE_DIR"
-          ditto "dist/mac-arm64/Picture Cleaner.app" "$PACKAGE_DIR/Picture Cleaner.app"
-          cp "Install-Picture-Cleaner.command" "$PACKAGE_DIR/Install-Picture-Cleaner.command"
-          cp "MAC-INSTALL.txt" "$PACKAGE_DIR/MAC-INSTALL.txt"
-          chmod 755 "$PACKAGE_DIR/Install-Picture-Cleaner.command"
+          ditto "dist/mac-arm64/Blog.app" "$PACKAGE_DIR/Blog.app"
+          cp Install-Blog.command Install-Picture-Cleaner.command MAC-INSTALL.txt "$PACKAGE_DIR/"
+          chmod 755 "$PACKAGE_DIR/Install-Blog.command" "$PACKAGE_DIR/Install-Picture-Cleaner.command"
           ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_DIR" "$ZIP_PATH"
-          unzip -l "$ZIP_PATH" | grep -E "Picture Cleaner.app/Contents/MacOS/Picture Cleaner|Install-Picture-Cleaner.command"
+          shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"
+          unzip -l "$ZIP_PATH" | grep -E 'Blog.app/Contents/MacOS/Blog|Install-Blog.command'
       - uses: actions/upload-artifact@v4
         with:
-          name: Picture-Cleaner-M1
-          path: mac-app/dist/Picture-Cleaner-M1-*.zip
+          name: Blog-M1
+          path: |
+            mac-app/dist/Blog-M1-*.zip
+            mac-app/dist/Blog-M1-*.sha256
           if-no-files-found: error
-      - name: Publish Mac file to latest release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload latest mac-app/dist/Picture-Cleaner-M1-*.zip --clobber

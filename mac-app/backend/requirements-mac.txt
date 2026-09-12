@@ -1,0 +1,5 @@
+Pillow>=11.3,<13
+requests>=2.32,<3
+selenium>=4.35,<5
+pyinstaller>=6.15,<7
+pyobjc-framework-Cocoa>=11,<13; sys_platform == "darwin"

@@ -132,6 +132,9 @@ def recent_post_urls(blog_id: str, days: int = 10) -> list[str]:
 
 
 class NaverAutomation:
+    # macOS adapters override the platform's edit shortcut without copying the
+    # publication engine. Windows retains its existing Control key behavior.
+    EDITOR_MODIFIER = Keys.CONTROL
     CREATOR_ADVISOR_TRENDS_URL = (
         "https://creator-advisor.naver.com/naver_blog/macdcross/trends"
     )
@@ -2895,8 +2898,8 @@ class NaverAutomation:
         ):
             raise RuntimeError("사진을 붙여 넣을 본문 문단을 선택하지 못했습니다.")
         self._copy_image_to_windows_clipboard(image_path)
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys("v").key_up(
-            Keys.CONTROL
+        ActionChains(driver).key_down(self.EDITOR_MODIFIER).send_keys("v").key_up(
+            self.EDITOR_MODIFIER
         ).perform()
         try:
             WebDriverWait(driver, 45).until(
@@ -4149,7 +4152,7 @@ class NaverAutomation:
                 editor,
             )
         except Exception:
-            editor.send_keys(Keys.CONTROL, "a")
+            editor.send_keys(cls.EDITOR_MODIFIER, "a")
         editor.send_keys(Keys.BACKSPACE)
         try:
             editor.send_keys(text)
@@ -4512,7 +4515,7 @@ class NaverAutomation:
                     "arguments[0].focus(); arguments[0].click();", editor
                 )
                 try:
-                    editor.send_keys(Keys.CONTROL, "a")
+                    editor.send_keys(cls.EDITOR_MODIFIER, "a")
                     editor.send_keys(Keys.BACKSPACE)
                     editor.send_keys(phrase)
                 except StaleElementReferenceException:
