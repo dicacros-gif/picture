@@ -1,0 +1,687 @@
+"""Offline publication/rights regression tests. Never connects to or posts to Naver."""
+import copy
+import hashlib
+import io
+import json
+import re
+import tempfile
+import unittest
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from PIL import Image
+from selenium.common.exceptions import TimeoutException, WebDriverException
+
+from naver_automation import NaverAutomation
+
+
+class ImmediateWait:
+    def __init__(self, driver, *_args, **_kwargs):
+        self.driver = driver
+
+    def until(self, callback):
+        result = callback(self.driver)
+        if not result:
+            raise TimeoutException("offline wait did not satisfy condition")
+        return result
+
+
+def document(paragraphs=None, image_ids=()):
+    paragraphs = paragraphs or ["본문 템플릿"]
+    return {"document": {"components": [
+        {"id": "title", "@ctype": "documentTitle", "title": [{"value": "제목"}]},
+        {"id": "text", "@ctype": "text", "value": [
+            {"id": f"p{i}", "@ctype": "paragraph", "nodes": [
+                {"id": f"n{i}", "@ctype": "textNode", "value": value}
+            ]} for i, value in enumerate(paragraphs)
+        ]},
+        *[{"id": value, "@ctype": "image", "src": f"https://local.invalid/{value}"} for value in image_ids],
+    ]}}
+
+
+class ArticlePlacementTests(unittest.TestCase):
+    def setUp(self):
+        self.paragraphs = [f"문단 {index + 1}. 원문 전체를 보존한다." for index in range(8)]
+        self.ids = [f"image-{index}" for index in range(6)]
+        self.positions = [0, 1, 3, 4, 6, 7]
+
+    def test_eight_exact_paragraphs_and_semantic_image_positions(self):
+        source = document(image_ids=self.ids)
+        original = copy.deepcopy(source)
+        result = NaverAutomation._arrange_article_document(source, self.paragraphs, self.ids, self.positions)
+        self.assertTrue(NaverAutomation._verify_article_document(result, self.paragraphs, self.ids, self.positions))
+        self.assertEqual(source, original, "Arrangement must not mutate the supplied snapshot")
+        components = result["document"]["components"]
+        self.assertEqual(len([x for x in components if x["@ctype"] == "text"]), 8)
+        self.assertEqual([x["src"] for x in components if x["@ctype"] == "image"],
+                         [f"https://local.invalid/{value}" for value in self.ids])
+
+    def test_multiple_images_after_one_paragraph_keep_identity(self):
+        positions = [0, 0, 3, 4, 6, 7]
+        result = NaverAutomation._arrange_article_document(document(image_ids=self.ids), self.paragraphs, self.ids, positions)
+        self.assertTrue(NaverAutomation._verify_article_document(result, self.paragraphs, self.ids, positions))
+
+    def test_missing_or_extra_uploaded_images_stop_arrangement(self):
+        for ids in [self.ids[:-1], self.ids + ["extra"]]:
+            with self.subTest(ids=ids), self.assertRaises(RuntimeError):
+                NaverAutomation._arrange_article_document(document(image_ids=ids), self.paragraphs, self.ids, self.positions)
+
+    def test_exact_text_edit_image_swap_or_extra_paragraph_fails_verification(self):
+        arranged = NaverAutomation._arrange_article_document(document(image_ids=self.ids), self.paragraphs, self.ids, self.positions)
+        changed = copy.deepcopy(arranged)
+        changed["document"]["components"][1]["value"][0]["nodes"][0]["value"] += " 추가"
+        self.assertFalse(NaverAutomation._verify_article_document(changed, self.paragraphs, self.ids, self.positions))
+        self.assertFalse(NaverAutomation._verify_article_document(arranged, self.paragraphs, list(reversed(self.ids)), self.positions))
+        changed = copy.deepcopy(arranged)
+        changed["document"]["components"].append(copy.deepcopy(changed["document"]["components"][1]))
+        self.assertFalse(NaverAutomation._verify_article_document(changed, self.paragraphs, self.ids, self.positions))
+
+    def test_unknown_components_are_not_silently_published(self):
+        data = document(image_ids=self.ids)
+        data["document"]["components"].append({"@ctype": "video", "id": "v"})
+        with self.assertRaisesRegex(RuntimeError, "예상하지"):
+            NaverAutomation._arrange_article_document(data, self.paragraphs, self.ids, self.positions)
+
+    def test_multiline_sections_preserve_blank_rows_and_eight_components(self):
+        sections = [f"구역 {index + 1}\n\n첫 문장입니다.\n\n다음 문장입니다." for index in range(8)]
+        result = NaverAutomation._arrange_article_document(document(image_ids=self.ids), sections, self.ids, self.positions)
+        components = [item for item in result["document"]["components"] if item["@ctype"] == "text"]
+        self.assertEqual(len(components), 8)
+        self.assertEqual([len(item["value"]) for item in components], [5] * 8)
+        self.assertEqual(components[0]["value"][1]["nodes"][0]["value"], "\u200b")
+        self.assertTrue(NaverAutomation._verify_article_document(result, sections, self.ids, self.positions))
+        components[0]["value"].pop(1)
+        self.assertFalse(NaverAutomation._verify_article_document(result, sections, self.ids, self.positions))
+
+    def test_native_heading_and_selected_term_bold_preserve_literal_text(self):
+        sections = ["❝금리 변화, 지금 확인할 점❞\n\n금리 기준을 먼저 보고 금리 변화를 살펴봅니다."] * 8
+        # Runtime passes the style delta observed from the editor's own bold command.
+        observed_style = {"bold": True}
+        result = NaverAutomation._arrange_article_document(
+            document(image_ids=self.ids), sections, self.ids, self.positions,
+            bold_terms=["금리"], bold_style=observed_style,
+        )
+        rows = next(item for item in result["document"]["components"] if item["@ctype"] == "text")["value"]
+        self.assertTrue(rows[0]["nodes"][0]["style"]["bold"])
+        self.assertNotIn("bold", rows[1]["nodes"][0]["style"])
+        self.assertEqual([node["value"] for node in rows[2]["nodes"]], ["금리", " 기준을 먼저 보고 ", "금리", " 변화를 살펴봅니다."])
+        self.assertTrue(NaverAutomation._verify_article_document(result, sections, self.ids, self.positions,
+                         bold_terms=["금리"], bold_style=observed_style))
+        rows[0]["nodes"][0]["style"].pop("bold")
+        self.assertFalse(NaverAutomation._verify_article_document(result, sections, self.ids, self.positions,
+                          bold_terms=["금리"], bold_style=observed_style))
+
+    def test_bold_headings_cannot_guess_unknown_editor_style(self):
+        sections = ["❝소제목❞\n\n본문입니다."] * 8
+        with self.assertRaisesRegex(RuntimeError, "실제 굵게 서식"):
+            NaverAutomation._arrange_article_document(document(image_ids=self.ids), sections, self.ids, self.positions)
+
+    def test_bold_style_delta_is_learned_from_matching_real_node(self):
+        before = document(["소제목"])
+        after = copy.deepcopy(before)
+        after["document"]["components"][1]["value"][0]["nodes"][0]["style"] = {"@ctype": "nodeStyle", "bold": True}
+        self.assertEqual(NaverAutomation._observed_bold_style(before, after), {"bold": True})
+        after["document"]["components"][1]["value"][0]["nodes"][0]["value"] = "다른 글"
+        self.assertEqual(NaverAutomation._observed_bold_style(before, after), {})
+
+
+class PublishTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.app = NaverAutomation(self.root, lambda message: None)
+        self.article = {"title": "테스트 제목", "paragraphs": [f"본문 {i + 1}입니다." for i in range(8)], "images": []}
+        self.article.update({"ready_to_publish": True, "reviews": [{"stage": 1, "provider": "claude", "review": {
+            "approved": True, "facts_verified": True, "sources_verified": True,
+            "search_intent_satisfied": True, "natural_korean": True, "issues": [],
+        }}]})
+        self._set_reviewed_content_hash()
+        for i in range(8):
+            path = self.root / f"image-{i}.png"
+            Image.new("RGB", (20, 20), (i * 25, 10, 30)).save(path)
+            if i < 6:
+                self.article["images"].append({
+                    "path": str(path), "paragraph_index": [0, 1, 3, 4, 6, 7][i],
+                    "provider": "chatgpt" if i < 3 else "antigravity", "approved": True,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "reviews": [{"provider": "claude", "approved": True}],
+                })
+        self.driver = MagicMock()
+        self.driver.current_url = "https://blog.naver.com/testblog/postwrite"
+        self.opener = MagicMock()
+        self.final = MagicMock()
+        self.app._driver = MagicMock(return_value=self.driver)
+        self.app._prepare_article_in_writer = MagicMock(return_value=[f"id-{i}" for i in range(6)])
+        self.app._article_ready_to_publish = MagicMock(return_value=True)
+        self.app._find_publish_control = MagicMock(side_effect=lambda _driver, final=False: self.final if final else self.opener)
+        self.app._published_article_url = MagicMock(return_value="https://blog.naver.com/testblog/123456789012")
+        self.wait = patch("naver_automation.WebDriverWait", ImmediateWait)
+        self.wait.start()
+        self.addCleanup(self.wait.stop)
+
+    def _set_reviewed_content_hash(self):
+        self.article["reviewed_content_sha256"] = hashlib.sha256(json.dumps(
+            {"title": self.article["title"], "paragraphs": self.article["paragraphs"]},
+            ensure_ascii=False, sort_keys=True
+        ).encode("utf-8")).hexdigest()
+
+    def test_success_clicks_final_once_and_checks_post_url_title(self):
+        receipt = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(receipt["published"])
+        self.final.click.assert_called_once()
+        self.opener.click.assert_called_once()
+        self.app._published_article_url.assert_called_once_with(self.driver, "testblog", self.article["title"])
+        repeated = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(repeated["published"])
+        self.assertTrue(repeated["reused_receipt"])
+        self.final.click.assert_called_once()
+        self.app._prepare_article_in_writer.assert_called_once()
+
+    def test_count_or_order_failure_never_opens_publish_panel(self):
+        self.app._article_ready_to_publish.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "순서 검증"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.opener.click.assert_not_called()
+        self.final.click.assert_not_called()
+        self.assertFalse((self.root / "publication_receipts").exists())
+
+    def test_content_changed_after_panel_open_never_submits(self):
+        self.app._article_ready_to_publish.side_effect = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "발행 직전"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.opener.click.assert_called_once()
+        self.final.click.assert_not_called()
+
+    def test_missing_final_button_reports_specific_error_without_receipt_or_final_click(self):
+        self.app._find_publish_control.side_effect = lambda _driver, final=False: None if final else self.opener
+        with self.assertRaisesRegex(RuntimeError, "최종 버튼은 누르지 않았으며"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.opener.click.assert_called_once()
+        self.final.click.assert_not_called()
+        self.assertFalse((self.root / "publication_receipts").exists())
+
+    def test_uncertain_timeout_is_durable_and_never_reclicked(self):
+        self.app._published_article_url.return_value = ""
+        receipt = self.app.publish_naver_article("testblog", self.article)
+        self.assertFalse(receipt["published"])
+        self.assertEqual(receipt["status"], "uncertain")
+        self.final.click.assert_called_once()
+        new_app = NaverAutomation(self.root, lambda message: None)
+        new_app._driver = MagicMock(side_effect=AssertionError("Must not reopen writer after uncertainty"))
+        repeated = new_app.publish_naver_article("testblog", self.article)
+        self.assertEqual(repeated["status"], "uncertain")
+        new_app._driver.assert_not_called()
+
+    def test_click_error_is_uncertain_and_receipt_precedes_click(self):
+        def failed_click():
+            receipts = list((self.root / "publication_receipts").glob("*.json"))
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(json.loads(receipts[0].read_text(encoding="utf-8"))["status"], "uncertain")
+            raise WebDriverException("connection lost while submitting")
+        self.final.click.side_effect = failed_click
+        result = self.app.publish_naver_article("testblog", self.article)
+        self.assertEqual(result["status"], "uncertain")
+        self.final.click.assert_called_once()
+
+    def test_parallel_claim_prevents_second_submission(self):
+        self.app._claim_publication_receipt = MagicMock(return_value=False)
+        result = self.app.publish_naver_article("testblog", self.article)
+        self.assertTrue(result["reused_receipt"])
+        self.final.click.assert_not_called()
+
+    def test_prepare_only_never_clicks_publish(self):
+        result = self.app.publish_naver_article("testblog", self.article, publish=False)
+        self.assertEqual(result["status"], "prepared")
+        self.opener.click.assert_not_called()
+        self.final.click.assert_not_called()
+
+    def _mock_draft_button(self, confirmed=True):
+        button = MagicMock()
+        button.text = "저장"
+        self.app._find_draft_buttons = MagicMock(return_value=[button])
+        self.app._arm_article_draft_confirmation = MagicMock()
+        self.app._fresh_article_draft_confirmed = MagicMock(return_value=confirmed)
+        return button
+
+    def test_draft_save_clicks_once_and_requires_fresh_confirmation(self):
+        button = self._mock_draft_button()
+        result = self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        self.assertEqual(result["status"], "draft_saved")
+        self.assertTrue(result["saved"])
+        self.assertFalse(result["published"])
+        self.assertEqual(result["url"], self.driver.current_url)
+        button.click.assert_called_once()
+        self.opener.click.assert_not_called()
+        self.final.click.assert_not_called()
+        self.app._find_publish_control.assert_not_called()
+        token = self.app._arm_article_draft_confirmation.call_args.args[1]
+        self.assertTrue(token)
+        self.app._fresh_article_draft_confirmed.assert_called_once_with(self.driver, token)
+        self.assertFalse((self.root / "publication_receipts").exists())
+
+    def test_draft_confirmation_timeout_is_failure_and_never_reclicked(self):
+        button = self._mock_draft_button(confirmed=False)
+        with self.assertRaisesRegex(RuntimeError, "저장 성공으로 처리하지"):
+            self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        button.click.assert_called_once()
+        self.app._find_publish_control.assert_not_called()
+
+    def test_missing_or_ambiguous_draft_button_never_clicks(self):
+        button = self._mock_draft_button()
+        for candidates in [[], [button, button]]:
+            self.app._find_draft_buttons.return_value = candidates
+            with self.subTest(count=len(candidates)), self.assertRaisesRegex(RuntimeError, "고유하게"):
+                self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        button.click.assert_not_called()
+        self.app._find_publish_control.assert_not_called()
+
+    def test_draft_list_button_with_count_is_not_current_save(self):
+        button = self._mock_draft_button()
+        button.text = "임시저장 3"
+        with self.assertRaisesRegex(RuntimeError, "고유하게"):
+            self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        button.click.assert_not_called()
+
+    def test_draft_with_invalid_content_does_not_click_save(self):
+        button = self._mock_draft_button()
+        self.app._article_ready_to_publish.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "순서 검증"):
+            self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        button.click.assert_not_called()
+        self.app._arm_article_draft_confirmation.assert_not_called()
+
+    def test_draft_with_publish_flag_is_rejected_before_browser(self):
+        with self.assertRaisesRegex(ValueError, "동시에 선택"):
+            self.app.publish_naver_article("testblog", self.article, publish=True, save_draft=True)
+        self.app._driver.assert_not_called()
+
+    def test_existing_published_receipt_cannot_claim_requested_draft_was_saved(self):
+        self.assertTrue(self.app.publish_naver_article("testblog", self.article)["published"])
+        self.opener.click.reset_mock()
+        self.final.click.reset_mock()
+        self.app._find_publish_control.reset_mock()
+        button = self._mock_draft_button()
+        result = self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        self.assertEqual(result["status"], "draft_saved")
+        self.assertFalse(result["published"])
+        self.assertNotIn("reused_receipt", result)
+        button.click.assert_called_once()
+        self.opener.click.assert_not_called()
+        self.final.click.assert_not_called()
+
+    def test_draft_does_not_report_success_on_unexpected_post_navigation(self):
+        button = self._mock_draft_button()
+        self.driver.current_url = "https://blog.naver.com/testblog/123456789012"
+        with self.assertRaisesRegex(RuntimeError, "게시글 화면 이동"):
+            self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
+        button.click.assert_called_once()
+        self.app._find_publish_control.assert_not_called()
+
+    def test_wrong_paragraph_count_missing_file_or_rejected_review_stops_before_browser(self):
+        bad_variants = []
+        wrong_count = copy.deepcopy(self.article)
+        wrong_count["paragraphs"].pop()
+        bad_variants.append(wrong_count)
+        missing = copy.deepcopy(self.article)
+        missing["images"][0]["path"] = str(self.root / "missing.png")
+        bad_variants.append(missing)
+        rejected = copy.deepcopy(self.article)
+        rejected["images"][0]["reviews"][0]["approved"] = False
+        bad_variants.append(rejected)
+        for value in bad_variants:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.app.publish_naver_article("testblog", value)
+        self.app._driver.assert_not_called()
+
+    def test_google_requires_license_rights_review_and_no_public_attribution(self):
+        ref = {"path": str(self.root / "image-6.png"), "paragraph_index": 2, "provider": "google",
+               "sha256": hashlib.sha256((self.root / "image-6.png").read_bytes()).hexdigest(),
+               "approved": True, "reviews": [{"provider": "claude", "approved": True}]}
+        self.article["images"].append(ref)
+        with self.assertRaisesRegex(ValueError, "라이선스"):
+            self.app.publish_naver_article("testblog", self.article)
+        ref.update({"license_verified": True, "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                    "commercial_use_allowed": True, "modification_allowed": True,
+                    "attribution_required": True, "attribution": "출처: 예시 작가"})
+        with self.assertRaisesRegex(ValueError, "출처 표시"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.article["paragraphs"][2] += " 출처: 예시 작가"
+        self._set_reviewed_content_hash()
+        with self.assertRaisesRegex(ValueError, "공개 출처 표시"):
+            self.app._validate_publish_article(self.article)
+        ref.update({"attribution_required": False, "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"})
+        title, paragraphs, images = self.app._validate_publish_article(self.article)
+        self.assertEqual(len(paragraphs), 8)
+        self.assertEqual(len(images), 7)
+
+    def test_multiline_article_validation_accepts_sentence_spacing(self):
+        self.article["paragraphs"] = [f"소제목 {index}\n\n첫 문장.\n\n두 번째 문장." for index in range(8)]
+        self._set_reviewed_content_hash()
+        _title, sections, _images = self.app._validate_publish_article(self.article)
+        self.assertEqual(sections, self.article["paragraphs"])
+
+    def test_public_markdown_and_source_urls_are_rejected(self):
+        for text in ["**강조** 본문", "# 소제목", "출처 https://example.com/source"]:
+            self.article["paragraphs"][0] = text
+            self._set_reviewed_content_hash()
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_same_image_bytes_cannot_count_as_six_unique_pictures(self):
+        self.article["images"][1]["path"] = self.article["images"][0]["path"]
+        self.article["images"][1]["sha256"] = self.article["images"][0]["sha256"]
+        with self.assertRaisesRegex(ValueError, "중복"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.final.click.assert_not_called()
+
+    def test_changed_image_after_review_is_rejected(self):
+        path = Path(self.article["images"][0]["path"])
+        Image.new("RGB", (20, 20), "yellow").save(path)
+        with self.assertRaisesRegex(ValueError, "이미지 파일이 변경"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_provisional_image_requires_final_context_review_even_if_initial_review_passed(self):
+        self.article["images"][0]["requires_final_semantic_review"] = True
+        with self.assertRaisesRegex(ValueError, "최종 본문 문맥"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_image_moved_to_different_section_after_visual_review_is_rejected(self):
+        image = self.article["images"][0]
+        image["reviewed_paragraph_sha256"] = hashlib.sha256(
+            self.article["paragraphs"][image["paragraph_index"]].encode("utf-8")
+        ).hexdigest()
+        image["paragraph_index"] = 2
+        with self.assertRaisesRegex(ValueError, "배치 구역"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_final_article_review_does_not_revalidate_image_for_changed_section(self):
+        image = self.article["images"][0]
+        image["reviewed_paragraph_sha256"] = hashlib.sha256(
+            self.article["paragraphs"][0].encode("utf-8")
+        ).hexdigest()
+        self.article["paragraphs"][0] = "최종 글 검수에서 주제를 바꾼 문단입니다.\n\n기존 사진 문맥과 다릅니다."
+        self._set_reviewed_content_hash()
+        with self.assertRaisesRegex(ValueError, "본문 내용이 변경"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_matching_final_context_hash_preserves_internal_sentence_spacing(self):
+        self.article["paragraphs"][0] = "첫 문장입니다.\n\n둘째 문장입니다."
+        self._set_reviewed_content_hash()
+        image = self.article["images"][0]
+        image.update({"requires_final_semantic_review": False,
+                      "reviewed_paragraph_sha256": hashlib.sha256(self.article["paragraphs"][0].encode("utf-8")).hexdigest()})
+        _title, sections, checked_images = self.app._validate_publish_article(self.article)
+        self.assertEqual(sections[0], self.article["paragraphs"][0])
+        self.assertEqual(checked_images[0]["reviewed_paragraph_sha256"], image["reviewed_paragraph_sha256"])
+        self.article["paragraphs"][0] = self.article["paragraphs"][0].replace("\n\n", "\n")
+        self._set_reviewed_content_hash()
+        with self.assertRaisesRegex(ValueError, "본문 내용이 변경"):
+            self.app._validate_publish_article(self.article)
+
+    def test_changed_title_after_review_is_rejected(self):
+        self.article["title"] += " (수정)"
+        with self.assertRaisesRegex(ValueError, "제목 또는 본문이 변경"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_missing_fact_approval_or_ready_flag_is_rejected(self):
+        self.article["ready_to_publish"] = False
+        with self.assertRaisesRegex(ValueError, "발행 준비"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.article["ready_to_publish"] = True
+        self.article["reviews"][0]["review"]["facts_verified"] = False
+        with self.assertRaisesRegex(ValueError, "본문 사실"):
+            self.app.publish_naver_article("testblog", self.article)
+        self.app._driver.assert_not_called()
+
+    def test_published_page_inspection_reads_eight_sections_and_image_ids_without_writes(self):
+        self.app._article_native_bold_rendered = MagicMock(return_value=True)
+        ids = [f"image-{i}" for i in range(6)]
+        self.driver.execute_script.return_value = {
+            "sections": list(self.article["paragraphs"]),
+            "images": [{"id": value, "position": image["paragraph_index"]}
+                       for value, image in zip(ids, self.article["images"])],
+        }
+        result = self.app.inspect_published_naver_article("testblog", self.article, expected_image_ids=ids)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["section_count"], 8)
+        self.assertEqual(result["image_count"], 6)
+        self.assertTrue(result["image_identity_matches"])
+        self.driver.get.assert_not_called()
+        self.app._prepare_article_in_writer.assert_not_called()
+        self.app._find_publish_control.assert_not_called()
+        self.final.click.assert_not_called()
+
+    def test_published_page_inspection_rejects_missing_text_or_wrong_image_position(self):
+        self.app._article_native_bold_rendered = MagicMock(return_value=True)
+        self.driver.execute_script.return_value = {
+            "sections": list(self.article["paragraphs"]),
+            "images": [{"id": f"image-{i}", "position": image["paragraph_index"]}
+                       for i, image in enumerate(self.article["images"])],
+        }
+        self.driver.execute_script.return_value["images"][0]["position"] = 7
+        self.assertFalse(self.app.inspect_published_naver_article("testblog", self.article)["verified"])
+        self.driver.execute_script.return_value["sections"].pop()
+        self.assertFalse(self.app.inspect_published_naver_article("testblog", self.article)["verified"])
+
+
+class ReferenceLicenseTests(unittest.TestCase):
+    source = "https://commons.wikimedia.org/wiki/File:Example.jpg"
+    image = "https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Example.jpg/800px-Example.jpg"
+
+    def evidence(self, **changes):
+        page = {"original_file_present": True, "author": "Author", "license_links": ["https://creativecommons.org/publicdomain/zero/1.0/"]}
+        page.update(changes)
+        return NaverAutomation._commons_license_evidence(self.source, self.image, page)
+
+    def test_file_specific_cc0_proof_sets_rights_and_no_required_attribution(self):
+        result = self.evidence()
+        self.assertTrue(result["license_verified"])
+        self.assertTrue(result["commercial_use_allowed"])
+        self.assertTrue(result["modification_allowed"])
+        self.assertFalse(result["attribution_required"])
+
+    def test_search_filter_or_unrelated_creative_commons_link_is_not_proof(self):
+        page = {"license_filter": "Creative Commons", "license_links": ["https://creativecommons.org/publicdomain/zero/1.0/"]}
+        self.assertFalse(NaverAutomation._commons_license_evidence("https://example.com/picture", self.image, page)["license_verified"])
+        self.assertFalse(self.evidence(original_file_present=False)["license_verified"])
+        self.assertFalse(self.evidence(license_links=[])["license_verified"])
+
+    def test_mismatched_source_image_or_noncommercial_license_rejected(self):
+        page = {"original_file_present": True, "license_links": ["https://creativecommons.org/publicdomain/zero/1.0/"]}
+        self.assertFalse(NaverAutomation._commons_license_evidence(self.source, self.image.replace("Example", "Other"), page)["license_verified"])
+        self.assertFalse(self.evidence(license_links=["https://creativecommons.org/licenses/by-nc/4.0/"])["license_verified"])
+
+    def test_attribution_license_requires_known_author_and_records_requirements(self):
+        license_url = "https://creativecommons.org/licenses/by/4.0/"
+        self.assertFalse(self.evidence(author="", license_links=[license_url])["license_verified"])
+        result = self.evidence(license_links=[license_url])
+        self.assertTrue(result["attribution_required"])
+        self.assertFalse(result["share_alike"])
+        self.assertIn(self.source, result["attribution"])
+
+    def test_share_alike_needs_separate_compliance_and_is_not_eligible(self):
+        self.assertFalse(self.evidence(license_links=["https://creativecommons.org/licenses/by-sa/4.0/"])["license_verified"])
+
+    def test_google_result_source_unwrap_and_wikimedia_file_suffix(self):
+        wrapped = "https://www.google.com/imgres?imgrefurl=https%3A%2F%2Fcommons.wikimedia.org%2Fwiki%2FFile%3AExample.jpg"
+        self.assertEqual(NaverAutomation._reference_source_url([wrapped]), self.source)
+        self.assertEqual(NaverAutomation._reference_source_url([self.source]), self.source)
+        self.assertEqual(NaverAutomation._reference_source_url(["https://example.com/image.jpg"]), "")
+
+    def test_preview_resize_preserves_entire_aspect_ratio(self):
+        source = Image.new("RGB", (400, 600), "white")
+        enlarged = NaverAutomation._gently_enhance_google_image(source)
+        self.assertAlmostEqual(enlarged.width / enlarged.height, 2 / 3, places=3)
+        self.assertGreater(enlarged.height, source.height)
+
+    def test_captures_first_two_image_elements_without_download_or_rights_assumption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = NaverAutomation(Path(temporary), lambda message: None)
+            driver = MagicMock()
+            app._driver = MagicMock(return_value=driver)
+            app._inspect_reference_license = MagicMock(return_value={"license_verified": False, "license_url": "", "attribution": ""})
+            thumbnails = [MagicMock() for _ in range(3)]
+            previews = [MagicMock() for _ in range(3)]
+            selection = {"index": 0}
+            for index, (thumb, preview) in enumerate(zip(thumbnails, previews)):
+                thumb.is_displayed.return_value = True
+                thumb.rect = {"width": 200, "height": 150}
+                preview.is_displayed.return_value = True
+                preview.get_attribute.return_value = "original-css"
+                buffer = io.BytesIO()
+                Image.new("RGB", (400, 240), (index * 30, 50, 70)).save(buffer, "PNG")
+                preview.screenshot_as_png = buffer.getvalue()
+            def find_elements(_by, selector):
+                return thumbnails if selector == "img.YQ4gaf, img.rg_i, div[data-ri] img" else [previews[selection["index"]]]
+            def script(source, *arguments):
+                if "scrollIntoView" in source:
+                    selection["index"] = thumbnails.index(arguments[0])
+                elif "complete:e.complete" in source:
+                    return {"width": 800, "height": 480, "display_width": 400, "display_height": 240,
+                            "url": f"https://example.com/image-{selection['index']}.jpg", "complete": True}
+                elif "const links=[]" in source:
+                    return [f"https://example.com/photo-{selection['index']}.html"]
+                return None
+            driver.find_elements.side_effect = find_elements
+            driver.execute_script.side_effect = script
+            with patch("naver_automation.WebDriverWait", ImmediateWait), patch.object(app, "_download_google_preview") as download:
+                candidates = app.capture_google_reference_candidates("예시", Path(temporary), 2)
+            self.assertEqual([item["search_rank"] for item in candidates], [1, 2])
+            self.assertTrue(all(item["capture_method"] == "image_element_screenshot" for item in candidates))
+            self.assertTrue(all(item["license_verified"] is False and item["vision_reviewed"] is False for item in candidates))
+            self.assertTrue(all(item["capture_width"] == 400 for item in candidates))
+            self.assertTrue(all(Path(item["path"]).is_file() for item in candidates))
+            download.assert_not_called()
+
+
+class PublishControlTests(unittest.TestCase):
+    def test_observed_css_module_publish_panel_without_dialog_role_finds_final_button(self):
+        # Minimal actual 2026-09-12 Naver DOM: CSS-module suffixes, no role=dialog.
+        html = '''<div><button class="publish_btn__v_kS9"><span>발행</span></button>
+          <div class="layer_popup__VVWW8 is_show__LbCeK"><div class="layer_publish__Jv1Pu">
+            <div class="layer_content_set_publish__hKFQ5"><p>카테고리 공개 설정 발행 설정</p>
+              <div class="btn_area__koq5u"><button type="button" class="confirm_btn__byZZW"
+                data-testid="seOnePublishBtn" data-click-area="tpb*i.publish"><span>발행</span></button></div>
+            </div></div></div></div>'''
+        tree = ET.fromstring(html)
+        parents = {child: parent for parent in tree.iter() for child in parent}
+        buttons = []
+        for node in tree.iter("button"):
+            button = MagicMock()
+            button.node = node
+            button.text = "".join(node.itertext())
+            button.is_displayed.return_value = True
+            button.is_enabled.return_value = True
+            buttons.append(button)
+        driver = MagicMock()
+        driver.find_elements.return_value = buttons
+        def matches(node, selector):
+            selector = selector.strip()
+            if selector.startswith("."):
+                return selector[1:] in node.get("class", "").split()
+            attr = re.fullmatch(r'\[([\w-]+)(\*?=)"([^"]+)"\]', selector)
+            if not attr:
+                return False
+            key, operator, wanted = attr.groups()
+            actual = node.get(key, "")
+            return wanted in actual if operator == "*=" else actual == wanted
+        def evaluate_scope(script, button):
+            # Apply the production closest() selector to the parsed HTML ancestry.
+            selectors = re.search(r"e\.closest\('([^']+)'\)", script).group(1).split(",")
+            node = button.node
+            while node is not None:
+                if any(matches(node, selector) for selector in selectors):
+                    return {"inside": True, "settings": bool(re.search("공개|카테고리|발행 설정|주제", "".join(node.itertext())))}
+                node = parents.get(node)
+            return {"inside": False, "settings": False}
+        driver.execute_script.side_effect = evaluate_scope
+        with patch.object(NaverAutomation, "_find_across_frames", side_effect=lambda _d, finder: finder()):
+            self.assertIs(NaverAutomation._find_publish_control(driver, final=False), buttons[0])
+            self.assertIs(NaverAutomation._find_publish_control(driver, final=True), buttons[1])
+            tree.find(".//p").text = "알 수 없는 안내"
+            self.assertIsNone(NaverAutomation._find_publish_control(driver, final=True))
+
+    def test_recovery_prompt_declines_only_known_restore_action(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = NaverAutomation(Path(temporary), lambda message: None)
+            driver, dialog, cancel = MagicMock(), MagicMock(), MagicMock()
+            dialog.text = "작성 중인 글이 있습니다. 이전 내용을 이어서 작성하시겠습니까?"
+            cancel.text = "취소"
+            shown = {"value": True}
+            dialog.is_displayed.side_effect = lambda: shown["value"]
+            cancel.is_displayed.return_value = True
+            cancel.is_enabled.return_value = True
+            cancel.click.side_effect = lambda: shown.update(value=False)
+            dialog.find_elements.return_value = [cancel]
+            driver.find_elements.return_value = [dialog]
+            with patch("naver_automation.WebDriverWait", ImmediateWait):
+                app._handle_writer_recovery_prompt(driver)
+            cancel.click.assert_called_once()
+            self.assertFalse(shown["value"])
+
+    def test_unknown_writer_modal_is_never_dismissed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = NaverAutomation(Path(temporary), lambda message: None)
+            driver, dialog = MagicMock(), MagicMock()
+            dialog.text = "다른 안내: 기존 글을 삭제하시겠습니까?"
+            dialog.is_displayed.return_value = True
+            driver.find_elements.return_value = [dialog]
+            with self.assertRaisesRegex(RuntimeError, "알 수 없는"):
+                app._handle_writer_recovery_prompt(driver)
+            dialog.find_elements.assert_not_called()
+
+    def test_rendered_bold_requires_matching_visible_runs_not_only_model_flags(self):
+        sections = ["❝소제목❞\n\n본문 강조입니다."] * 8
+        driver = MagicMock()
+        driver.execute_script.return_value = [[
+            [{"value": "❝소제목❞", "bold": True}],
+            [{"value": "\u200b", "bold": False}],
+            [{"value": "본문 ", "bold": False}, {"value": "강조", "bold": True}, {"value": "입니다.", "bold": False}],
+        ] for _ in range(8)]
+        self.assertTrue(NaverAutomation._article_native_bold_rendered(driver, sections, ["강조"]))
+        driver.execute_script.return_value[0][0][0]["bold"] = False
+        self.assertFalse(NaverAutomation._article_native_bold_rendered(driver, sections, ["강조"]))
+
+    def test_final_control_must_be_in_publication_settings_and_unique(self):
+        driver = MagicMock()
+        opener, final, unrelated = MagicMock(), MagicMock(), MagicMock()
+        for button in (opener, final, unrelated):
+            button.is_displayed.return_value = True
+            button.is_enabled.return_value = True
+        driver.find_elements.return_value = [opener, final, unrelated]
+        def scope(_script, button):
+            return {"inside": button is not opener, "settings": button is final}
+        driver.execute_script.side_effect = scope
+        with patch.object(NaverAutomation, "_find_across_frames", side_effect=lambda _d, finder: finder()):
+            self.assertIs(NaverAutomation._find_publish_control(driver), opener)
+            self.assertIs(NaverAutomation._find_publish_control(driver, final=True), final)
+            driver.find_elements.return_value = [final, final]
+            self.assertIsNone(NaverAutomation._find_publish_control(driver, final=True))
+
+    def test_post_confirmation_requires_own_post_url_and_visible_exact_title(self):
+        driver = MagicMock()
+        heading = MagicMock()
+        heading.is_displayed.return_value = True
+        heading.text = "테스트 제목"
+        driver.find_elements.return_value = [heading]
+        with patch.object(NaverAutomation, "_find_across_frames", side_effect=lambda _d, finder: finder()):
+            for url in ["https://blog.naver.com/testblog/postwrite", "https://blog.naver.com/otherblog/123456789012", "https://not-naver.example/testblog/123456789012"]:
+                driver.current_url = url
+                self.assertEqual(NaverAutomation._published_article_url(driver, "testblog", "테스트 제목"), "")
+            driver.current_url = "https://blog.naver.com/testblog/123456789012"
+            self.assertEqual(NaverAutomation._published_article_url(driver, "testblog", "다른 제목"), "")
+            self.assertEqual(NaverAutomation._published_article_url(driver, "testblog", "테스트 제목"), driver.current_url)
+            heading.is_displayed.return_value = False
+            self.assertEqual(NaverAutomation._published_article_url(driver, "testblog", "테스트 제목"), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

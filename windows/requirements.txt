@@ -1,0 +1,8 @@
+Pillow
+PyInstaller
+requests
+selenium
+Send2Trash
+pywinauto==0.6.9
+pywin32==312
+comtypes==1.4.16
