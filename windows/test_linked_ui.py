@@ -65,7 +65,20 @@ class LinkedUiTests(unittest.TestCase):
             app._apply_theme()
             box = app.cli_stage_model_boxes[1]
             pop = app.root.tk.call('ttk::combobox::PopdownWindow', str(box))
-            self.assertEqual(app.root.tk.call(str(pop)+'.f.l', 'cget', '-background'), '#243b53')
+            self.assertEqual(app.root.tk.call(str(pop)+'.f.l', 'cget', '-background'), '#153e46')
+            self.assertIn('bold', str(app.root.tk.call(str(pop)+'.f.l', 'cget', '-font')))
+            self.assertNotEqual(app.style.lookup('TButton', 'background'),
+                                app.style.lookup('TCombobox', 'fieldbackground', ('readonly',)))
+            self.assertEqual(app.style.lookup('TButton', 'relief'), 'raised')
+            self.assertEqual(app.style.lookup('Accent.TButton', 'relief', ('pressed',)), 'sunken')
+            self.assertEqual(int(app.style.lookup('TButton', 'borderwidth')), 2)
+            for name in ('TButton', 'Sub.TLabel', 'TNotebook.Tab', 'TEntry', 'TCombobox'):
+                self.assertIn('bold', str(app.style.lookup(name, 'font')))
+            app.dark_mode.set(False)
+            app._apply_theme()
+            self.assertEqual(app.root.tk.call(str(pop)+'.f.l', 'cget', '-background'), '#e2f4f1')
+            app.dark_mode.set(True)
+            app._apply_theme()
             app.progress_panel.append('계정 회차 failed', account='secondary')
             app.progress_panel.append('정상 처리 완료', account='secondary')
             log = app.progress_panel.account_texts['secondary']

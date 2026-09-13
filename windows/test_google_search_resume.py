@@ -17,6 +17,9 @@ class GoogleSearchResumeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        clock_patch = patch('blog_google_budget.time.time', return_value=1000.0)
+        self.clock = clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         precheck = patch("blog_controls._GoogleSearchJob._precheck", side_effect=lambda planner, items, number: items)
         precheck.start()
         self.addCleanup(precheck.stop)
@@ -72,7 +75,7 @@ class GoogleSearchResumeTests(unittest.TestCase):
         receipt = json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))
         self.assertEqual(receipt["candidate_count"], 0)
         self.assertEqual(receipt["status"], "completed")
-        self.assertEqual(len(receipt["queries"]), 3)
+        self.assertEqual(len(receipt["queries"]), 1)
         self.fail_article = False
         self.reset_capture_calls()
         self.prepare_article(config=self.resume_config())
@@ -80,7 +83,7 @@ class GoogleSearchResumeTests(unittest.TestCase):
         self.app.naver_bot.capture_google_reference_candidates.assert_not_called()
         self.assertEqual(self.workflow.prepare.call_args.kwargs["google_candidates"], [])
 
-    def test_changed_topic_keywords_or_search_settings_require_fresh_search(self):
+    def test_changed_settings_do_not_repeat_google_for_the_same_article(self):
         self.prepare_article()
         original_receipt = (self.run / "google-search-checkpoint.json").read_bytes()
         variations = [
@@ -96,8 +99,8 @@ class GoogleSearchResumeTests(unittest.TestCase):
                 (self.run / "google-search-checkpoint.json").write_bytes(original_receipt)
                 self.reset_capture_calls()
                 self.prepare_article(topic, keywords, self.resume_config(**changes))
-                self.workflow.plan_google_image_search.assert_called_once()
-                self.assertEqual(self.app.naver_bot.capture_google_reference_candidates.call_count, 3)
+                self.workflow.plan_google_image_search.assert_not_called()
+                self.app.naver_bot.capture_google_reference_candidates.assert_not_called()
 
     def test_new_run_cannot_inherit_another_runs_completed_search(self):
         self.prepare_article()
@@ -106,17 +109,20 @@ class GoogleSearchResumeTests(unittest.TestCase):
         for filename in ("google-search-checkpoint.json", "request.json"):
             (next_run / filename).write_bytes((self.run / filename).read_bytes())
         self.reset_capture_calls()
+        self.clock.return_value += 61
         self.prepare_article(config=self.resume_config(resume_run_dir=str(next_run)))
         self.workflow.plan_google_image_search.assert_called_once()
 
-    def test_query_exception_does_not_cache_an_empty_failed_search(self):
-        self.app.naver_bot.capture_google_reference_candidates.side_effect = [[], RuntimeError("navigation failed"), []]
+    def test_query_exception_finishes_optional_work_without_searching_again(self):
+        self.app.naver_bot.capture_google_reference_candidates.side_effect = RuntimeError("navigation failed")
         self.prepare_article()
-        self.assertNotEqual(json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))["status"], "completed")
+        receipt = json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "completed")
+        self.assertEqual(receipt["skip_reason"], "capture_failed")
         self.app.naver_bot.capture_google_reference_candidates.side_effect = None
         self.reset_capture_calls()
         self.prepare_article(config=self.resume_config())
-        self.workflow.plan_google_image_search.assert_called_once()
+        self.workflow.plan_google_image_search.assert_not_called()
         self.assertTrue((self.run / "google-search-checkpoint.json").is_file())
 
     def test_planner_failure_does_not_cache_a_completed_search(self):
@@ -135,12 +141,12 @@ class GoogleSearchResumeTests(unittest.TestCase):
         self.workflow.prepare.assert_called_once()
         self.assertNotEqual(json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))["status"], "completed")
 
-    def test_corrupt_receipt_retries_without_interrupting_preparation(self):
+    def test_corrupt_receipt_does_not_override_persisted_request_limit(self):
         self.prepare_article()
         (self.run / "google-search-checkpoint.json").write_text("{invalid", encoding="utf-8")
         self.reset_capture_calls()
         self.prepare_article(config=self.resume_config())
-        self.workflow.plan_google_image_search.assert_called_once()
+        self.workflow.plan_google_image_search.assert_not_called()
 
     def test_cached_positive_candidate_still_requires_english_evidence_and_matching_hash(self):
         image = self.root / "google-reference-candidates" / "original" / "photo.png"
@@ -158,7 +164,8 @@ class GoogleSearchResumeTests(unittest.TestCase):
         image.write_bytes(b"different image")
         self.app.naver_bot.capture_google_reference_candidates.return_value = []
         self.prepare_article(config=self.resume_config())
-        self.workflow.plan_google_image_search.assert_called_once()
+        self.workflow.plan_google_image_search.assert_not_called()
+        self.assertEqual(self.workflow.prepare.call_args.kwargs["google_candidates"], [])
 
     def test_disabling_google_does_not_search_or_write_a_completion_receipt(self):
         self.prepare_article(config={**self.config, "include_google": False})

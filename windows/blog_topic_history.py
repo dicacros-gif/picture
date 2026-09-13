@@ -1,13 +1,14 @@
-"""Persistent keyword consumption based only on confirmed browser publication.
+"""Persistent, separate records for publications and verified private drafts.
 
-Drafts, editor input and failed runs never consume a topic. An uncertain browser
-submission can be reserved separately, so automation can avoid attempting the
-same topic again until its browser receipt has been reconciled.
+Only confirmed public posts enter publication history. A fresh website save of
+failed work can consume keywords separately for thirty days without pretending
+the draft was published. Editor input, unverified saves and failed runs do not
+consume topics. Uncertain public submissions remain separately reserved.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -99,6 +100,33 @@ def _confirmed(result) -> bool:
             and result.get("status") == "published" and bool(_published_url(result.get("url"))))
 
 
+def confirmed_draft(result) -> bool:
+    """Only a fresh website save notice can authorize draft consumption/cleanup."""
+    if (not isinstance(result, dict) or result.get("saved") is not True
+            or result.get("published") is not False or result.get("status") != "draft_saved"
+            or result.get("draft_confirmation_verified") is not True
+            or type(result.get("paragraph_count")) is not int or not 1 <= result["paragraph_count"] <= 8
+            or not isinstance(result.get("article_key"), str)
+            or not re.fullmatch(r"[a-fA-F0-9]{64}", result["article_key"])):
+        return False
+    blog_id = result.get("blog_id")
+    if not isinstance(blog_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{2,50}", blog_id):
+        return False
+    try:
+        stamp = datetime.fromisoformat(result["saved_at"])
+        url = urlsplit(result["url"])
+        if (url.scheme != "https" or url.hostname != "blog.naver.com" or url.username or url.password
+                or url.port not in {None, 443}):
+            return False
+        if url.path.casefold() == f"/{blog_id}/postwrite".casefold():
+            return True
+        query = {key.casefold(): value for key, value in parse_qs(url.query).items()}
+        return (url.path.casefold() == "/postwriteform.naver"
+                and [value.casefold() for value in query.get("blogid", [])] == [blog_id.casefold()])
+    except (KeyError, ValueError, TypeError):
+        return False
+
+
 def _uncertain(result) -> bool:
     return (isinstance(result, dict) and result.get("published") is False
             and result.get("status") == "uncertain"
@@ -179,8 +207,20 @@ class TopicHistory:
                     entry["keywords"] = []
                     entry["title_terms"] = title_terms(entry.get("title", ""))
                 data["version"] = 2
+            drafts = data.get("consumed_drafts", {})
+            if not isinstance(drafts, dict):
+                raise ValueError("Invalid consumed draft history")
+            for key, entry in drafts.items():
+                if (not isinstance(entry, dict) or key != topic_key(entry.get("topic", ""))
+                        or not key or entry.get("status") != "draft_saved"
+                        or not isinstance(entry.get("keywords"), list)
+                        or any(not isinstance(word, str) for word in entry["keywords"])
+                        or not isinstance(entry.get("article_key"), str)
+                        or not re.fullmatch(r"[a-fA-F0-9]{64}", entry["article_key"])):
+                    raise ValueError("Invalid consumed draft entry")
+                datetime.fromisoformat(entry["expires_at"])
             return data
-        except (OSError, ValueError, TypeError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             raise TopicHistoryError("발행 주제 이력을 읽을 수 없어 중복 발행 방지를 위해 중단했습니다. 이력 파일을 확인하세요.") from exc
 
     def _write(self, data: dict) -> None:
@@ -213,6 +253,7 @@ class TopicHistory:
         with self._locked():
             data = self._read()
             combined = {**data["pending"], **data["published"]}
+            combined.update({topic_key(entry["topic"]): entry for entry in self._recent_drafts(data)})
             return [entry["topic"] for entry in combined.values()]
 
     def record_publication(self, topic: str, result: dict, run_dir: str = "", keywords=None, title="") -> bool:
@@ -232,6 +273,38 @@ class TopicHistory:
             if changed:
                 self._write(data)
             return new
+
+    def _recent_drafts(self, data):
+        now = self.clock() if callable(getattr(self, "clock", None)) else datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        entries = []
+        for entry in data.get("consumed_drafts", {}).values():
+            expiry = datetime.fromisoformat(entry["expires_at"])
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if expiry > now:
+                entries.append(entry)
+        return entries
+
+    def record_consumed_draft(self, topic, result, run_dir="", keywords=None, title=""):
+        """Keep a 30-day usage record separately from public publication history."""
+        key = topic_key(topic)
+        if not key or not confirmed_draft(result):
+            return False
+        with self._locked():
+            data = self._read()
+            drafts = data.setdefault("consumed_drafts", {})
+            if drafts.get(key, {}).get("article_key") == result["article_key"]:
+                return False  # Receipt replay must not extend the thirty-day hold.
+            now = self.clock() if callable(getattr(self, "clock", None)) else datetime.now(timezone.utc)
+            drafts[key] = {"topic": normalize_topic(topic), "keywords": self._filtered(keywords or [], set()),
+                "title": normalize_topic(title)[:500], "title_terms": title_terms(title),
+                "article_key": result["article_key"], "blog_id": result["blog_id"],
+                "status": "draft_saved", "recorded_at": now.isoformat(),
+                "expires_at": (now + timedelta(days=30)).isoformat(), "run_dir": str(run_dir)}
+            self._write(data)
+            return True
 
     @classmethod
     def _enrich_entry(cls, entry, result, run_dir="", keywords=None, title=""):
@@ -304,6 +377,8 @@ class TopicHistory:
             excluded = set(data["published"])
             for entry in data["published"].values():
                 excluded.update(topic_key(item) for item in entry.get("keywords", []) if topic_key(item))
+            for entry in self._recent_drafts(data):
+                excluded.update(topic_key(item) for item in [entry["topic"], *entry["keywords"]] if topic_key(item))
             return excluded | (set(data["pending"]) if include_pending else set())
 
     def recent_publications(self, limit: int = 30) -> list[dict]:
@@ -317,7 +392,8 @@ class TopicHistory:
         candidate_keywords = {topic_key(item) for item in [topic, *(keywords or [])] if topic_key(item)}
         candidate_title = set(title_terms(title or topic))
         with self._locked():
-            entries = self._read()["published"].values()
+            data = self._read()
+            entries = [*data["published"].values(), *self._recent_drafts(data)]
             for entry in entries:
                 old_keywords = {topic_key(item) for item in [entry.get("topic", ""), *entry.get("keywords", [])] if topic_key(item)}
                 overlap = len(candidate_keywords & old_keywords) / max(1, min(len(candidate_keywords), len(old_keywords)))

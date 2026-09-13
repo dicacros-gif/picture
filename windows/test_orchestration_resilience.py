@@ -188,7 +188,7 @@ class GoogleCandidateReuseTests(unittest.TestCase):
         workflow.return_value.prepare.side_effect = prepare
         return app, config
 
-    def test_alternative_queries_keep_candidates_deduplicate_and_stop_at_goal(self):
+    def test_one_search_keeps_available_candidate_without_chasing_target_count(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
             app, config = self.google_app(folder, workflow)
             first = {'path': str(Path(folder) / 'one.jpg'), 'image_url': 'https://example.org/one.jpg', 'capture_sha256': 'one'}
@@ -197,13 +197,12 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app.naver_bot.capture_google_reference_candidates.side_effect = [[first], [dict(first), second, third]]
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             calls = app.naver_bot.capture_google_reference_candidates.call_args_list
-            self.assertEqual(len(calls), 2)
-            self.assertEqual([call.kwargs['count'] for call in calls], [8, 4])
-            self.assertNotEqual(calls[0].args[1], calls[1].args[1])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual([call.kwargs['count'] for call in calls], [2])
             self.assertTrue(all(call.kwargs['reuse_only'] and call.kwargs['english_only'] for call in calls))
-            self.assertEqual(app.resolved_google, [first, second, third])
+            self.assertEqual(app.resolved_google, [first])
 
-    def test_three_kept_photos_scan_past_duplicate_leading_result_to_reach_four(self):
+    def test_two_original_limit_applies_even_when_saved_target_is_four(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
             app, config = self.google_app(folder, workflow, count=4)
             photos = [{'path': str(Path(folder) / f'{index}.jpg'),
@@ -215,18 +214,18 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app.naver_bot.capture_google_reference_candidates.side_effect = capture
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             calls = app.naver_bot.capture_google_reference_candidates.call_args_list
-            self.assertEqual([call.kwargs['count'] for call in calls], [8, 4])
-            self.assertEqual(app.resolved_google, photos[:4])
+            self.assertEqual([call.kwargs['count'] for call in calls], [2])
+            self.assertEqual(app.resolved_google, photos[:2])
 
-    def test_search_failure_uses_remaining_queries_without_discarding_results(self):
+    def test_search_failure_does_not_visit_alternate_queries(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
             app, config = self.google_app(folder, workflow)
             one = {'path': str(Path(folder) / 'one.jpg')}
             two = {'path': str(Path(folder) / 'two.jpg')}
-            app.naver_bot.capture_google_reference_candidates.side_effect = [[one], RuntimeError('preview timeout'), [two]]
+            app.naver_bot.capture_google_reference_candidates.side_effect = [RuntimeError('preview timeout'), [one, two]]
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
-            self.assertEqual(app.naver_bot.capture_google_reference_candidates.call_count, 3)
-            self.assertEqual(app.resolved_google, [one, two])
+            self.assertEqual(app.naver_bot.capture_google_reference_candidates.call_count, 1)
+            self.assertEqual(app.resolved_google, [])
 
     def test_stop_in_google_capture_never_starts_more_searches_or_writing(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:

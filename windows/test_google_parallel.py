@@ -184,16 +184,19 @@ class GoogleParallelTests(unittest.TestCase):
         self.planner._text_call.side_effect = review
         self.run_prepare()
         self.app.naver_bot.capture_google_reference_candidates.assert_called_once()
-        self.assertEqual(self.app.naver_bot.capture_google_reference_candidates.call_args.kwargs['count'], 8)
-        self.assertEqual([item['path'] for item in self.resolved], [item['path'] for item in photos[:4]])
-        self.assertEqual(self.planner._text_call.call_args_list[0].kwargs['images'], [item['path'] for item in photos[:4]])
+        options = self.app.naver_bot.capture_google_reference_candidates.call_args.kwargs
+        self.assertEqual(options['count'], 2)
+        self.assertEqual((options['thumbnail_limit'], options['preview_limit']), (8, 2))
+        self.assertTrue(callable(options['thumbnail_selector']))
+        self.assertEqual([item['path'] for item in self.resolved], [item['path'] for item in photos[:2]])
+        self.assertEqual(self.planner._text_call.call_args_list[0].kwargs['images'], [item['path'] for item in photos[:2]])
         self.assertEqual(self.planner._text_call.call_args.args[4]['chatgpt'], 'stage-model')
         self.assertTrue(all('approved' not in item for item in self.resolved))
         sidecar = json.loads((self.run / 'google-search-checkpoint.json').read_text(encoding='utf-8'))
-        self.assertEqual(len(sidecar['prechecks']), 4)
-        self.assertEqual(sidecar['candidate_count'], 4)
+        self.assertEqual(len(sidecar['prechecks']), 2)
+        self.assertEqual(sidecar['candidate_count'], 2)
 
-    def test_max_twelve_photos_three_prechecks_with_alternative_query(self):
+    def test_rejected_originals_do_not_trigger_more_searches_or_prechecks(self):
         photos = [self.photo(index) for index in range(12)]
         self.app.naver_bot.capture_google_reference_candidates.side_effect = [photos[:8], photos[8:]]
         def reject(*args, images, **kwargs):
@@ -204,11 +207,54 @@ class GoogleParallelTests(unittest.TestCase):
         self.planner._text_call.side_effect = reject
         self.run_prepare()
         self.assertEqual(self.resolved, [])
-        self.assertEqual(self.planner._text_call.call_count, 3)
-        self.assertEqual([call.kwargs['count'] for call in self.app.naver_bot.capture_google_reference_candidates.call_args_list], [8, 4])
+        self.assertEqual(self.planner._text_call.call_count, 1)
+        self.assertEqual([call.kwargs['count'] for call in self.app.naver_bot.capture_google_reference_candidates.call_args_list], [2])
         sidecar = json.loads((self.run / 'google-search-checkpoint.json').read_text(encoding='utf-8'))
         self.assertEqual(sidecar['status'], 'completed')
-        self.assertEqual(len(sidecar['prechecks']), 12)
+        self.assertEqual(len(sidecar['prechecks']), 2)
+
+    def test_actual_thumbnails_are_ranked_once_before_two_originals(self):
+        job = _GoogleSearchJob(self.app, '기차', ['기차 예매'], self.config)
+        job.run_dir = self.run
+        photos = [dict(self.photo(index), rank=index, alt='기차 사진') for index in range(8)]
+        flags = ('image_observed', 'topic_relevant', 'watermark_free', 'photo_dominant', 'little_text')
+        reviews = [{'rank': index, **{flag: True for flag in flags}, 'score': index * 10} for index in range(8)]
+        reviews[7]['watermark_free'] = False
+        reviews[6]['little_text'] = False
+        self.planner._text_call.side_effect = None
+        self.planner._text_call.return_value = {'images': reviews}
+        self.assertEqual(job._select_thumbnails(self.planner, photos), [5, 4])
+        self.planner._text_call.assert_called_once()
+        self.assertEqual(self.planner._text_call.call_args.kwargs['images'], [item['path'] for item in photos])
+        self.assertEqual(self.planner._text_call.call_args.kwargs['timeout'], 60)
+
+    def test_thumbnail_failure_never_falls_back_to_unobserved_links(self):
+        job = _GoogleSearchJob(self.app, '기차', [], self.config)
+        job.run_dir = self.run
+        photo = dict(self.photo(1), rank=1)
+        self.planner._text_call.side_effect = RuntimeError('CLI unavailable')
+        self.assertEqual(job._select_thumbnails(self.planner, [photo]), [])
+        self.assertIn('추가 링크를 열지 않고', str(self.app._naver_log.call_args))
+
+    def test_captcha_disables_other_account_search_without_delaying_article(self):
+        from blog_google_budget import GoogleImageChallengeError
+        from types import SimpleNamespace
+        self.app.naver_bot.capture_google_reference_candidates.side_effect = GoogleImageChallengeError('captcha')
+        self.run_prepare()
+        self.assertEqual(self.resolved, [])
+        receipt = json.loads((self.run / 'google-search-checkpoint.json').read_text(encoding='utf-8'))
+        self.assertEqual(receipt['skip_reason'], 'google_challenge')
+        app2 = object.__new__(BlogWorkflowControls)
+        app2.runtime = SimpleNamespace(root=self.root)
+        app2.cli_app_dir = self.root / 'writer-accounts' / 'secondary' / 'edge'
+        app2.full_auto_stop = threading.Event()
+        app2.naver_bot = Mock(stop_event=threading.Event())
+        app2._naver_log = Mock()
+        job = _GoogleSearchJob(app2, '다른 주제', [], self.config)
+        job.start(app2.cli_app_dir / 'blog-runs' / 'second')
+        self.assertEqual(job.resolve(), [])
+        app2.naver_bot.capture_google_reference_candidates.assert_not_called()
+        self.assertEqual(job.skip_reason, 'challenge_cooldown')
 
     def test_precheck_requires_exact_indices_observation_and_all_boolean_flags(self):
         photo = self.photo(0)

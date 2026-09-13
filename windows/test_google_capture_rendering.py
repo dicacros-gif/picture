@@ -22,7 +22,7 @@ class GoogleCaptureRenderingTests(unittest.TestCase):
                          ('Emulation.setFocusEmulationEnabled', {'enabled': False}))
         self.bot._capture_google_reference_candidates.assert_called_once_with(
             self.driver, 'gas station photo', 'unused', 2, reuse_only=True, english_only=True,
-            allow_attribution=False)
+            allow_attribution=False, thumbnail_limit=8, preview_limit=2, thumbnail_selector=None)
 
     def test_failure_restores_capture_focus_without_hiding_original_error(self):
         self.bot._capture_google_reference_candidates.side_effect = RuntimeError('cancelled')

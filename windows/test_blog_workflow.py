@@ -382,10 +382,12 @@ class BlogWorkflowTests(unittest.TestCase):
         self.bridge.bad_image_indices = {0}
         self.assert_blocked("첫 사진")
 
-    def test_missing_very_important_sentences_is_a_repairable_format_error(self):
+    def test_missing_highlight_suggestions_do_not_retry_or_block_approved_copy(self):
         self.bridge.article.pop('highlight_phrases')
-        self.assert_blocked('highlight_phrases')
-        self.assertEqual(len(self.bridge.calls),2)
+        result = self.prepare()
+        self.assertTrue(result['ready_to_publish'])
+        self.assertFalse(result['visual_style']['highlight_phrases'])
+        self.assertFalse(any('format-retry' in item['prompt'] for item in self.bridge.calls))
 
     def test_long_or_non_korean_cover_hook_is_repairable_format_error(self):
         for value in ('x', '가' * 29 + '?'):

@@ -231,6 +231,12 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         def run(provider, prompt, **kwargs):
             if kwargs.get("images") or prompt.startswith("FINAL_ARTICLE_REVIEW"):
                 return original(provider, prompt, **kwargs)
+            if prompt.startswith('SOURCE_METADATA_REPAIR'):
+                if not resumed:
+                    return json.dumps({'replacements': [], 'unverifiable': [{'index': 0}]})
+                prompts.append(prompt)
+                return json.dumps({'replacements': [{'index': 0, 'source': previous['sources'][0]}],
+                                   'unverifiable': []})
             if provider == "antigravity" or "동일 주제 복구 단계" in prompt:
                 if not resumed:
                     return json.dumps(rejected)
@@ -241,14 +247,15 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         self.bridge.run_text = run
         stages = self.routes()
         stages[-1]["role"] = "문체 다듬기"
-        failed = self.assert_blocked("sources[0]", steps=["chatgpt", "antigravity"], stage_configs=stages)
+        failed = self.assert_blocked("1차 출처 근거", steps=["chatgpt", "antigravity"], stage_configs=stages)
         resumed = True
         result = self.workflow.resume(failed["run_dir"])
         self.assertTrue(result["ready_to_publish"])
         self.assertEqual(len(prompts), 1)
-        data = json.loads(prompts[0].split("BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n", 1)[1].split(
-            "\nEND_UNTRUSTED_RESEARCH_DATA_JSON", 1)[0])
-        self.assertEqual(data["previous_draft"], previous)
+        self.assertTrue(prompts[0].startswith('SOURCE_METADATA_REPAIR'))
+        data = json.loads(prompts[0].splitlines()[-1])
+        self.assertEqual(data['invalid_sources'][0]['source']['supports'], previous['sources'][0]['supports'])
+        self.assertNotIn('previous_draft', data)
         self.assertEqual(result["paragraphs"], revised["paragraphs"])
 
     def test_numeric_style_rewrite_preserves_approved_copy_and_continues_to_patch_naturalizer(self):
@@ -274,7 +281,8 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=stages,
                               editorial_mode="natural")
         self.assertTrue(result["ready_to_publish"])
-        self.assertEqual(result["paragraphs"], baseline["paragraphs"])
+        self.assertEqual([p.split() for p in result["paragraphs"]],
+                         [p.split() for p in baseline["paragraphs"]])
         self.assertEqual(natural_finish_calls, ["antigravity"])
         manifest = self.latest_manifest()
         self.assertEqual(manifest["style_stage_preservations"][0]["reason"],

@@ -16,7 +16,7 @@ import threading
 import time
 
 from blog_preferences import atomic_json_write
-from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed, _published_url, topic_key
+from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed, _published_url, topic_key, confirmed_draft
 
 
 class CleanupError(RuntimeError):
@@ -81,7 +81,7 @@ class ArtifactCleanup:
                 or any(not isinstance(item, str) or not item for item in data["blocked_paths"])):
             raise CleanupError("산출물 정리 대기열을 읽을 수 없어 모든 자료를 보존합니다.")
         for entry in data["entries"].values():
-            if (not isinstance(entry, dict) or entry.get("kind") not in {"publication", "discarded_plan"}
+            if (not isinstance(entry, dict) or entry.get("kind") not in {"publication", "draft", "discarded_plan"}
                     or entry.get("status") not in {"pending", "done", "blocked"}
                     or not isinstance(entry.get("targets"), list)):
                 raise CleanupError("산출물 정리 대기열 항목이 손상되어 자료를 보존합니다.")
@@ -183,6 +183,42 @@ class ArtifactCleanup:
                 or not recorded.get("run_dir") or Path(recorded["run_dir"]).resolve() != run
                 or recorded.get("article_key") != key):
             raise CleanupError("저장된 발행 이력과 정리 요청이 일치하지 않아 산출물을 보존합니다.")
+        self._verify_snapshot(entry, run)
+        return run
+
+    def _verify_draft(self, entry):
+        run = self._target(entry.get("run_dir"), Path(str(entry.get("run_dir", ""))).resolve())
+        if run.parent != self.root / "blog-runs" or run.name.startswith(_PLANS):
+            raise CleanupError("네이버 임시저장 원고 폴더가 아닌 경로는 보존합니다.")
+        key = entry.get("article_key")
+        if not isinstance(key, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", key):
+            raise CleanupError("임시저장 원고 식별자가 없어 자료를 보존합니다.")
+        receipt = _read_json(self.root / "draft_receipts" / f"{key}.json")
+        if (not confirmed_draft(receipt) or receipt.get("article_key") != key
+                or receipt.get("run_dir") != str(run)):
+            raise CleanupError("네이버의 새로운 임시저장 완료 영수증이 없어 자료를 보존합니다.")
+        with self.history._locked():
+            recorded = self.history._read().get("consumed_drafts", {}).get(topic_key(entry.get("topic", "")))
+        if (not isinstance(recorded, dict) or recorded.get("article_key") != key
+                or recorded.get("run_dir") != str(run) or recorded.get("status") != "draft_saved"):
+            raise CleanupError("임시저장 키워드 사용 기록이 일치하지 않아 자료를 보존합니다.")
+        self._verify_snapshot(entry, run)
+        sources = entry.get("source_files", {})
+        if not isinstance(sources, dict):
+            raise CleanupError("임시저장 근거 파일 목록이 올바르지 않습니다.")
+        for name, digest in sources.items():
+            if (not isinstance(name, str) or Path(name).name != name or not isinstance(digest, str)
+                    or not re.fullmatch(r"[a-fA-F0-9]{64}", digest)):
+                raise CleanupError("임시저장 근거 파일의 경로가 올바르지 않습니다.")
+            path = run / name
+            started = any(target.get("attempts", 0) > 0 and Path(target.get("path", "")) == run
+                          for target in entry.get("targets", []))
+            if (path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() != digest
+                    or run.exists() and not path.exists() and not started):
+                raise CleanupError("임시저장 후 원고 근거가 변경되어 자료를 보존합니다.")
+        return run
+
+    def _verify_snapshot(self, entry, run):
         if "draft_files" in entry and run.exists():
             fingerprints = entry["draft_files"]
             if not isinstance(fingerprints, dict) or any(name not in _DRAFT_FILES for name in fingerprints):
@@ -196,7 +232,6 @@ class ArtifactCleanup:
                         raise CleanupError("정리 대기 중 원고가 변경되어 자료를 보존합니다.")
                 elif name in fingerprints and not started:
                     raise CleanupError("정리 대기 중 원고 근거 파일이 없어져 자료를 보존합니다.")
-        return run
 
     def _new_target(self, path):
         if not path.exists():
@@ -208,17 +243,31 @@ class ArtifactCleanup:
         result = article.get("publication")
         if not _confirmed(result) or result.get("content_verified") is not True:
             raise CleanupError("게시 URL과 본문 확인이 모두 완료된 자료만 정리할 수 있습니다.")
-        entry = {"kind": "publication", "status": "pending", "topic": article.get("topic"),
+        self._enqueue_confirmed(article, "publication")
+
+    def enqueue_draft(self, article):
+        if not confirmed_draft(article.get("publication")):
+            raise CleanupError("네이버의 새로운 임시저장 완료를 확인한 자료만 정리할 수 있습니다.")
+        self._enqueue_confirmed(article, "draft")
+
+    def _enqueue_confirmed(self, article, kind):
+        result = article["publication"]
+        entry = {"kind": kind, "status": "pending", "topic": article.get("topic"),
                  "run_dir": article.get("run_dir"), "article_key": result.get("article_key"),
-                 "url": _published_url(result.get("url")), "created_at": self.clock(), "targets": []}
+                 "url": _published_url(result.get("url")) if kind == "publication" else result.get("url"),
+                 "created_at": self.clock(), "targets": []}
+        if kind == "draft":
+            entry['source_files'] = article.get('draft_source_sha256', {})
+            entry['draft_files'] = article.get('draft_artifact_sha256', {})
         with self.lock:
             data = self._load()
             blocked = self._policy_paths(data)
-            run = self._verify_publication(entry)
+            run = self._verify_publication(entry) if kind == "publication" else self._verify_draft(entry)
             identity = hashlib.sha256((str(run) + "\n" + entry["url"]).encode("utf-8")).hexdigest()
             if identity not in data["entries"]:
-                entry["draft_files"] = {name: hashlib.sha256((run / name).read_bytes()).hexdigest()
-                                        for name in _DRAFT_FILES if (run / name).is_file()}
+                if kind != "draft":
+                    entry["draft_files"] = {name: hashlib.sha256((run / name).read_bytes()).hexdigest()
+                                            for name in _DRAFT_FILES if (run / name).is_file()}
                 values = [str(run), *article.get("auxiliary_dirs", [])]
                 for name in _RUN_FILES:
                     path = run / name
@@ -290,7 +339,8 @@ class ArtifactCleanup:
                 if entry["status"] != "pending" or remaining <= 0:
                     continue
                 try:
-                    run = self._verify_publication(entry) if entry["kind"] == "publication" else None
+                    run = (self._verify_publication(entry) if entry["kind"] == "publication" else
+                           self._verify_draft(entry) if entry["kind"] == "draft" else None)
                     references = self._references(exclude_run=run)
                 except (CleanupError, TopicHistoryError, OSError, ValueError, TypeError) as exc:
                     message = str(exc)[:500]
@@ -321,7 +371,7 @@ class ArtifactCleanup:
                             atomic_json_write(self.path, data)
                             shutil.rmtree(path)
                             target["status"] = "done"
-                            self.log(f"발행·폐기 확인 산출물 정리 완료 · {path.name}")
+                            self.log(f"발행·임시저장·폐기 확인 산출물 정리 완료 · {path.name}")
                     except CleanupError as exc:
                         target["status"], target["last_error"] = "blocked", str(exc)[:500]
                     except OSError as exc:

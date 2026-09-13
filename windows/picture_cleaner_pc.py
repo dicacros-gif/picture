@@ -885,14 +885,25 @@ class PictureCleanerApp(BlogWorkflowControls):
             "tab": "#273548" if dark else "#dce6f1",
             "tab_selected": "#1f2937" if dark else "#ffffff",
             "entry": "#243b53" if dark else "#ffffff",
-            "primary": "#2388d1" if dark else "#1769aa",
-            "green": "#20a875" if dark else "#16835d",
-            "danger": "#d9534f" if dark else "#c43d3d",
+            "dropdown": "#153e46" if dark else "#e2f4f1",
+            "dropdown_arrow": "#246674" if dark else "#b5ddd6",
+            "dropdown_border": "#62bac9" if dark else "#37887d",
+            "dropdown_selection": "#267887" if dark else "#b1e3d9",
+            "primary": "#176ead" if dark else "#1769aa",
+            "green": "#137a51" if dark else "#13764f",
+            "danger": "#b8353d" if dark else "#b83238",
             "status": "#203b55" if dark else "#dceaf6",
             "selection": "#315f86" if dark else "#b9dcf7",
         }
         self.palette = colors
         style = self.style
+        ui_font = ("맑은 고딕", 10, "bold")
+        from tkinter import font as tkfont
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+            tkfont.nametofont(name, root=self.root).configure(family="맑은 고딕", weight="bold")
+        style.configure(".", font=ui_font)
+        self.root.option_add("*Menu.font", ui_font)
+        self.root.option_add("*TCombobox*Listbox.font", ui_font)
         self.root.configure(background=colors["bg"])
         style.configure("TFrame", background=colors["bg"])
         style.configure(
@@ -940,35 +951,32 @@ class PictureCleanerApp(BlogWorkflowControls):
         )
         style.configure(
             "TButton",
-            background="#34536f" if dark else colors["tab"],
+            background="#365e83" if dark else "#d2e3f5",
             foreground=colors["text"],
-            font=("맑은 고딕", 10, "bold"),
+            font=ui_font, padding=(12, 7), relief="raised", borderwidth=2,
+            bordercolor="#7faacb" if dark else "#6b91b6",
+            lightcolor="#739dc0" if dark else "#f7fbff",
+            darkcolor="#172f49" if dark else "#7a9bbd",
+            focuscolor="#b7e0ff" if dark else "#174b73",
         )
         style.map(
             "TButton",
-            background=[("disabled", colors["panel_alt"]), ("pressed", "#1d6592" if dark else colors["border"]),
-                        ("active", "#466f92" if dark else colors["panel_alt"])],
+            background=[("disabled", colors["panel_alt"]), ("pressed", "#214361" if dark else "#a9c5e0"),
+                        ("active", "#477aa7" if dark else "#e4f0fc")],
             foreground=[("disabled", "#d3dbe5" if dark else "#667788")],
+            relief=[("pressed", "sunken"), ("!pressed", "raised")],
         )
-        style.configure(
-            "Accent.TButton", background=colors["primary"], foreground="#ffffff"
-        )
-        style.configure(
-            "Copy.TButton", background=colors["green"], foreground="#ffffff"
-        )
-        style.configure(
-            "Danger.TButton", background=colors["danger"], foreground="#ffffff",
-            font=("맑은 고딕", 10, "bold"), padding=(16, 9)
-        )
-        style.map(
-            "Danger.TButton",
-            background=[("active", "#b83232"), ("pressed", "#922626")],
-        )
-        style.configure(
-            "Secondary.TButton", background="#596b7e", foreground="#ffffff",
-            font=("맑은 고딕", 10, "bold"), padding=(16, 9)
-        )
-        style.configure("Sub.TLabel", background=colors["bg"], foreground=colors["muted"])
+        for name, normal, hover, pressed in (
+            ("Accent.TButton", colors["primary"], "#1675b6", "#105182"),
+            ("Copy.TButton", colors["green"], "#14794f", "#0c583c"),
+            ("Danger.TButton", colors["danger"], "#b83232", "#922626"),
+            ("Secondary.TButton", "#526d8b", "#637fa0", "#344d68"),
+        ):
+            style.configure(name, background=normal, foreground="#ffffff", font=ui_font,
+                            padding=(16, 9))
+            style.map(name, background=[("disabled", colors["panel_alt"]),
+                                        ("pressed", pressed), ("active", hover)])
+        style.configure("Sub.TLabel", background=colors["bg"], foreground=colors["muted"], font=ui_font)
         style.configure(
             "Panel.TLabelframe",
             background=colors["panel"],
@@ -1017,32 +1025,36 @@ class PictureCleanerApp(BlogWorkflowControls):
         )
         style.configure(
             "TCombobox",
-            fieldbackground=colors["entry"],
-            background="#34536f" if dark else colors["entry"],
+            fieldbackground=colors["dropdown"],
+            background=colors["dropdown_arrow"],
             foreground=colors["text"],
-            arrowcolor=colors["text"],
-            font=("맑은 고딕", 10, "bold"),
+            arrowcolor="#d4fcff" if dark else "#123c40",
+            bordercolor=colors["dropdown_border"],
+            lightcolor=colors["dropdown_border"], darkcolor=colors["dropdown_border"],
+            arrowsize=17, borderwidth=2, padding=(5, 4), font=ui_font,
         )
         style.map(
             "TCombobox",
             fieldbackground=[
-                ("readonly", colors["entry"]),
-                ("focus", colors["entry"]),
+                ("disabled", colors["panel_alt"]),
+                ("readonly", colors["dropdown"]),
+                ("focus", colors["dropdown"]),
             ],
-            background=[("disabled", colors["panel_alt"]), ("active", "#466f92" if dark else colors["selection"]),
-                        ("readonly", "#34536f" if dark else colors["entry"])],
+            background=[("disabled", colors["panel_alt"]), ("pressed", "#185262" if dark else "#8fc7bd"),
+                        ("active", "#348295" if dark else "#9bd3c9"),
+                        ("readonly", colors["dropdown_arrow"])],
             foreground=[
+                ("disabled", "#d3dbe5" if dark else "#667788"),
                 ("readonly", colors["text"]),
                 ("focus", colors["text"]),
-                ("disabled", "#d3dbe5" if dark else "#667788"),
             ],
-            selectbackground=[("readonly", colors["selection"])],
+            selectbackground=[("readonly", colors["dropdown_selection"])],
             selectforeground=[("readonly", colors["text"])],
         )
-        self.root.option_add("*TCombobox*Listbox.background", colors["entry"])
+        self.root.option_add("*TCombobox*Listbox.background", colors["dropdown"])
         self.root.option_add("*TCombobox*Listbox.foreground", colors["text"])
         self.root.option_add(
-            "*TCombobox*Listbox.selectBackground", colors["selection"]
+            "*TCombobox*Listbox.selectBackground", colors["dropdown_selection"]
         )
         self.root.option_add(
             "*TCombobox*Listbox.selectForeground", colors["text"]
@@ -1052,9 +1064,9 @@ class PictureCleanerApp(BlogWorkflowControls):
             for widget in parent.winfo_children():
                 if isinstance(widget, ttk.Combobox):
                     pop = self.root.tk.call('ttk::combobox::PopdownWindow', str(widget))
-                    self.root.tk.call(str(pop) + '.f.l', 'configure', '-background', colors['entry'],
-                                      '-foreground', colors['text'], '-selectbackground', colors['selection'],
-                                      '-selectforeground', colors['text'])
+                    self.root.tk.call(str(pop) + '.f.l', 'configure', '-background', colors['dropdown'],
+                                      '-foreground', colors['text'], '-selectbackground', colors['dropdown_selection'],
+                                      '-selectforeground', colors['text'], '-font', ui_font)
                 refresh_popdowns(widget)
         refresh_popdowns(self.root)
         if hasattr(self, 'progress_panel'):
@@ -1895,7 +1907,25 @@ class PictureCleanerApp(BlogWorkflowControls):
     def _rank_longtail_topics(
         self, groups: dict[str, list[str]], config: dict | None = None
     ) -> tuple[list[dict], dict]:
-        blocked_terms = (config if config is not None else self.cli_preferences).get("blocked_terms")
+        preferences = config if config is not None else self.cli_preferences
+        blocked_terms = preferences.get("blocked_terms")
+        def fallback_candidates():
+            from blog_topic_fallback import shared_snapshot, rank_fallback
+            if self.full_auto_stop.is_set():
+                raise RuntimeError("사용자가 전체 자동화를 중지했습니다.")
+            budget = getattr(self, '_cycle_budget', None)
+            if budget is not None:
+                budget.check(reserve_seconds=600)
+            self._naver_log('기존 미사용 주제 소진 · RT 사이트 공통 캐시의 검색어·연관어를 확인합니다.')
+            snapshot = shared_snapshot(self.full_auto_stop)
+            ranked, related, _fallback_groups = rank_fallback(snapshot, self.topic_history, preferences,
+                BlogWorkflow.rank_topics, is_ephemeral_keyword)
+            if not ranked:
+                raise RuntimeError('RT 예비 검색어에서도 중복·차단을 제외한 연관어 기반 주제를 확보하지 못했습니다.')
+            self._naver_log(f'RT 예비 후보 {len(ranked)}개 · 사이트 연관어 재사용 · 추가 자동완성 조회 생략 · '
+                            '연관어 수·의도 다양성·지속적인 설명 수요 우선')
+            self.events.put(('cli_ranking', ranked[:10]))
+            return ranked, related
         groups = self.topic_history.filter_groups(groups, include_pending=True)
         history_keys = {keyword_comparison_key(topic) for topic in self.topic_history.blocked_topics()}
         source_counts: dict[str, int] = {}
@@ -1916,6 +1946,8 @@ class PictureCleanerApp(BlogWorkflowControls):
                     source_counts[key] = source_counts.get(key, 0) + 1
                     display_values.setdefault(key, normalized)
         candidates = list(display_values.values())
+        if not candidates:
+            return fallback_candidates()
         if len(candidates) < 3:
             for stored in self.topic_history.filter_keywords(getattr(self, "keyword_db", []), include_pending=True):
                 normalized = normalize_keyword(stored)
@@ -1925,7 +1957,7 @@ class PictureCleanerApp(BlogWorkflowControls):
                     candidates.append(normalized)
                     if len(candidates) >= 3: break
         if not candidates:
-            raise RuntimeError("반복되지 않은 롱테일 후보 검색어가 없습니다.")
+            return fallback_candidates()
 
         related_by_topic: dict[str, dict[str, list[str]]] = {}
         with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
@@ -1949,7 +1981,6 @@ class PictureCleanerApp(BlogWorkflowControls):
             ranking_groups["저장된 미사용 검색어"] = stored_candidates
         ranked = BlogWorkflow.rank_topics(ranking_groups, related_by_topic,
             exclude_topics=self.topic_history.blocked_topics(), blocked_terms=blocked_terms)
-        preferences = config if config is not None else self.cli_preferences
         ranked = [candidate for candidate in ranked if self.topic_history.is_duplicate(
             candidate["topic"], candidate.get("keywords", []), candidate["topic"],
             keyword_threshold=preferences.get("duplicate_keyword_threshold", .4),
@@ -1959,7 +1990,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             if hits:
                 self._naver_log(f"연관어 차단 · {candidate}: {', '.join(hits)}")
         if not ranked:
-            raise RuntimeError("연관 검색어가 충분한 관심 주제를 찾지 못했습니다.")
+            return fallback_candidates()
         self.events.put(("cli_ranking", ranked[:10]))
         return ranked, related_by_topic
 

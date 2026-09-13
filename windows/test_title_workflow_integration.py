@@ -68,7 +68,12 @@ class TitleWorkflowTests(unittest.TestCase):
             with patch('blog_workflow.inspect_article', side_effect=self.title_issues):
                 result = workflow._repair_editorial(Path(folder), article, KEYWORDS, '공휴일', '기존 사용자 지침',
                     ['chatgpt'], {}, [{'provider': 'chatgpt', 'role': '문체 다듬기', 'model': ''}], {}, 'natural')
-            self.assertEqual(result, {**before, 'title': NEW_TITLE})
+            # The title edit preserves every body word/fact. Presentation now
+            # places each sentence on a new line inside its original group.
+            self.assertEqual({key: value for key, value in result.items() if key != 'paragraphs'},
+                             {key: value for key, value in {**before, 'title': NEW_TITLE}.items() if key != 'paragraphs'})
+            self.assertEqual([p.split() for p in result['paragraphs']],
+                             [p.split() for p in before['paragraphs']])
             workflow._text_call.assert_called_once()
             payload = json.loads(workflow._text_call.call_args.args[3].split('\n')[-1])
             self.assertEqual(set(payload['response_schema']), {'title', 'paragraph_patches'})

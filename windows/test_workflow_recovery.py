@@ -270,25 +270,24 @@ class WorkflowRecoveryTests(unittest.TestCase):
                     self.workflow.plan_google_image_search(support.TOPIC, support.KEYWORDS, ["chatgpt"], {})
                 self.workflow._text_call.assert_called_once()
 
-    def test_english_photo_query_fallback_keeps_provider_model_order(self):
+    def test_optional_english_query_failure_does_not_fan_out_to_other_models(self):
         stages = [{"provider": "chatgpt", "model": "first-model"},
                   {"provider": "chatgpt", "model": "second-model"},
                   {"provider": "antigravity", "model": "third-model"}]
         self.workflow._text_call = Mock(side_effect=[BlogCliError("permission_required", "command denied"),
             {"query": "women choosing a laptop photo"}, {"query": "Korean women choosing laptop photo"}])
-        result = self.workflow.plan_google_image_search("노트북 고르기", ["노트북 선택 기준"],
-            ["chatgpt", "chatgpt", "antigravity"], {}, stages)
-        self.assertEqual(result["provider"], "antigravity")
-        self.assertEqual(result["query"], "Korean women choosing laptop photo")
+        with self.assertRaises(WorkflowError):
+            self.workflow.plan_google_image_search("노트북 고르기", ["노트북 선택 기준"],
+                ["chatgpt", "chatgpt", "antigravity"], {}, stages)
         calls = self.workflow._text_call.call_args_list
         self.assertEqual([(call.args[2], call.args[4][call.args[2]]) for call in calls],
-            [("chatgpt", "first-model"), ("chatgpt", "second-model"), ("antigravity", "third-model")])
+            [("chatgpt", "first-model")])
 
     def test_english_photo_query_failure_is_optional_workflow_error_without_generation(self):
         self.workflow._text_call = Mock(side_effect=BlogCliError("authentication_required", "login needed"))
         with self.assertRaises(WorkflowError) as caught:
             self.workflow.plan_google_image_search(support.TOPIC, support.KEYWORDS, ["chatgpt", "claude"], {})
-        self.assertEqual(self.workflow._text_call.call_count, 2)
+        self.assertEqual(self.workflow._text_call.call_count, 1)
         self.assertTrue(Path(caught.exception.run_dir, "search-plan-errors.json").is_file())
         self.assertFalse(self.bridge.generations)
 

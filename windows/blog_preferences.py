@@ -297,7 +297,11 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         typography_marker = "[썸네일 타이포그래피 · 2026-09-13]"
         if typography_marker in default_prompt:
             text = _append_marked_policy(text, typography_marker,
-                typography_marker + default_prompt.split(typography_marker, 1)[1].rstrip())
+                typography_marker + default_prompt.split(typography_marker, 1)[1].split("\n\n[", 1)[0].rstrip())
+        linebreak_marker = "[문장 줄바꿈 최종 규칙 · 2026-09-13]"
+        if linebreak_marker in default_prompt:
+            text = _append_marked_policy(text, linebreak_marker,
+                linebreak_marker + default_prompt.split(linebreak_marker, 1)[1].rstrip())
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)

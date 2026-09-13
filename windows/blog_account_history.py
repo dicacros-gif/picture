@@ -53,6 +53,7 @@ class AccountTopicHistory(TopicHistory):
 
     def _blocked_entries(self, data, *, include_pending=True, reservations=True):
         result = [entry for entry in data["published"].values() if self._recent(entry)]
+        result.extend(self._recent_drafts(data))
         if include_pending:
             result.extend(data["pending"].values())  # Uncertain submissions do not expire.
         if reservations:

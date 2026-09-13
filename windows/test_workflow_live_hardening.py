@@ -159,9 +159,10 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
             'charging cable laptop detail photo', 'laptop keyboard close up photo']})
         result = self.workflow.plan_google_image_search(support.TOPIC, support.KEYWORDS, ['chatgpt'], {})
         self.assertEqual(result['query'], primary)
-        self.assertEqual(result['queries'], [primary, 'power adapter wooden desk photo', 'charging cable laptop detail photo'])
+        self.assertEqual(result['queries'], [primary])
         self.workflow._text_call.assert_called_once()
-        self.assertIn('실제 사물·장소 명사', self.workflow._text_call.call_args.args[3])
+        self.assertIn('최적의 영어 검색어 1개만', self.workflow._text_call.call_args.args[3])
+        self.assertEqual(self.workflow._text_call.call_args.kwargs['timeout'], 60)
 
     def test_legacy_single_google_query_returns_compatible_array(self):
         self.workflow._text_call = Mock(return_value={'query': 'laptop battery wooden desk photo'})

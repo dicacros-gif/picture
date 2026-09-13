@@ -267,9 +267,12 @@ class EditorialTests(unittest.TestCase):
         article['highlight_phrases'] = []
         article['hook_endings'] = [''] * 8
         result, changed = layout_article(article)
-        self.assertEqual(changed, [0])
-        self.assertIn('첫 문장입니다. 둘째 문장이지요.\n\n중요한 문장입니다.\n\n넷째 문장이에요. 다섯째 문장입니다.',
+        self.assertEqual(changed, list(range(8)))
+        self.assertIn('첫 문장입니다.\n둘째 문장이지요.\n\n중요한 문장입니다.\n\n넷째 문장이에요.\n다섯째 문장입니다.',
                       result['paragraphs'][0])
+        again, changed_again = layout_article(result)
+        self.assertEqual(again, result)
+        self.assertEqual(changed_again, [])
 
     def test_code_fallback_uses_existing_title_intent_after_two_short_edits(self):
         article = valid_article()

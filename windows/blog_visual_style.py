@@ -99,8 +99,9 @@ def choose_visual_style(paragraphs: list[str], bold_phrases=None, highlight_phra
                       if isinstance(phrase, str) and 12 <= len(phrase) <= 200 and '\n' not in phrase
                       and phrase.endswith(('.', '?', '!'))
                       and sum(p.count(phrase) for p in paragraphs) == 1
-                      and any(phrase == line.strip() for p in paragraphs for line in p.split('\n')
-                              if not line.lstrip('\ufeff \t').startswith('❝'))))[:3]
+                      and any(phrase == sentence.strip() for p in paragraphs for line in p.split('\n')
+                              if not line.lstrip('\ufeff \t').startswith(('❝', '─', '#'))
+                              for sentence in re.split(r'(?<=[.!?。])\s+', line.strip()))))[:3]
     colors = random.SystemRandom().sample(list(HEADING_BACKGROUNDS), len(highlights))
     selected_bold = list(dict.fromkeys(phrase for phrase in bold_phrases or []
                     if isinstance(phrase, str) and 4 <= len(phrase) <= 200 and '\n' not in phrase

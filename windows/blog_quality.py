@@ -435,7 +435,7 @@ def layout_article(article):
         blocks, group = [], []
         def flush():
             if group:
-                blocks.append(' '.join(group))
+                blocks.append('\n'.join(group))
                 group.clear()
         for sentence in body_items:
             if sentence in emphasized:

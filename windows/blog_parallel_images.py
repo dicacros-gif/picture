@@ -122,6 +122,7 @@ class ImageGenerationBatch:
         self.running = {}
         self.closed = False
         self.error = None
+        self.completed_revision = 0
 
     @property
     def pending(self):
@@ -139,6 +140,7 @@ class ImageGenerationBatch:
                 candidate.update(approved=False, error=str(exc))
                 self.error = self.error or exc
             self.store(candidate)
+            self.completed_revision += 1
         if raise_errors and self.error is not None:
             raise self.error
 

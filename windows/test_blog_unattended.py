@@ -132,6 +132,9 @@ class CandidateRetryTests(unittest.TestCase):
     def test_quality_failure_saves_private_draft_without_repeating_and_releases_next_topic(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
             app, config = self.make_cycle(folder)
+            from blog_topic_history import TopicHistory
+            app.topic_history = TopicHistory(Path(folder) / 'published-topic-history.json')
+            config['blog_id'] = 'testowner'
             run = Path(folder) / "blog-runs" / "quality-hold"
             run.mkdir(parents=True)
             article = {"title": "검토가 더 필요한 제목", "paragraphs": [f"검토 문단 {i}." for i in range(8)]}
@@ -143,7 +146,10 @@ class CandidateRetryTests(unittest.TestCase):
             workflow.return_value.select_topic.return_value = {"topic": "A", "keywords": ["A 방법"]}
             app._prepare_cli_worker.side_effect = WorkflowError(
                 "팩트 보강 단계가 기존 제목·문단을 변경했습니다", run)
-            app._publish_cli_worker.return_value = {"saved": True, "published": False, "status": "draft_saved"}
+            app._publish_cli_worker.return_value = {"saved": True, "published": False, "status": "draft_saved",
+                "draft_confirmation_verified": True, "article_key": "a" * 64, "blog_id": "testowner",
+                "paragraph_count": 8, "image_count": 0, "saved_at": "2026-09-13T19:58:00+09:00",
+                "url": "https://blog.naver.com/testowner/postwrite"}
 
             app._cli_automation_cycle(config)
 

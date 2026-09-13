@@ -173,7 +173,10 @@ class SettingsPersistenceTests(unittest.TestCase):
             result = app._prepare_cli_worker('하이마트', ['하이마트 재고'], config)
             capture = app.naver_bot.capture_google_reference_candidates.call_args
             self.assertEqual(capture.args[0], 'Korean home appliance store')
-            self.assertEqual(capture.kwargs, {'count': 8, 'reuse_only': True, 'english_only': True, 'allow_attribution': True})
+            self.assertEqual({key: value for key, value in capture.kwargs.items() if key != 'thumbnail_selector'},
+                {'count': 2, 'reuse_only': True, 'english_only': True, 'allow_attribution': True,
+                 'thumbnail_limit': 8, 'preview_limit': 2})
+            self.assertTrue(callable(capture.kwargs['thumbnail_selector']))
             instance.plan_google_image_search.assert_called_once_with('하이마트', ['하이마트 재고'],
                 ['chatgpt'], {'chatgpt': 'saved-model'}, stage_configs=None)
             self.assertEqual(instance.prepare.call_args.args[0], '하이마트')

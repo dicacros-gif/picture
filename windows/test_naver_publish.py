@@ -530,6 +530,8 @@ class PublishTests(unittest.TestCase):
         result = self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
         self.assertEqual(result["status"], "draft_saved")
         self.assertTrue(result["saved"])
+        self.assertTrue(result["draft_confirmation_verified"])
+        self.assertEqual(result["blog_id"], "testblog")
         self.assertFalse(result["published"])
         self.assertEqual(result["url"], self.driver.current_url)
         button.click.assert_called_once()
@@ -560,6 +562,20 @@ class PublishTests(unittest.TestCase):
                 "testblog", self.article, publish=True, save_draft=False, allow_quality_draft=True)
         self.app._driver.assert_not_called()
 
+    def test_partial_copy_can_be_saved_privately_without_fabricating_missing_sections(self):
+        button = self._mock_draft_button()
+        self.article.update(paragraphs=self.article['paragraphs'][:2], images=[], ready_to_publish=False)
+        self.article.pop('visual_style', None)
+        result = self.app.publish_naver_article(
+            'testblog', self.article, publish=False, save_draft=True, allow_quality_draft=True)
+        self.assertEqual(result['paragraph_count'], 2)
+        self.assertEqual(result['image_count'], 0)
+        self.assertTrue(result['draft_confirmation_verified'])
+        button.click.assert_called_once()
+        self.final.click.assert_not_called()
+        with self.assertRaises(ValueError):
+            self.app._publication_key('testblog', self.article)
+
     def test_save_intercepted_by_known_help_retries_only_same_button(self):
         from selenium.common.exceptions import ElementClickInterceptedException
         button = self._mock_draft_button()
@@ -586,6 +602,40 @@ class PublishTests(unittest.TestCase):
             self.app.publish_naver_article("testblog", self.article, publish=False, save_draft=True)
         button.click.assert_called_once()
         self.app._find_publish_control.assert_not_called()
+        self.app._prepare_article_in_writer.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, '이전 임시저장 클릭 결과'):
+            self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.app._prepare_article_in_writer.assert_not_called()
+        button.click.assert_called_once()
+
+    def test_draft_receipt_exists_before_click_and_replay_does_not_open_writer(self):
+        button = self._mock_draft_button()
+        def saved_click():
+            receipts = list((self.root / 'draft_receipts').glob('*.json'))
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(json.loads(receipts[0].read_text(encoding='utf-8'))['status'], 'draft_uncertain')
+        button.click.side_effect = saved_click
+        result = self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.app._prepare_article_in_writer.reset_mock()
+        self.app._driver.reset_mock()
+        replay = self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.assertTrue(replay['reused_receipt'])
+        self.assertEqual(replay['article_key'], result['article_key'])
+        self.app._prepare_article_in_writer.assert_not_called()
+        self.app._driver.assert_not_called()
+        button.click.assert_called_once()
+
+    def test_draft_notice_can_reconcile_uncertain_receipt_without_second_click(self):
+        button = self._mock_draft_button(confirmed=False)
+        with self.assertRaises(RuntimeError):
+            self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.app._fresh_article_draft_confirmed.return_value = True
+        self.app._prepare_article_in_writer.reset_mock()
+        replay = self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.assertTrue(replay['draft_confirmation_verified'])
+        self.assertTrue(replay['reused_receipt'])
+        self.app._prepare_article_in_writer.assert_not_called()
+        button.click.assert_called_once()
 
     def test_missing_or_ambiguous_draft_button_never_clicks(self):
         button = self._mock_draft_button()
@@ -1149,13 +1199,13 @@ class ReferenceLicenseTests(unittest.TestCase):
                                 for item in candidates))
             download.assert_not_called()
 
-    def test_reuse_only_skips_ineligible_results_and_stops_after_sixty_candidates(self):
+    def test_reuse_only_checks_at_most_two_preselected_candidates(self):
         reusable = {"license_verified": True, "commercial_use_allowed": True, "modification_allowed": True,
                     "attribution_required": False, "share_alike": False,
                     "license_url": "https://creativecommons.org/publicdomain/zero/1.0/"}
-        scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [3, 4], 4, 2, False, 0),
-                     ([{}] * 61, [], 60, 4, False, 0),
-                     ([reusable] * 12, list(range(1, 11)), 10, 20, False, 0),
+        scenarios = [([{}, {**reusable, "attribution_required": True}, reusable, reusable], [], 2, 2, False, 0),
+                     ([{}] * 61, [], 2, 4, False, 0),
+                     ([reusable] * 12, [1, 2], 2, 20, False, 0),
                      ([reusable], [1], 1, 1, False, 61),
                      ([{**reusable, "english_source_verified": False},
                        {**reusable, "english_source_verified": True, "source_language": "en"}], [2], 2, 1, True, 0)]
@@ -1312,7 +1362,7 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
             with patch("naver_automation.WebDriverWait", self.PollingWait):
                 self.assertEqual(app.capture_google_reference_candidates("wallet coins photograph", Path(folder)), [])
             self.assertEqual(state["clicks"], 0)
-            self.assertEqual(state["photo_polls"], 16)
+            self.assertEqual(state["photo_polls"], 8)
             app._inspect_reference_license.assert_not_called()
             record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(record["status"], "no_results")
@@ -1358,7 +1408,7 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
             self.assertEqual(NaverAutomation._reference_diagnostic_url("data:image/png;base64,private"), "data:(omitted)")
             self.assertEqual(NaverAutomation._reference_diagnostic_url("file:///C:/Users/private/photo.jpg"), "file:(omitted)")
 
-    def test_three_failed_previews_end_query_before_remaining_candidates(self):
+    def test_two_failed_previews_end_query_before_remaining_candidates(self):
         with tempfile.TemporaryDirectory() as folder:
             app, _, state = self.setup_capture(folder, loading=False, photo_count=8, preview_error="always")
             with patch("naver_automation.WebDriverWait", self.PollingWait):
@@ -1366,23 +1416,23 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
             record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(images, [])
             self.assertEqual(record["status"], "preview_unavailable")
-            self.assertEqual(record["consecutive_preview_failures"], 3)
-            self.assertEqual(record["scanned_count"], 3)
-            self.assertEqual(state["clicks"], 6)
+            self.assertEqual(record["consecutive_preview_failures"], 2)
+            self.assertEqual(record["scanned_count"], 2)
+            self.assertEqual(state["clicks"], 4)
             app._inspect_reference_license.assert_not_called()
             self.assertFalse(app.stop_event.is_set())
 
     def test_loaded_preview_resets_failures_even_when_license_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
-            app, _, state = self.setup_capture(folder, loading=False, photo_count=8, blocked_previews={0, 1, 3, 4, 5})
+            app, _, state = self.setup_capture(folder, loading=False, photo_count=8, blocked_previews={0})
             with patch("naver_automation.WebDriverWait", self.PollingWait):
                 images = app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4, reuse_only=True)
             record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(images, [])
-            self.assertEqual(record["status"], "preview_unavailable")
-            self.assertEqual(record["scanned_count"], 6)
+            self.assertEqual(record["status"], "no_eligible_candidates")
+            self.assertEqual(record["scanned_count"], 2)
             self.assertEqual(record["rejection_counts"]["reuse_rights_unverified"], 1)
-            self.assertEqual(record["consecutive_preview_failures"], 3)
+            self.assertEqual(record["consecutive_preview_failures"], 0)
             self.assertEqual(app._inspect_reference_license.call_count, 1)
 
     def test_license_rejections_do_not_trigger_preview_failure_limit(self):
@@ -1392,9 +1442,9 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
                 self.assertEqual(app.capture_google_reference_candidates("wallet coins photograph", Path(folder), count=4, reuse_only=True), [])
             record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(record["status"], "no_eligible_candidates")
-            self.assertEqual(record["scanned_count"], 7)
+            self.assertEqual(record["scanned_count"], 2)
             self.assertEqual(record["consecutive_preview_failures"], 0)
-            self.assertEqual(app._inspect_reference_license.call_count, 7)
+            self.assertEqual(app._inspect_reference_license.call_count, 2)
 
     def test_query_time_budget_preserves_captured_files_and_returns_partial_without_stop(self):
         with tempfile.TemporaryDirectory() as folder:

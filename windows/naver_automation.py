@@ -27,6 +27,7 @@ from typing import Callable
 from blog_visual_style import (IMAGE_POLICY, LOCAL_IMAGE_VALIDATION_POLICY, BODY_TEXT_COLOR,
                                line_style_runs, cover_headline, quote_parts, choose_visual_style,
                                supplement_bold_phrases)
+from blog_google_budget import GoogleImageChallengeError
 from image_delivery import COVER_RENDER_VERSION, CAPTION_RENDER_VERSION, OVERLAY_TEXT_COLORS
 
 import requests
@@ -1995,9 +1996,23 @@ class NaverAutomation:
                     # The user can close the capture tab while cancellation unwinds.
                     pass
 
+    @staticmethod
+    def _raise_google_image_challenge(driver):
+        url = driver.current_url
+        challenged = isinstance(url, str) and "/sorry/" in urllib.parse.urlparse(url).path
+        if not challenged:
+            challenged = driver.execute_script("""
+                return [...document.querySelectorAll('form[action*="/sorry/"], #captcha-form, iframe[src*="recaptcha"][title*="challenge"], .g-recaptcha')]
+                  .some(e=>{const r=e.getBoundingClientRect();return r.width>50 && r.height>40
+                    && getComputedStyle(e).visibility!=='hidden' && getComputedStyle(e).display!=='none';});
+            """) is True
+        if challenged:
+            raise GoogleImageChallengeError("Google CAPTCHA 감지 · 추가 검색과 링크 열기를 중단합니다.")
+
     def capture_google_reference_candidates(
         self, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False,
-        english_only: bool = False, allow_attribution: bool = False
+        english_only: bool = False, allow_attribution: bool = False,
+        thumbnail_limit: int = 8, preview_limit: int = 2, thumbnail_selector=None
     ) -> list[dict]:
         keyword = str(keyword or "").strip()
         if not keyword:
@@ -2010,13 +2025,15 @@ class NaverAutomation:
         with self._google_capture_rendering(driver):
             return self._capture_google_reference_candidates(
                 driver, keyword, output_dir, count, reuse_only=reuse_only, english_only=english_only,
-                allow_attribution=allow_attribution)
+                allow_attribution=allow_attribution, thumbnail_limit=thumbnail_limit,
+                preview_limit=preview_limit, thumbnail_selector=thumbnail_selector)
 
     def _capture_google_reference_candidates(
         self, driver, keyword: str, output_dir: Path, count: int = 2, *, reuse_only: bool = False,
-        english_only: bool = False, allow_attribution: bool = False
+        english_only: bool = False, allow_attribution: bool = False,
+        thumbnail_limit: int = 8, preview_limit: int = 2, thumbnail_selector=None
     ) -> list[dict]:
-        """Capture up to ten eligible previews; licensing/vision gates stay explicit.
+        """Shortlist thumbnails before opening a bounded number of eligible previews.
 
         Screenshots contain only the image element. Embedded text or watermarks
         are preserved and must be rejected by the later CLI visual review.
@@ -2031,11 +2048,13 @@ class NaverAutomation:
             raise ValueError("Google 참고 이미지 검색어가 없습니다.")
         if english_only and (not keyword.isascii() or re.search(r"[A-Za-z]{2,}", keyword) is None):
             raise ValueError("영어 이미지 검색에는 영문 단어로 번역된 검색어가 필요합니다.")
-        count = max(1, min(10, int(count)))
+        thumbnail_limit = max(1, min(60, int(thumbnail_limit)))
+        preview_limit = max(1, min(thumbnail_limit, int(preview_limit)))
+        count = max(1, min(preview_limit, int(count)))
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         search_options = {
-            "tbm": "isch", "hl": "en" if english_only else "ko", "safe": "active", "tbs": "il:cl",
+            "udm": "2", "hl": "en" if english_only else "ko", "safe": "active", "tbs": "il:cl",
             "q": keyword + (" site:commons.wikimedia.org" if reuse_only or english_only else "")
         }
         if english_only:
@@ -2050,8 +2069,9 @@ class NaverAutomation:
         consecutive_preview_failures = 0
         diagnostics = {"query": keyword, "english_only": english_only, "reuse_only": reuse_only,
                        "allow_attribution": allow_attribution,
-                       "requested_count": count, "selector": selector, "scan_limit": 60,
-                       "candidate_time_budget_seconds": 90, "preview_failure_limit": 3,
+                       "requested_count": count, "selector": selector, "scan_limit": thumbnail_limit,
+                       "preview_limit": preview_limit, "thumbnail_visual_selection": thumbnail_selector is not None,
+                       "candidate_time_budget_seconds": 30, "preview_failure_limit": 2,
                        "thumbnails_found": 0, "scanned_count": 0, "rejection_counts": {}, "rejections": [],
                        "result_load_samples": [], "photo_candidates": [], "preview_attempts": []}
         def safe_text(value, limit=300):
@@ -2091,6 +2111,7 @@ class NaverAutomation:
             nonlocal latest_photos, latest_rejections, previous_signature, stable_polls
             if self.stop_event.is_set():
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
+            self._raise_google_image_challenge(d)
             thumbnails = d.find_elements(By.CSS_SELECTOR, selector)
             latest_photos, latest_rejections = [], []
             for rank, thumbnail in enumerate(thumbnails, 1):
@@ -2132,19 +2153,10 @@ class NaverAutomation:
                 diagnostics["results_stabilized"] = True
             except TimeoutException:
                 diagnostics["results_stabilized"] = False
-                if not latest_photos and "/sorry/" not in driver.current_url:
-                    alternate = dict(search_options)
-                    alternate.pop("tbm", None)
-                    alternate["udm"] = "2"
-                    diagnostics["alternate_search_used"] = True
-                    self.log("Google 이미지 결과 형식을 바꿔 한 번 더 조회합니다.")
-                    driver.get("https://www.google.com/search?" + urllib.parse.urlencode(alternate))
-                    try:
-                        WebDriverWait(driver, 8, poll_frequency=.4).until(settled_photos)
-                        diagnostics["results_stabilized"] = True
-                    except TimeoutException:
-                        pass
             eligible_thumbnails = latest_photos
+        except GoogleImageChallengeError:
+            finish("challenge")
+            raise
         except RuntimeError:
             finish("cancelled")
             raise
@@ -2164,7 +2176,7 @@ class NaverAutomation:
             finish("no_results")
             self.log("Google 참고 이미지 검색 결과에 사진이 없어 다음 검색어 또는 생성 이미지로 진행합니다.")
             return []
-        for rank, thumbnail, element_id in eligible_thumbnails[:60]:
+        for rank, thumbnail, element_id in eligible_thumbnails[:thumbnail_limit]:
             try:
                 diagnostics["photo_candidates"].append({"rank": rank, "id": safe_text(element_id, 120),
                     "dom_index": photo_dom_indices[rank],
@@ -2173,10 +2185,54 @@ class NaverAutomation:
             except StaleElementReferenceException:
                 diagnostics["photo_candidates"].append({"rank": rank, "dom_index": photo_dom_indices[rank],
                     "id": safe_text(element_id, 120), "stale": True})
+        # Only the selected thumbnail elements are captured; no preview clicks or scrolling.
+        if thumbnail_selector is not None:
+            thumbnail_items = []
+            eligible_by_rank = {}
+            for rank, thumbnail, element_id in eligible_thumbnails[:thumbnail_limit]:
+                if self.stop_event.is_set():
+                    raise RuntimeError("사용자가 작업을 중지했습니다.")
+                self._raise_google_image_challenge(driver)
+                try:
+                    visible = driver.execute_script("""const r=arguments[0].getBoundingClientRect();
+                        return r.width>0 && r.height>0 && r.top>=0 && r.left>=0
+                          && r.bottom<=innerHeight && r.right<=innerWidth;""", thumbnail)
+                    if visible is False:
+                        reject(rank, "thumbnail_outside_viewport")
+                        continue
+                    links = driver.execute_script("""
+                        const image=arguments[0], links=[];
+                        let card=image.closest('[data-preview-id], [data-ri], a[href]') || image.parentElement;
+                        for(let i=0;card && i<3;i++,card=card.parentElement){
+                          if(card.matches('a[href]')) links.push(card.href);
+                          links.push(...[...card.querySelectorAll('a[href]')].map(a=>a.href));
+                        }
+                        return [...new Set(links)];
+                    """, thumbnail)
+                    source_url = self._reference_source_url(links) if isinstance(links, list) else ""
+                    if source_url and (reuse_only or english_only):
+                        source = urllib.parse.urlparse(source_url)
+                        if source.hostname != "commons.wikimedia.org" or "/wiki/File:" not in source.path:
+                            reject(rank, "unsupported_thumbnail_source", source_url=source_url)
+                            continue
+                    path = output_dir / f"thumbnail-{rank:02d}.png"
+                    path.write_bytes(thumbnail.screenshot_as_png)
+                    thumbnail_items.append({"rank": rank, "path": str(path.resolve()),
+                        "alt": safe_text(thumbnail.get_attribute("alt")), "source_url": source_url})
+                    eligible_by_rank[rank] = (rank, thumbnail, element_id)
+                except (WebDriverException, OSError, TypeError) as exc:
+                    reject(rank, "thumbnail_capture_unavailable", error=str(exc))
+            chosen = thumbnail_selector(thumbnail_items) if thumbnail_items else []
+            ranks = list(dict.fromkeys(rank for rank in chosen if type(rank) is int and rank in eligible_by_rank)) if isinstance(chosen, list) else []
+            diagnostics["thumbnail_reviewed_count"] = len(thumbnail_items)
+            diagnostics["selected_ranks"] = ranks[:preview_limit]
+            eligible_thumbnails = [eligible_by_rank[rank] for rank in ranks[:preview_limit]]
+        else:
+            eligible_thumbnails = eligible_thumbnails[:preview_limit]
         seen: set[str] = set()
         candidate_started = time.monotonic()
         # The scan budget applies to photographs, not icons preceding them.
-        for rank, thumbnail, element_id in eligible_thumbnails[:60]:
+        for rank, thumbnail, element_id in eligible_thumbnails[:thumbnail_limit]:
             if self.stop_event.is_set():
                 finish("cancelled")
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
@@ -2185,12 +2241,13 @@ class NaverAutomation:
             if time.monotonic() - candidate_started >= diagnostics["candidate_time_budget_seconds"]:
                 termination_reason = "time_budget_exhausted"
                 reject(rank, termination_reason)
-                self.log("Google 참고 이미지 후보 검토 90초 한도에 도달해 확보한 사진을 유지하고 다음 검색어로 진행합니다.")
+                self.log("Google 참고 이미지 확인 시간 한도에 도달해 확보한 사진으로 마칩니다.")
                 break
             diagnostics["scanned_count"] += 1
             stage, preview_observations = "thumbnail", []
             try:
                 def preview_ready(d):
+                    self._raise_google_image_challenge(d)
                     if self.stop_event.is_set():
                         raise RuntimeError("사용자가 작업을 중지했습니다.")
                     viable = []
@@ -2241,6 +2298,7 @@ class NaverAutomation:
                                 raise StaleElementReferenceException("Selected photo result was replaced")
                             thumbnail = current[0]
                         stage = "preview"
+                        self._raise_google_image_challenge(driver)
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", thumbnail)
                         preview, info = WebDriverWait(driver, 3, poll_frequency=.25).until(preview_ready)
                         links = driver.execute_script("""
@@ -2343,7 +2401,7 @@ class NaverAutomation:
                     if consecutive_preview_failures >= diagnostics["preview_failure_limit"]:
                         termination_reason = "preview_unavailable"
                         reject(rank, termination_reason, consecutive_failures=consecutive_preview_failures)
-                        self.log("Google 참고 이미지 미리보기가 3개 연속 열리지 않아 다음 검색어로 진행합니다.")
+                        self.log("Google 참고 이미지 미리보기가 연속 열리지 않아 추가 검색 없이 마칩니다.")
                         break
             except RuntimeError:
                 if self.stop_event.is_set():
@@ -3607,10 +3665,10 @@ class NaverAutomation:
         paragraphs = article.get("paragraphs")
         if not title or len(title) > 100 or "\n" in title:
             raise ValueError("임시저장 제목은 1~100자의 한 줄이어야 합니다.")
-        if not isinstance(paragraphs, list) or len(paragraphs) != 8:
-            raise ValueError("임시저장 본문에는 정확히 8개 구역이 필요합니다.")
+        if not isinstance(paragraphs, list) or not 1 <= len(paragraphs) <= 8:
+            raise ValueError("임시저장 본문에는 작성된 1~8개 구역이 필요합니다.")
         if any(not isinstance(value, str) or not value.strip() for value in paragraphs):
-            raise ValueError("임시저장할 8개 본문 구역은 비어 있을 수 없습니다.")
+            raise ValueError("임시저장할 본문 구역은 비어 있을 수 없습니다.")
         paragraphs = [value.strip() for value in paragraphs]
         public_text = "\n".join([title, *paragraphs])
         if re.search(r"https?://", public_text, re.I):
@@ -3624,7 +3682,7 @@ class NaverAutomation:
             if not isinstance(item, dict) or item.get("provider") == "google":
                 continue
             position = item.get("paragraph_index")
-            if type(position) is not int or not 0 <= position <= 7:
+            if type(position) is not int or not 0 <= position < len(paragraphs):
                 continue
             path = Path(str(item.get("path", ""))).resolve()
             if not path.is_file():
@@ -4372,14 +4430,14 @@ class NaverAutomation:
         title, paragraphs, images = article.get("title"), article.get("paragraphs"), article.get("images")
         if not isinstance(title, str) or not title.strip() or len(title.strip()) > 100 or "\n" in title:
             raise ValueError("발행 제목은 1~100자의 한 줄이어야 합니다.")
-        if (not isinstance(paragraphs, list) or len(paragraphs) != 8
+        if (not isinstance(paragraphs, list) or not (1 if draft_only else 8) <= len(paragraphs) <= 8
                 or any(not isinstance(item, str) or not item.strip() for item in paragraphs)):
             raise ValueError("발행 기록 조회에는 비어 있지 않은 본문 8개 구역이 필요합니다.")
         if not isinstance(images, list) or not (0 if draft_only else 6) <= len(images) <= 16:
             raise ValueError("발행 기록 조회에는 이미지 6~16장의 식별 정보가 필요합니다.")
         for item in images:
             if (not isinstance(item, dict) or type(item.get("paragraph_index")) is not int
-                    or not 0 <= item["paragraph_index"] <= 7
+                    or not 0 <= item["paragraph_index"] < len(paragraphs)
                     or not isinstance(item.get("sha256"), str)
                     or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None):
                 raise ValueError("발행 기록 조회에 필요한 이미지 해시 또는 배치 정보가 올바르지 않습니다.")
@@ -4532,6 +4590,39 @@ class NaverAutomation:
         self.log('저장 버튼을 가리는 편집기 도움말을 닫았습니다.')
         return True
 
+    def _saved_draft_receipt(self, key: str, blog_id: str) -> dict | None:
+        from blog_topic_history import confirmed_draft
+        path = self.data_dir / "draft_receipts" / f"{key}.json"
+        try:
+            result = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("기존 임시저장 기록을 읽지 못해 저장 버튼을 다시 누르지 않습니다.") from exc
+        if (confirmed_draft(result) and result.get('article_key') == key
+                and result.get('blog_id', '').casefold() == blog_id.casefold()):
+            return {**result, "reused_receipt": True}
+        if (isinstance(result, dict) and result.get('status') == 'draft_uncertain'
+                and result.get('article_key') == key and result.get('blog_id') == blog_id
+                and isinstance(result.get('confirmation_token'), str)):
+            # A process restart can happen after the site's save succeeded but
+            # before its receipt reached disk. Read the existing observer only;
+            # never reopen the writer, modify its content, or repeat the click.
+            try:
+                driver = self._driver()
+                if self._fresh_article_draft_confirmed(driver, result['confirmation_token']):
+                    recovered = {**result, 'saved': True, 'published': False, 'status': 'draft_saved',
+                                 'draft_confirmation_verified': True, 'url': str(driver.current_url or ''),
+                                 'saved_at': datetime.now().isoformat(timespec='seconds')}
+                    if confirmed_draft(recovered):
+                        recovered.pop('confirmation_token', None)
+                        self._write_publication_receipt(path, recovered)
+                        self.log('기존 저장 클릭의 완료 표시를 복구했습니다. 저장 버튼을 다시 누르지 않습니다.')
+                        return {**recovered, 'reused_receipt': True}
+            except (WebDriverException, OSError):
+                pass
+        raise RuntimeError("이 원고의 이전 임시저장 클릭 결과를 확인해야 합니다. 작업 파일을 보존하고 중복 저장하지 않습니다.")
+
     def _save_prepared_article_draft(self, driver, prepared: dict) -> dict:
         self._dismiss_writer_help(driver)
         def single_save_button(d):
@@ -4546,9 +4637,24 @@ class NaverAutomation:
             raise RuntimeError("사용자가 작업을 중지했습니다.")
         token = str(uuid.uuid4())
         self._arm_article_draft_confirmation(driver, token)
+        path = self.data_dir / "draft_receipts" / f"{prepared['article_key']}.json"
+        receipt = {key: prepared[key] for key in ('article_key', 'blog_id', 'paragraph_count', 'image_count')}
+        receipt.update(saved=False, published=False, status='draft_uncertain',
+                       submitted_at=datetime.now().isoformat(timespec='seconds'), confirmation_token=token)
+        if not self._claim_publication_receipt(path, receipt):
+            return self._saved_draft_receipt(prepared['article_key'], prepared['blog_id'])
+        submitted = False
+        def click_save(target):
+            nonlocal submitted
+            submitted = True
+            try:
+                target.click()
+            except ElementClickInterceptedException:
+                submitted = False
+                raise
         try:
             try:
-                button.click()
+                click_save(button)
             except ElementClickInterceptedException:
                 # Interception means no save click reached the page. Close only
                 # known help, then reacquire the identical save button once.
@@ -4558,20 +4664,32 @@ class NaverAutomation:
                 if current != button:
                     raise RuntimeError('도움말 처리 후 같은 저장 버튼을 확인하지 못했습니다.')
                 self._arm_article_draft_confirmation(driver, token)
-                current.click()
+                click_save(current)
             WebDriverWait(driver, 20).until(lambda d: self._fresh_article_draft_confirmed(d, token))
         except WebDriverException as exc:
+            if not submitted:
+                path.unlink(missing_ok=True)
             raise RuntimeError(
                 "임시저장 버튼은 한 번 눌렀지만 새로운 저장 완료 안내를 확인하지 못했습니다. "
                 "저장 성공으로 처리하지 않았으며 다시 누르지 않습니다. 웨일에서 확인해 주세요."
             ) from exc
+        except Exception:
+            if not submitted:
+                path.unlink(missing_ok=True)
+            raise
         url = str(driver.current_url or "")
         parsed = urllib.parse.urlparse(url)
         if parsed.path.lower().endswith("/postview.naver") or re.fullmatch(r"/[^/]+/\d+/?", parsed.path):
             raise RuntimeError("임시저장 중 예상하지 못한 게시글 화면 이동이 감지되었습니다. 저장 완료로 처리하지 않았습니다.")
-        result = {**prepared, "saved": True, "status": "draft_saved", "url": url,
+        result = {**prepared, "saved": True, "draft_confirmation_verified": True, "status": "draft_saved", "url": url,
                   "saved_at": datetime.now().isoformat(timespec="seconds"),
                   "message": "새로운 임시저장 완료 안내를 확인했습니다."}
+        from blog_topic_history import confirmed_draft
+        if not confirmed_draft(result):
+            raise RuntimeError("임시저장 완료 안내와 작성 계정 주소가 일치하지 않아 자료를 보존합니다.")
+        proof = {key: result[key] for key in ('saved', 'published', 'status', 'draft_confirmation_verified',
+                 'article_key', 'blog_id', 'paragraph_count', 'image_count', 'url', 'saved_at')}
+        self._write_publication_receipt(path, proof)
         self.log(result["message"])
         return result
 
@@ -4597,6 +4715,11 @@ class NaverAutomation:
                                      if allow_quality_draft else self._validate_publish_article(article))
         key = self._publication_key(blog_id, {"title": title, "paragraphs": paragraphs, "images": images},
                                     **({'draft_only': True} if allow_quality_draft else {}))
+        if save_draft:
+            prior_draft = self._saved_draft_receipt(key, blog_id)
+            if prior_draft is not None:
+                self.log("확인된 네이버 임시저장 기록을 재사용합니다. 편집기 입력과 저장 클릭을 반복하지 않습니다.")
+                return prior_draft
         receipt_path = self.data_dir / "publication_receipts" / f"{key}.json"
         driver = self._driver()
         bold_terms = article.get("bold_terms", [])
@@ -4625,7 +4748,7 @@ class NaverAutomation:
                                               bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
             raise RuntimeError("제목, 8개 문단, 사진 수와 순서 검증에 실패하여 발행하지 않았습니다.")
         prepared = {"published": False, "saved": False, "status": "prepared", "url": "", "title": title,
-                    "paragraph_count": 8, "image_count": len(images), "article_key": key,
+                    "paragraph_count": len(paragraphs), "image_count": len(images), "article_key": key, "blog_id": blog_id,
                     "image_component_ids": image_ids, "image_positions": positions}
         prepared["visual_style"] = visual_style
         if save_draft:
