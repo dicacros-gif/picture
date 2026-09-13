@@ -166,7 +166,7 @@ class EditorialTests(unittest.TestCase):
     def test_code_fallback_uses_existing_title_intent_after_two_short_edits(self):
         article = valid_article()
         article['title'] = '즉석밥 오래 둬도 괜찮을까? 소비기한 확인법'
-        keywords = ['즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
+        keywords = ['즉석밥 210g', '노브랜드 즉석밥', '즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
         article['title_intent'] = {
             'question': '즉석밥은 왜 오래 보관돼도 괜찮고 소비기한이 지난 제품은 어떻게 판단하며 방부제와 용기 배출은 무엇을 확인해야 하는가',
             'related_keywords': keywords}

@@ -172,20 +172,22 @@ def fallback_intent_title(article, keywords):
     supplied = _keywords(keywords)
     declared = _keywords(intent.get('related_keywords')) if isinstance(intent, dict) else []
     related = [value for value in declared if value in supplied] or supplied
-    if not any(_has_keyword(question, value) for value in related):
-        lead = re.match(r'^([가-힣A-Za-z0-9]+?)(?:은|는|이|가)?\s+', question)
-        lead_term = _PARTICLE.sub('', lead.group(1)) if lead else ''
-        chosen = next((value for value in related if _terms(value, generic=True)
-                       and _terms(value, generic=True)[0] == lead_term), '')
-        if chosen and lead:
-            remainder = question[lead.end():]
-            for part in _terms(chosen, generic=True)[1:]:
-                remainder = re.sub(r'(?<![가-힣A-Za-z0-9])' + re.escape(part)
-                                   + r'(?:은|는|이|가|을|를)?\s*', '', remainder, count=1)
-            last = chosen[-1]
-            particle = '은' if '가' <= last <= '힣' and (ord(last) - 0xAC00) % 28 else '는'
-            question = f'{chosen}{particle} {remainder}'.strip()
-    candidate = re.sub(r'\s+', ' ', question).strip() + '?'
-    if 45 <= len(candidate) <= 70 and any(_has_keyword(candidate, value) for value in related):
-        return candidate
+    direct = re.sub(r'\s+', ' ', question).strip() + '?'
+    if 45 <= len(direct) <= 70 and any(_has_keyword(direct, value) for value in related):
+        return direct
+    lead = re.match(r'^([가-힣A-Za-z0-9]+?)(?:은|는|이|가)?\s+', question)
+    lead_term = _PARTICLE.sub('', lead.group(1)) if lead else ''
+    for chosen in related:
+        terms = _terms(chosen, generic=True)
+        if not lead or not terms or terms[0] != lead_term:
+            continue
+        remainder = question[lead.end():]
+        for part in terms[1:]:
+            remainder = re.sub(r'(?<![가-힣A-Za-z0-9])' + re.escape(part)
+                               + r'(?:은|는|이|가|을|를)?\s*', '', remainder, count=1)
+        last = chosen[-1]
+        particle = '은' if '가' <= last <= '힣' and (ord(last) - 0xAC00) % 28 else '는'
+        candidate = re.sub(r'\s+', ' ', f'{chosen}{particle} {remainder}').strip() + '?'
+        if 45 <= len(candidate) <= 70 and _has_keyword(candidate, chosen):
+            return candidate
     return ''

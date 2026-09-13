@@ -31,7 +31,7 @@ class TitleQualityTests(unittest.TestCase):
         return '\n'.join(issue['detail'] for issue in title_quality_issues(value, keywords))
 
     def test_fallback_promotes_grounded_intent_to_a_long_related_title(self):
-        keywords = ['즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
+        keywords = ['즉석밥 210g', '노브랜드 즉석밥', '즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
         value = {'title': '즉석밥 오래 둬도 괜찮을까?', 'title_intent': {
             'question': '즉석밥은 왜 오래 보관돼도 괜찮고 소비기한이 지난 제품은 어떻게 판단하며 방부제와 용기 배출은 무엇을 확인해야 하는가',
             'related_keywords': keywords}}
