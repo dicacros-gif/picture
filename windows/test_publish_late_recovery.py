@@ -88,6 +88,32 @@ class LateWriterRecoveryTests(unittest.TestCase):
         confirm.click.assert_not_called()
         self.assert_no_submission()
 
+    def test_detached_restore_dialog_does_not_fail_on_stale_cached_visibility(self):
+        state, dialog, cancel, _confirm = self.recovery_dialog()
+        dialog.is_displayed.side_effect = None
+        dialog.is_displayed.return_value = True
+        self.driver.find_elements.side_effect = lambda _by, selector: (
+            [dialog] if selector == ".se-popup, [role='dialog']" and state["visible"] else [])
+        cancel.click.side_effect = lambda: state.update(visible=False)
+
+        with unittest.mock.patch("naver_automation.WebDriverWait", support.ImmediateWait):
+            self.app._handle_writer_recovery_prompt(self.driver)
+
+        cancel.click.assert_called_once()
+        self.assertFalse(state["visible"])
+
+    def test_restore_dialog_uses_one_javascript_cancel_retry(self):
+        state, _dialog, cancel, _confirm = self.recovery_dialog()
+        cancel.click.side_effect = None
+        self.driver.execute_script.side_effect = lambda _script, _button: state.update(visible=False)
+
+        with unittest.mock.patch("naver_automation.WebDriverWait", support.ImmediateWait):
+            self.app._handle_writer_recovery_prompt(self.driver)
+
+        cancel.click.assert_called_once()
+        self.driver.execute_script.assert_called_once_with("arguments[0].click()", cancel)
+        self.assertFalse(state["visible"])
+
     def test_delayed_restore_is_declined_before_content_validation_and_publish(self):
         state, _dialog, cancel, confirm = self.recovery_dialog()
         def verified(*_args, **_kwargs):

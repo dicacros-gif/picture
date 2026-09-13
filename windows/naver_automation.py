@@ -2507,18 +2507,37 @@ class NaverAutomation:
             raise RuntimeError("이전 작성 내용 불러오기 취소 버튼을 고유하게 확인하지 못했습니다.")
         self.log("이전 작성 내용 복원 안내를 확인했습니다. 현재 편집기에서 불러오기 취소를 누릅니다.")
         candidates[0].click()
+        def current_dialogs():
+            # SmartEditor can keep the clicked React element alive briefly even
+            # after its popup has left the current DOM. Re-query every time;
+            # is_displayed() on the cached element gave a false positive in the
+            # live writer and stopped an otherwise empty article.
+            return self._find_across_frames(driver, visible_dialogs) or []
         def dismissed(_driver):
-            try:
-                return not dialog.is_displayed()
-            except StaleElementReferenceException:
-                return True
+            return not current_dialogs()
         try:
-            WebDriverWait(driver, 8).until(dismissed)
+            WebDriverWait(driver, 3).until(dismissed)
         except TimeoutException as exc:
-            raise RuntimeError(
-                "이전 작성 내용 불러오기 취소 버튼을 눌렀지만 안내창이 닫히지 않았습니다. "
-                "편집기 내용을 유지했으며 발행·저장은 실행하지 않았습니다."
-            ) from exc
+            remaining = current_dialogs()
+            retry = []
+            if len(remaining) == 1:
+                retry_text = self._normalized_text(remaining[0].text)
+                if "작성 중인 글이 있습니다" in retry_text and "이어서 작성" in retry_text:
+                    retry = [button for button in remaining[0].find_elements(
+                        By.CSS_SELECTOR, ".se-popup-button-cancel")
+                        if button.is_displayed() and button.is_enabled()
+                        and self._normalized_text(button.text) == "취소"]
+            if len(retry) == 1:
+                driver.execute_script("arguments[0].click()", retry[0])
+                try:
+                    WebDriverWait(driver, 5).until(dismissed)
+                except TimeoutException:
+                    pass
+            if current_dialogs():
+                raise RuntimeError(
+                    "이전 작성 내용 불러오기 취소 버튼을 눌렀지만 안내창이 닫히지 않았습니다. "
+                    "편집기 내용을 유지했으며 발행·저장은 실행하지 않았습니다."
+                ) from exc
         self.log("새 글 작성을 위해 이전 작성 내용 불러오기를 취소했습니다. 저장된 임시글 삭제는 실행하지 않았습니다.")
 
     def open_blog_writer(self, blog_id: str):
@@ -3765,30 +3784,30 @@ class NaverAutomation:
             # Observed from native Ctrl+B on SmartEditor ONE, 2026-09-12:
             # nodeStyle.bold=true renders as <b> inside the editor text node.
             self._active_article_bold_style = {"bold": True}
-        image_ids: list[str] = []
-        positions: list[int] = []
-        for index, image in enumerate(images):
+        for image in images:
             if self.stop_event.is_set():
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
             if hashlib.sha256(Path(image["path"]).read_bytes()).hexdigest() != image["sha256"]:
                 raise RuntimeError("업로드 직전 이미지 변경을 감지하여 발행을 중단했습니다.")
-            if index:
-                self._focus_body_image_position(driver, index, len(images))
-            self._upload_blog_images(driver, [image["path"]])
-            current = self._read_article_document(driver)
-            current_ids = [item.get("id") for item in current["document"].get("components", []) if item.get("@ctype") == "image"]
-            added = [value for value in current_ids if value not in image_ids]
-            if len(added) != 1 or not added[0] or len(current_ids) != len(image_ids) + 1:
-                raise RuntimeError("이번에 업로드한 사진 1장을 고유하게 확인하지 못했습니다.")
-            image_ids.append(added[0])
-            positions.append(image["paragraph_index"])
-            arranged = self._arrange_article_document(current, paragraphs, image_ids, positions,
-                bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style)
-            self._set_article_document(driver, arranged)
-            WebDriverWait(driver, 15).until(lambda d: self._verify_article_document(
-                self._read_article_document(d), paragraphs, image_ids, positions,
-                bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style,
-            ))
+        # SmartEditor accepts a multi-file input. Upload all approved files in
+        # one operation, then place their document components between the eight
+        # sections once. This removes one upload wait and one full document
+        # rebuild per image while retaining byte/hash and final-layout checks.
+        self._upload_blog_images(driver, [image["path"] for image in images])
+        current = self._read_article_document(driver)
+        image_ids = [item.get("id") for item in current["document"].get("components", [])
+                     if item.get("@ctype") == "image"]
+        if (len(image_ids) != len(images) or len(set(image_ids)) != len(image_ids)
+                or any(not value for value in image_ids)):
+            raise RuntimeError(f"업로드한 사진 {len(images)}장의 고유 식별자를 모두 확인하지 못했습니다.")
+        positions = [image["paragraph_index"] for image in images]
+        arranged = self._arrange_article_document(current, paragraphs, image_ids, positions,
+            bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style)
+        self._set_article_document(driver, arranged)
+        WebDriverWait(driver, 15).until(lambda d: self._verify_article_document(
+            self._read_article_document(d), paragraphs, image_ids, positions,
+            bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style,
+        ))
         return image_ids
 
     @classmethod

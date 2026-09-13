@@ -202,7 +202,7 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(self.app.publish_naver_article("testblog", self.article)["reused_receipt"])
         self.final.click.assert_called_once()
 
-    def test_sixteen_uploads_preserve_order_for_multiple_images_in_each_section(self):
+    def test_sixteen_images_upload_in_one_batch_and_preserve_order_in_each_section(self):
         self._append_google_images(10)
         title, paragraphs, images = self.app._validate_publish_article(self.article)
         state = {"data": document(paragraphs), "uploaded": 0}
@@ -213,17 +213,18 @@ class PublishTests(unittest.TestCase):
         self.app._set_article_document = MagicMock(side_effect=lambda _driver, value: state.update(data=copy.deepcopy(value)))
         self.app._focus_body_image_position = MagicMock()
         def upload(_driver, paths):
-            self.assertEqual(len(paths), 1)
-            index = state["uploaded"]
-            state["data"]["document"]["components"].append({"@ctype": "image", "id": f"uploaded-{index}",
-                                                                "src": f"https://local.invalid/{index}"})
-            state["uploaded"] += 1
+            for path in paths:
+                index = state["uploaded"]
+                self.assertEqual(path, images[index]["path"])
+                state["data"]["document"]["components"].append({"@ctype": "image", "id": f"uploaded-{index}",
+                                                                    "src": f"https://local.invalid/{index}"})
+                state["uploaded"] += 1
         self.app._upload_blog_images = MagicMock(side_effect=upload)
         ids = NaverAutomation._prepare_article_in_writer(self.app, self.driver, "testblog", title, paragraphs, images)
         self.assertEqual(ids, [f"uploaded-{index}" for index in range(16)])
-        self.assertEqual(self.app._upload_blog_images.call_count, 16)
-        self.assertEqual([call.args[1][0] for call in self.app._upload_blog_images.call_args_list],
-                         [item["path"] for item in images])
+        self.app._upload_blog_images.assert_called_once_with(self.driver, [item["path"] for item in images])
+        self.app._focus_body_image_position.assert_not_called()
+        self.app._set_article_document.assert_called_once()
         positions = [item["paragraph_index"] for item in images]
         self.assertTrue(NaverAutomation._verify_article_document(state["data"], paragraphs, ids, positions))
         self.assertFalse(NaverAutomation._verify_article_document(state["data"], paragraphs,
