@@ -86,6 +86,24 @@ class BlogUiTests(unittest.TestCase):
             self.assertFalse(config["publish"])
             self.assertFalse(hasattr(restored, "api_key"))
 
+    def test_startup_persists_migrated_image_typography_policy(self):
+        old_prompt = ("내가 저장한 지침\n\n[제목 통합 작성 규칙 · 2026-09-13 v2]\n제목 지침\n\n"
+                      "[이미지 문구 최신 규칙 · 2026-09-13]\n"
+                      "형광 녹색만 사용하고 빨간 글자는 쓰지 않습니다.")
+        settings = {"cli_workflow": {
+            "default_revision": "user-20260913-title-synthesis-v2",
+            "prompts": [{"id": "saved", "name": "저장값", "text": old_prompt}],
+            "selected_prompt_id": "saved",
+        }}
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.make_app(directory, settings)
+            saved = json.loads((Path(directory) / "settings.json").read_text(encoding="utf-8"))
+            text = saved["cli_workflow"]["prompts"][0]["text"]
+            self.assertIn("[이미지 문구 최신 규칙 · 2026-09-13 v2]", text)
+            self.assertIn("형광 빨간색", text)
+            self.assertNotIn("빨간 글자는 쓰지 않습니다", text)
+            self.assertIn("내가 저장한 지침", app.base_text.get("1.0", "end"))
+
     def test_default_migration_preserves_user_presets_with_colliding_name_and_id(self):
         prompts = [{"id": "mine", "name": "사용자 기본 프롬프트 · 통합 확장 제목", "text": "사용자 직접 작성한 문장"},
                    {"id": "user-default-20260913-title-synthesis-v2", "name": "직접 저장한 옵션", "text": "보존할 두 번째 내용"}]

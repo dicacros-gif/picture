@@ -57,6 +57,11 @@ _IMAGE_REALISM_POLICY_BLOCK = """[실사 이미지 질감 규칙 · 2026-09-13 v
 생성 이미지는 실제 카메라 사진처럼 눈에 보이는 중간 강도의 고운 35mm 필름 그레인, 자연광, 자연스러운 렌즈 보케와 아웃포커싱, 아주 약한 광학 왜곡·비네팅·색수차를 사용합니다. 디지털 노이즈나 과한 빈티지 손상은 피하고 피부·옷감·사물의 미세한 실제 질감을 유지합니다.
 인물은 가상의 한국인 성인만 사용하며 몇 미터 떨어진 중거리·원경에 작게 배치합니다. 정면 응시·정면 포즈·셀피·얼굴 클로즈업은 금지하고 측면·비스듬한 각도·뒷모습이나 자연스러운 활동 장면으로 표현합니다. 첫 이미지는 사람 얼굴을 전혀 넣지 않습니다. AI 생성 이미지는 앱의 해상도·파일·중복·첫 썸네일 문구 검사만 하고 CLI 시각 검수는 생략하며, Google 캡처만 글자·로고·워터마크·본문 관련성을 CLI로 검수합니다."""
 
+_IMAGE_TEXT_POLICY_BLOCK_V2 = """[이미지 문구 최신 규칙 · 2026-09-13 v2]
+첫 생성 이미지는 얼굴 없는 1:1 실사 사진으로 만들고, 핵심 사물은 선명하게 알아볼 수 있게 두며 주변 배경에는 자연스러운 아웃포커싱과 렌즈 보케를 사용합니다. 본문이 답하는 궁금증을 자연스러운 한글 질문으로 압축해 공백 포함 최대 28자로 쓰고 반드시 ?로 끝냅니다. 띄어쓰기와 문법을 지키고 단어만 붙인 조어·긴 설명·해시태그는 쓰지 않습니다.
+앱이 한글 질문을 가독성 높은 굵은 고딕체로 두세 줄 이내에 가운데 정렬합니다. 일반 문구는 흰색, 서로 다른 핵심 단어는 형광 녹색 #8CE88C~#95F095와 선명한 형광 빨간색으로 나누어 강조합니다. 글자 아래에는 짙은 그림자를 넣고, 글자 뒤에는 원사진이 보이는 반투명 검정 배경을 둡니다.
+Google 이미지는 핵심 키워드를 영어로 검색해 이미지 탭의 앞쪽 후보부터 확인합니다. 원본에 글자·로고·워터마크가 없고 사용 조건을 확인한 캡처만 여백을 보수적으로 잘라 원래 비율로 사용합니다. 같은 굵은 고딕체·가운데 정렬·반투명 검정 배경·짙은 그림자와 흰색·형광 녹색·형광 빨간색 조합으로 짧은 한글 질문을 추가합니다."""
+
 
 def _migrate_title_policy_prompt(text: str) -> str:
     """Upgrade only the app-inserted, explicitly marked title policy block."""
@@ -80,6 +85,24 @@ def _migrate_opening_policy_prompt(text: str) -> str:
     if marker in text:
         return text.replace(marker, _OPENING_POLICY_BLOCK + "\n\n" + marker, 1)
     return text.rstrip() + "\n\n" + _OPENING_POLICY_BLOCK
+
+
+def _migrate_image_text_policy_prompt(text: str) -> str:
+    """Replace the obsolete app-owned no-red block without touching user prose."""
+    if not isinstance(text, str) or "[이미지 문구 최신 규칙 · 2026-09-13 v2]" in text:
+        return text
+    old_marker = "[이미지 문구 최신 규칙 · 2026-09-13]"
+    if old_marker in text:
+        return re.sub(
+            r"\[이미지 문구 최신 규칙 · 2026-09-13\]\s*.*?(?=\n+\[[^\]\n]+\]|\Z)",
+            _IMAGE_TEXT_POLICY_BLOCK_V2 + "\n",
+            text,
+            count=1,
+            flags=re.S,
+        )
+    if "[제목 통합 작성 규칙 · 2026-09-13 v2]" in text:
+        return text.rstrip() + "\n\n" + _IMAGE_TEXT_POLICY_BLOCK_V2
+    return text
 
 
 def _append_marked_policy(text: str, marker: str, block: str) -> str:
@@ -263,8 +286,8 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
             continue
         identifier = str(preset.get("id", "")).strip()
         name = str(preset.get("name", "")).strip()
-        text = _migrate_opening_policy_prompt(
-            _migrate_title_policy_prompt(str(preset.get("text", "")).strip()))
+        text = _migrate_image_text_policy_prompt(_migrate_opening_policy_prompt(
+            _migrate_title_policy_prompt(str(preset.get("text", "")).strip())))
         text = _append_marked_policy(text, "[상투적 연결 표현 금지 · 2026-09-13]",
                                      _CANNED_TRANSITION_POLICY_BLOCK)
         text = _append_marked_policy(text, "[실사 이미지 질감 규칙 · 2026-09-13 v2]",

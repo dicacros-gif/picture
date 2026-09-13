@@ -80,7 +80,7 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIn("45~68자", text)
         self.assertNotIn("40~65자를 권장", text)
         self.assertIn("직접 작성한 앞 지침", text)
-        self.assertIn("[이미지 문구 최신 규칙 · 2026-09-13]", text)
+        self.assertIn("[이미지 문구 최신 규칙 · 2026-09-13 v2]", text)
 
     def test_marked_prompt_receives_opening_hook_policy_once(self):
         marked = ("직접 작성한 앞 지침\n\n[제목 통합 작성 규칙 · 2026-09-13 v2]\n"
@@ -110,6 +110,23 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIn("정면 응시", text)
         self.assertIn("광학 왜곡", text)
         self.assertIn("Google 캡처만", text)
+
+    def test_obsolete_no_red_image_policy_is_replaced_once(self):
+        marked = ("직접 작성한 앞 지침\n\n[제목 통합 작성 규칙 · 2026-09-13 v2]\n"
+                  "45~68자 제목\n\n[이미지 문구 최신 규칙 · 2026-09-13]\n"
+                  "형광 녹색을 사용합니다. 빨간 글자는 쓰지 않습니다.\n\n"
+                  "[상투적 연결 표현 금지 · 2026-09-13]\n연결어 지침")
+        value = {"prompts": [{"id": "saved", "name": "저장값", "text": marked}],
+                 "selected_prompt_id": "saved"}
+        first = normalize_preferences(value, "기본")
+        second = normalize_preferences(first, "기본")
+        text = second["prompts"][0]["text"]
+        self.assertEqual(text.count("[이미지 문구 최신 규칙 · 2026-09-13 v2]"), 1)
+        self.assertNotIn("빨간 글자는 쓰지 않습니다", text)
+        self.assertIn("형광 녹색 #8CE88C~#95F095", text)
+        self.assertIn("선명한 형광 빨간색", text)
+        self.assertIn("Google 이미지는 핵심 키워드를 영어로 검색", text)
+        self.assertIn("직접 작성한 앞 지침", text)
 
     def test_next_cycle_uses_new_settings_and_recalculates_changed_wait(self):
         for first_hours, changed_hours in ((6, 1), (1, 6)):

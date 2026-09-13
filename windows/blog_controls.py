@@ -388,6 +388,12 @@ class BlogWorkflowControls(UnattendedControls):
                         suffix += 1
                 pref["prompts"] = [supplied, *pref["prompts"]]
             pref["default_revision"] = "user-20260913-title-synthesis-v2"
+        # Migrations are part of the saved preset, not an in-memory overlay. This
+        # keeps the same typography and prompt policy after a restart even when
+        # the user does not touch any setting during this session.
+        if self.settings.get("cli_workflow") != pref:
+            self.settings["cli_workflow"] = copy.deepcopy(pref)
+            save_settings_json(self.cli_config_path, self.settings)
         self.cli_active_prompt = pref["selected_prompt_id"]
         selected = next(p for p in pref["prompts"] if p["id"] == self.cli_active_prompt)
         self.cli_preset_choice = StringVar(value=selected["name"])
