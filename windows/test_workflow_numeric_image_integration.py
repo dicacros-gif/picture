@@ -78,7 +78,7 @@ class WorkflowNumericImageIntegrationTests(unittest.TestCase):
         prompt = BlogWorkflow._article_prompt('휴일', ['휴일 확인'], '사용자 문체', editorial_mode='natural')
         self.assertIn('같은 대상·기간의 구체적인 수치는 한 구역에서만', prompt)
         self.assertIn('numeric_claims', prompt)
-        self.assertIn('중앙에는 앱이 굵은 고딕체의 흰색과 형광 녹색', prompt)
+        self.assertIn('중앙에는 앱이 굵은 고딕체의 흰색·형광 녹색·형광 빨간색', prompt)
         self.assertNotIn('아주 약한 미세 필름', prompt)
 
     def test_unverified_claim_can_be_removed_as_a_complete_sentence_without_new_facts(self):

@@ -13,9 +13,12 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter, ImageChops
 
-COVER_RENDER_VERSION = "center-question-overlay-v4"
-CAPTION_RENDER_VERSION = "center-question-overlay-v1"
-OVERLAY_TEXT_COLORS = ("#FFFFFF", "#8CE88C")
+COVER_RENDER_VERSION = "center-question-overlay-v5"
+CAPTION_RENDER_VERSION = "center-question-overlay-v2"
+# White keeps complete sentences readable. Fluorescent green and red mark
+# different hook words so both generated covers and Google captures have a
+# clear hierarchy on the translucent black panel.
+OVERLAY_TEXT_COLORS = ("#FFFFFF", "#8CE88C", "#FF4040")
 
 
 def _default_korean_font() -> Path:
@@ -148,7 +151,7 @@ def _emphasis_words(headline, lines):
     if not eligible:
         eligible = list(range(len(words)))
     center = (len(words) - 1) / 2
-    chosen = sorted(eligible, key=lambda index: (abs(index - center), index))[:2 if len(words) >= 5 else 1]
+    chosen = sorted(eligible, key=lambda index: (abs(index - center), index))[:2 if len(words) >= 3 else 1]
     emphasis = [words[index] for index in sorted(chosen)]
     emphasis = [word for word in emphasis if any(word in line for line in lines)]
     if not emphasis:
@@ -184,10 +187,11 @@ def _draw_question_overlay(pixels, headline, font_path=None):
         draw.text((x + shadow_x, y + shadow_y), line, font=font, fill=(5, 9, 12, 255),
                   stroke_width=max(1, round(font.size * .018)), stroke_fill=(5, 9, 12, 255))
         draw.text((x, y), line, font=font, fill=OVERLAY_TEXT_COLORS[0], stroke_width=stroke, stroke_fill=(20, 25, 30, 210))
-        for word in emphasis:
+        for emphasis_index, word in enumerate(emphasis):
             for match in re.finditer(re.escape(word), line):
                 prefix_width = draw.textlength(line[:match.start()], font=font)
-                draw.text((x + prefix_width, y), word, font=font, fill=OVERLAY_TEXT_COLORS[1],
+                accent = OVERLAY_TEXT_COLORS[1 + emphasis_index % (len(OVERLAY_TEXT_COLORS) - 1)]
+                draw.text((x + prefix_width, y), word, font=font, fill=accent,
                           stroke_width=stroke, stroke_fill=(20, 25, 30, 210))
     return Image.alpha_composite(background.convert("RGBA"), overlay).convert("RGB"), {
         "text_color": OVERLAY_TEXT_COLORS[1], "text_colors": list(OVERLAY_TEXT_COLORS),

@@ -49,9 +49,11 @@ class LateWriterRecoveryTests(unittest.TestCase):
         self.app._handle_writer_recovery_prompt(self.driver)
 
         self.driver.execute_cdp_cmd.assert_called_once_with("Page.bringToFront", {})
+        self.driver.switch_to.window.assert_called_once_with(
+            self.driver.current_window_handle
+        )
         self.assertLess(events.index("activate"), events.index("find"))
         self.assertLess(events.index("find"), events.index("cancel"))
-        self.driver.switch_to.window.assert_not_called()
 
     def test_unsupported_cdp_activates_only_current_writer_handle(self):
         state, _dialog, cancel, _confirm = self.recovery_dialog()
@@ -65,6 +67,9 @@ class LateWriterRecoveryTests(unittest.TestCase):
         self.app._handle_writer_recovery_prompt(self.driver)
 
         cancel.click.assert_called_once()
+        self.driver.switch_to.window.assert_called_once_with(
+            "existing-writer-handle"
+        )
         self.driver.get.assert_not_called()
         self.driver.execute_script.assert_not_called()
 

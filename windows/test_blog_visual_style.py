@@ -173,13 +173,14 @@ class VisualStyleTests(unittest.TestCase):
         self.assertIn('central area calm and uncluttered', cover)
         self.assertIn('1:1 square', cover)
 
-    def test_new_cover_requests_optical_background_and_app_only_white_green_question(self):
+    def test_new_cover_requests_optical_background_and_readable_multicolor_question(self):
         cover = image_prompt('연구실 사물 장면', '실제 본문 자료', 0)
         self.assertIn('photorealistic out-of-focus background', cover)
         self.assertIn('natural lens bokeh', cover)
         self.assertIn('Keep the topic recognizable', cover)
         self.assertIn('large bold Gothic', cover)
-        self.assertIn('white and fluorescent green only, never red text', cover)
+        self.assertIn('white, fluorescent green', cover)
+        self.assertIn('fluorescent red accents', cover)
         self.assertIn('natural word spacing and a final question mark', cover)
         self.assertIn('up to 28 characters', cover)
         self.assertIn('generate NO text yourself', cover)

@@ -17,6 +17,7 @@ from selenium.common.exceptions import StaleElementReferenceException, TimeoutEx
 
 from naver_automation import NaverAutomation
 from blog_visual_style import IMAGE_POLICY
+from image_delivery import OVERLAY_TEXT_COLORS
 
 
 class ImmediateWait:
@@ -306,10 +307,10 @@ class PublishTests(unittest.TestCase):
         item.update(caption_text="재고는 언제 확인할까?", caption_placement="center",
                     caption_layout="center_overlay", caption_band_height=0,
                     caption_render_version=CAPTION_RENDER_VERSION,
-                    caption_text_colors=["#FFFFFF", "#8CE88C"], caption_panel_color="#000000")
+                    caption_text_colors=list(OVERLAY_TEXT_COLORS), caption_panel_color="#000000")
         item["reviews"][0]["detected_text"] = item["caption_text"]
         self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 7)
-        for changes in ({"caption_text_colors": ["#EF3340", "#8CE88C"]},
+        for changes in ({"caption_text_colors": ["#FFFFFF", "#8CE88C"]},
                         {"caption_placement": "top"}, {"caption_text": "재고 확인 방법"},
                         {"caption_render_version": "unknown"}, {"original_text_free": False}):
             invalid = copy.deepcopy(self.article)
@@ -317,17 +318,17 @@ class PublishTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.app._validate_publish_article(invalid)
 
-    def test_new_cover_palette_is_white_green_while_old_approval_stays_readable(self):
+    def test_new_cover_palette_is_white_green_red_while_old_approval_stays_readable(self):
         from image_delivery import COVER_RENDER_VERSION
         self.test_generated_cover_policy_allows_only_separately_verified_reference_captions()
         cover = self.article["images"][0]
         cover["cover_text_color"] = "#EF3340"
         self.app._validate_publish_article(self.article)
         cover.update(cover_render_version=COVER_RENDER_VERSION,
-                     cover_text_color="#8CE88C", cover_text_colors=["#FFFFFF", "#8CE88C"])
+                     cover_text_color="#8CE88C", cover_text_colors=list(OVERLAY_TEXT_COLORS))
         self.app._validate_publish_article(self.article)
-        cover["cover_text_colors"] = ["#EF3340", "#8CE88C"]
-        with self.assertRaisesRegex(ValueError, "흰색과 형광 녹색"):
+        cover["cover_text_colors"] = ["#FFFFFF", "#8CE88C"]
+        with self.assertRaisesRegex(ValueError, "흰색과 형광 녹색·빨간색"):
             self.app._validate_publish_article(self.article)
 
     def test_published_page_inspects_sixteen_images_in_repeated_section_positions(self):
@@ -1366,6 +1367,9 @@ class PublishControlTests(unittest.TestCase):
         script, requested_final = driver.execute_script.call_args.args
         self.assertIn("seOnePublishBtn", script)
         self.assertIn("textContent", script)
+        self.assertIn("is_show", script)
+        self.assertIn("document.hidden && frozen", script)
+        self.assertIn("animation.finish()", script)
         self.assertTrue(requested_final)
 
     def test_observed_css_module_publish_panel_without_dialog_role_finds_final_button(self):

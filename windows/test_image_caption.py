@@ -19,7 +19,7 @@ class ImageCaptionTests(unittest.TestCase):
         self.assertEqual(result.size, photo.size)
         self.assertEqual(photo.tobytes(), original)
         self.assertNotEqual(result.tobytes(), original)
-        self.assertEqual(style["caption_text_colors"], ['#FFFFFF', '#8CE88C'])
+        self.assertEqual(style["caption_text_colors"], ['#FFFFFF', '#8CE88C', '#FF4040'])
         self.assertEqual(style["caption_render_version"], CAPTION_RENDER_VERSION)
         self.assertIn(len(style["caption_text_lines"]), (2, 3))
         self.assertEqual(' '.join(style["caption_text_lines"]), "재고 언제 확인할까?")

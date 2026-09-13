@@ -2480,12 +2480,18 @@ class NaverAutomation:
                 or not (re.fullmatch(r"/[^/]+/postwrite/?", url.path, re.I)
                         or url.path.lower() == "/postwriteform.naver")):
             return
+        # Calling Page.bringToFront alone did not select an already attached
+        # Whale tab in a live run: document.hidden stayed true and Naver's
+        # publish-panel animation remained frozen at its first frame. Re-select
+        # this exact handle first. This never enumerates or touches another tab.
+        handle = driver.current_window_handle
+        driver.switch_to.window(handle)
         try:
             driver.execute_cdp_cmd("Page.bringToFront", {})
         except (AttributeError, WebDriverException):
-            # A provider without CDP can still select its existing window. Do
-            # not enumerate or switch to unrelated tabs and never force clicks.
-            driver.switch_to.window(driver.current_window_handle)
+            # Edge/Chrome providers without CDP are already activated by the
+            # exact-handle switch above.
+            pass
 
     def _handle_writer_recovery_prompt(self, driver) -> None:
         """Decline only Naver's observed recovery prompt when opening a new article."""
@@ -3515,7 +3521,7 @@ class NaverAutomation:
                         or item.get("caption_applied") is not True or item.get("original_text_free") is not True
                         or not (legacy_band or center_overlay)
                         or item.get("cover_headline") or item.get("cover_text_applied")):
-                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 흰색·형광 녹색의 가운데 한글 질문 문구가 필요합니다.")
+                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 흰색·형광 녹색·빨간색의 가운데 한글 질문 문구가 필요합니다.")
                 for review in reviews:
                     if (any(review.get(flag) is not True for flag in ("caption_exact", "caption_legible", "no_other_text"))
                             or review.get("text_free") is not False
@@ -3537,7 +3543,7 @@ class NaverAutomation:
             if checked[0].get("cover_render_version") == COVER_RENDER_VERSION:
                 if (checked[0].get("cover_text_color") != "#8CE88C"
                         or checked[0].get("cover_text_colors") != list(OVERLAY_TEXT_COLORS)):
-                    raise ValueError("새 표지의 문구는 흰색과 형광 녹색으로 표시해야 합니다.")
+                    raise ValueError("새 표지의 문구는 흰색과 형광 녹색·빨간색으로 표시해야 합니다.")
             for index, item in enumerate(checked):
                 if item.get("provider") != "google" and item.get("image_policy") != IMAGE_POLICY:
                     raise ValueError("새 이미지 생성 규칙과 다른 사진이 포함되어 있습니다.")
@@ -4056,7 +4062,40 @@ class NaverAutomation:
                     const selector='[role="dialog"], .layer_publish, [class*="layer_publish"], '
                       + '[class*="publish_layer"], [class*="publishLayer"], [class*="publish_container"], '
                       + '[data-testid="publish-layer"]';
-                    const matched=[...document.querySelectorAll('button')].filter(e=>{
+                    const buttons=[...document.querySelectorAll('button')];
+                    if(wantFinal) {
+                      // Chromium pauses CSS animations at time zero when an
+                      // attached writer document is backgrounded. Naver has
+                      // already opened the panel in that state (the unique
+                      // wrapper carries is_show), but its real final button
+                      // remains visibility:hidden forever. Finish only the
+                      // animation of that positively identified Naver panel;
+                      // this changes presentation and never submits the form.
+                      const finals=buttons.filter(e=>{
+                        if(e.getAttribute('data-testid')!=='seOnePublishBtn'
+                            || e.disabled || e.getAttribute('aria-disabled')==='true') return false;
+                        const panel=e.closest(selector);
+                        const wrapper=panel && panel.closest('[class*="layer_popup"]');
+                        const content=panel ? (panel.innerText || panel.textContent || '') : '';
+                        return Boolean(panel && wrapper
+                          && /(?:^|\s)is_show(?:__\S+)?(?:\s|$)/.test(wrapper.className || '')
+                          && visible(wrapper) && /공개|카테고리|발행 설정|주제/.test(content));
+                      });
+                      if(finals.length===1 && !visible(finals[0])) {
+                        const panel=finals[0].closest(selector);
+                        const wrapper=panel.closest('[class*="layer_popup"]');
+                        const animations=wrapper.getAnimations({subtree:true});
+                        const frozen=animations.length>0 && animations.every(a=>
+                          (a.playState==='running' || a.playState==='pending')
+                          && (a.currentTime===0 || a.currentTime===null));
+                        if(document.hidden && frozen) {
+                          for(const animation of animations) {
+                            try { animation.finish(); } catch (_) {}
+                          }
+                        }
+                      }
+                    }
+                    const matched=buttons.filter(e=>{
                       if(!visible(e) || (normalized(e)!=='발행' && e.getAttribute('aria-label')!=='발행'
                           && e.getAttribute('data-testid')!=='seOnePublishBtn')) return false;
                       const panel=e.closest(selector), content=panel ? (panel.innerText || panel.textContent || '') : '';
