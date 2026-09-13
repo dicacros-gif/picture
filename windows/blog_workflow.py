@@ -2224,7 +2224,7 @@ class BlogWorkflow:
                 humanize_required = editorial_mode == "natural" and (
                     effective_stages[-1].get("role") != "문체 다듬기"
                     or effective_stages[-1].get("preserved_previous") is True)
-                editorial_policy_hash = _json_hash({"version": 2, "mode": editorial_mode,
+                editorial_policy_hash = _json_hash({"version": 3, "mode": editorial_mode,
                                                     "natural_finish_required": humanize_required,
                                                     "fact_spacing_review_required": bool(manifest.get('fact_spacing_repairs'))})
                 reused_editorial = False

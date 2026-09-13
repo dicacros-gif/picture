@@ -2,7 +2,7 @@ import copy
 import json
 import unittest
 
-from blog_title import TITLE_POLICY_VERSION, build_title_guidance, title_quality_issues
+from blog_title import TITLE_POLICY_VERSION, build_title_guidance, fallback_intent_title, title_quality_issues
 
 
 def article(title, footer=''):
@@ -29,6 +29,21 @@ class TitleGuidanceTests(unittest.TestCase):
 class TitleQualityTests(unittest.TestCase):
     def details(self, value, keywords=()):
         return '\n'.join(issue['detail'] for issue in title_quality_issues(value, keywords))
+
+    def test_fallback_promotes_grounded_intent_to_a_long_related_title(self):
+        keywords = ['즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
+        value = {'title': '즉석밥 오래 둬도 괜찮을까?', 'title_intent': {
+            'question': '즉석밥은 왜 오래 보관돼도 괜찮고 소비기한이 지난 제품은 어떻게 판단하며 방부제와 용기 배출은 무엇을 확인해야 하는가',
+            'related_keywords': keywords}}
+        result = fallback_intent_title(value, keywords)
+        self.assertTrue(45 <= len(result) <= 70)
+        self.assertIn('즉석밥 소비기한', result)
+        self.assertTrue(result.endswith('?'))
+        self.assertNotIn(',', result)
+
+    def test_fallback_does_not_pad_a_short_ungrounded_intent(self):
+        value = {'title_intent': {'question': '언제 열릴까', 'related_keywords': ['기차표 예매']}}
+        self.assertEqual(fallback_intent_title(value, ['기차표 예매']), '')
 
     def test_short_clear_question_has_no_length_issue(self):
         for title in ('기차표 취소표는 언제 다시 풀릴까?', '세금 환급은 누구에게 적용될까?', '30일 안에 철회할 수 있을까?'):

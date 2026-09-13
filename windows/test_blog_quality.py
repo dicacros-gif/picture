@@ -163,6 +163,21 @@ class EditorialTests(unittest.TestCase):
         self.assertNotIn(stale, cleaned['paragraphs'][0])
         self.assertTrue(any(item['code'] == 'opening_hook' for item in changes))
 
+    def test_code_fallback_uses_existing_title_intent_after_two_short_edits(self):
+        article = valid_article()
+        article['title'] = '즉석밥 오래 둬도 괜찮을까? 소비기한 확인법'
+        keywords = ['즉석밥 소비기한', '즉석밥 방부제', '즉석밥용기 재활용']
+        article['title_intent'] = {
+            'question': '즉석밥은 왜 오래 보관돼도 괜찮고 소비기한이 지난 제품은 어떻게 판단하며 방부제와 용기 배출은 무엇을 확인해야 하는가',
+            'related_keywords': keywords}
+        article['paragraphs'][-1] += '\n즉석밥 소비기한과 용기 재활용 확인 기준 뜻과 의미'
+        issues = [item for item in inspect_article(article, keywords, '즉석밥', mode='natural')
+                  if item['code'] in {'title_keyword', 'title_synthesis'}]
+        result, changes = local_cleanup(article, issues, mode='natural')
+        self.assertTrue(45 <= len(result['title']) <= 70)
+        self.assertIn('즉석밥 소비기한', result['title'])
+        self.assertIn('title_intent_fallback', {item['code'] for item in changes})
+
     def test_two_cli_repairs_then_code_cleanup_no_third_request(self):
         with tempfile.TemporaryDirectory() as folder:
             workflow = BlogWorkflow(Mock(), Path(folder), Mock())

@@ -157,3 +157,35 @@ def title_quality_issues(article, keywords):
                 '표현 차이일 수 있으므로 같은 검색 의도를 설명하는지 본문으로 확인하세요. '
                 '필요할 때만 마지막 제목의 핵심 정보를 첫 제목에 합치고 단어만 억지로 일치시키지 마세요.')
     return issues
+
+
+def fallback_intent_title(article, keywords):
+    """Promote the article's own intent question after bounded title edits fail."""
+    if not isinstance(article, dict):
+        return ''
+    intent = article.get('title_intent')
+    question = _clean(intent.get('question')) if isinstance(intent, dict) else ''
+    if not question:
+        return ''
+    question = re.sub(r'[,;:#*<>]+', ' ', question)
+    question = re.sub(r'\s+', ' ', question).strip().rstrip('.?!')
+    supplied = _keywords(keywords)
+    declared = _keywords(intent.get('related_keywords')) if isinstance(intent, dict) else []
+    related = [value for value in declared if value in supplied] or supplied
+    if not any(_has_keyword(question, value) for value in related):
+        lead = re.match(r'^([가-힣A-Za-z0-9]+?)(?:은|는|이|가)?\s+', question)
+        lead_term = _PARTICLE.sub('', lead.group(1)) if lead else ''
+        chosen = next((value for value in related if _terms(value, generic=True)
+                       and _terms(value, generic=True)[0] == lead_term), '')
+        if chosen and lead:
+            remainder = question[lead.end():]
+            for part in _terms(chosen, generic=True)[1:]:
+                remainder = re.sub(r'(?<![가-힣A-Za-z0-9])' + re.escape(part)
+                                   + r'(?:은|는|이|가|을|를)?\s*', '', remainder, count=1)
+            last = chosen[-1]
+            particle = '은' if '가' <= last <= '힣' and (ord(last) - 0xAC00) % 28 else '는'
+            question = f'{chosen}{particle} {remainder}'.strip()
+    candidate = re.sub(r'\s+', ' ', question).strip() + '?'
+    if 45 <= len(candidate) <= 70 and any(_has_keyword(candidate, value) for value in related):
+        return candidate
+    return ''

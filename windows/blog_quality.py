@@ -6,7 +6,7 @@ import re
 from difflib import SequenceMatcher
 
 from blog_numeric_claims import numeric_claim_issues, _numeric_value
-from blog_title import title_quality_issues
+from blog_title import fallback_intent_title, title_quality_issues
 
 FORBIDDEN = ("질문", "소제목", "예를 들어", "예컨대", "또한", "결론적으로", "오늘은 알아보겠습니다")
 ATTRIBUTION = re.compile(r"(?:Antigravity|안티그래비티|ChatGPT|Claude|클로드|챗GPT|CLI|AI)(?:가|에서|로|를 통해|는)?\s*(?:직접\s*)?(?:확인|검증|검수|작성|생성)", re.I)
@@ -198,6 +198,14 @@ def local_cleanup(article, issues, *, mode='strict'):
     changes = []
     alternates = [('입니다.', '이지요.'), ('있습니다.', '있어요.'), ('없습니다.', '없어요.'),
                   ('합니다.', '해요.'), ('됩니다.', '돼요.'), ('했습니다.', '했어요.')]
+    if any(issue['code'] in {'title_keyword', 'title_synthesis'} for issue in issues):
+        intent = article.get('title_intent') if isinstance(article.get('title_intent'), dict) else {}
+        replacement = fallback_intent_title(result, intent.get('related_keywords', []))
+        if replacement and replacement != result.get('title'):
+            old_title = result.get('title', '')
+            result['title'] = replacement
+            changes.append({'code': 'title_intent_fallback', 'index': -1,
+                            'old': old_title, 'new': replacement})
     for issue in issues:
         i, old = issue['index'], issue['text']
         if i < 0 or not old or old not in result['paragraphs'][i]:
