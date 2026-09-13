@@ -35,6 +35,10 @@ _TITLE_POLICY_BLOCK_V2 = """[제목 통합 작성 규칙 · 2026-09-13 v2]
 첫 제목은 첫줄 후킹과 마지막 SEO 제목의 핵심 정보를 실제로 한 제목에 합쳐 작성합니다. 두 제목 중 하나만 고르거나 짧은 검색어 꼬리만 붙이지 않습니다. 독자가 궁금해하는 점과 본문에서 답하는 서로 다른 정보 두 가지 이상을 담고 공백 포함 45~68자로 쓰되 70자를 넘지 않습니다. 입력된 실제 연관 검색어 중 중요한 2개를 자연스럽게 포함합니다.
 같은 연도·주제어·설명은 한 번만 남깁니다. 겹치는 주변 표현은 실제 연관어 안의 자연스러운 유사 표현으로 연결하되 의미가 달라지는 억지 동의어와 본문에 없는 사실은 만들지 않습니다. 물음표는 유지하고 쉼표·콜론·세미콜론은 쓰지 않습니다. 마지막 SEO 제목은 같은 검색 의도를 다른 정리·판단 관점으로 표현하고 반드시 뜻과 의미로 끝냅니다."""
 
+_OPENING_POLICY_BLOCK = """[도입 후킹 규칙 · 2026-09-13]
+첫 구역은 검색이나 블로그를 찾아온 과정을 설명하지 않고, 끝까지 읽어야 놓치기 쉬운 차이와 판단 기준을 알 수 있는 이유를 구체적인 상황이나 의문문으로 먼저 보여줍니다.
+'검색한 분들이', '제일 먼저 답하면', '검색창을 옮겨 다니다 보면', '블로그마다', '이 글에서는 알아보겠습니다' 같은 상투 문장은 출력하지 않습니다. 정답을 첫 문장에 모두 소진하지 않고 가까운 문장에서 이유와 답을 자연스럽게 풉니다."""
+
 
 def _migrate_title_policy_prompt(text: str) -> str:
     """Upgrade only the app-inserted, explicitly marked title policy block."""
@@ -47,6 +51,17 @@ def _migrate_title_policy_prompt(text: str) -> str:
         count=1,
         flags=re.S,
     )
+
+
+def _migrate_opening_policy_prompt(text: str) -> str:
+    """Add the requested opening rule only to prompts carrying the app title marker."""
+    if (not isinstance(text, str) or "[도입 후킹 규칙 · 2026-09-13]" in text
+            or "[제목 통합 작성 규칙 · 2026-09-13 v2]" not in text):
+        return text
+    marker = "[이미지 문구 최신 규칙 · 2026-09-13]"
+    if marker in text:
+        return text.replace(marker, _OPENING_POLICY_BLOCK + "\n\n" + marker, 1)
+    return text.rstrip() + "\n\n" + _OPENING_POLICY_BLOCK
 
 
 def atomic_json_write(path: str | Path, value) -> None:
@@ -210,7 +225,9 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
             continue
         identifier = str(preset.get("id", "")).strip()
         name = str(preset.get("name", "")).strip()
-        text = _migrate_title_policy_prompt(str(preset.get("text", "")).strip())
+        text = _migrate_opening_policy_prompt(
+            _migrate_title_policy_prompt(str(preset.get("text", "")).strip())
+        )
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)

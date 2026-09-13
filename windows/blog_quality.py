@@ -12,6 +12,11 @@ FORBIDDEN = ("질문", "소제목", "예를 들어", "예컨대", "또한", "결
 ATTRIBUTION = re.compile(r"(?:Antigravity|안티그래비티|ChatGPT|Claude|클로드|챗GPT|CLI|AI)(?:가|에서|로|를 통해|는)?\s*(?:직접\s*)?(?:확인|검증|검수|작성|생성)", re.I)
 PUBLIC_SOURCE = re.compile(r"https?\S*|www\.\S*|출처|참고\s*자료", re.I)
 SPECIFIC = re.compile(r"\d[\d,.]*\s*(?:원|만원|억원|일|주|개월|년|시간|분|회|번|%)|(?:경우|조건|대상|자격|이상|이하|미만|초과)")
+OPENING_META = re.compile(
+    r"(?:검색(?:한|하신|하는)\s*(?:분|사람)|검색창을\s*옮겨\s*다니|블로그마다|"
+    r"제일\s*먼저\s*답하면|가장\s*먼저\s*알고\s*싶은\s*(?:건|것은)|"
+    r"(?:이|이번)\s*글(?:에서는|은)\s*(?:알아|살펴))"
+)
 
 
 def sentences(text):
@@ -79,6 +84,11 @@ def inspect_article(article, keywords, topic, *, mode='strict'):
         elif key in used:
             add('heading_duplicate', i, heading(p), '다른 소제목에 사용하지 않은 실제 연관어 사용')
         used.add(key if isinstance(key, str) else '')
+    for sentence in sentences(paragraphs[0])[:3]:
+        if OPENING_META.search(sentence):
+            add('opening_hook', 0, sentence,
+                '검색·블로그·글쓰기 과정을 설명하는 상투적인 도입을 삭제하고, 끝까지 읽어야 알 수 있는 '
+                '구체적인 판단 기준이나 놓치기 쉬운 차이를 궁금증으로 여세요.')
     if sparse_keywords and len(set(actual_keywords) & used) < len(actual_keywords):
         add('heading_keyword_coverage', -1, '', f'확보한 실제 연관어 {len(actual_keywords)}개를 서로 다른 소제목에 배치하고 나머지는 빈 문자열로 기록')
     if concrete < 4:
@@ -193,7 +203,7 @@ def local_cleanup(article, issues, *, mode='strict'):
         if i < 0 or not old or old not in result['paragraphs'][i]:
             continue
         new = old
-        if issue['code'] in {'public_source', 'tool_attribution'}:
+        if issue['code'] in {'public_source', 'tool_attribution', 'opening_hook'}:
             new = ''
         elif issue['code'] == 'ending':
             for before, after in alternates:
@@ -213,6 +223,11 @@ def local_cleanup(article, issues, *, mode='strict'):
                 values = result.get(field, [])
                 if isinstance(values, list):
                     result[field] = [value.replace(old, new) if isinstance(value, str) else value for value in values]
+            if issue['code'] == 'opening_hook':
+                bridges = result.get('bridge_sentences')
+                remaining = sentences(result['paragraphs'][0])
+                if isinstance(bridges, list) and len(bridges) == 8 and not bridges[0].strip() and remaining:
+                    bridges[0] = remaining[0]
     # Reuse only explicitly verified supporting facts absent from the copy.
     # No generic filler, invented amounts, or fabricated search terms.
     available = [claim for source in result.get('sources', []) if isinstance(source, dict)

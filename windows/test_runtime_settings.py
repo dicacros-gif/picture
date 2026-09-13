@@ -82,6 +82,18 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIn("직접 작성한 앞 지침", text)
         self.assertIn("[이미지 문구 최신 규칙 · 2026-09-13]", text)
 
+    def test_marked_prompt_receives_opening_hook_policy_once(self):
+        marked = ("직접 작성한 앞 지침\n\n[제목 통합 작성 규칙 · 2026-09-13 v2]\n"
+                  "45~68자 제목\n\n[이미지 문구 최신 규칙 · 2026-09-13]\n이미지 지침")
+        value = {"prompts": [{"id": "saved", "name": "저장값", "text": marked}],
+                 "selected_prompt_id": "saved"}
+        first = normalize_preferences(value, "기본")
+        second = normalize_preferences(first, "기본")
+        text = second["prompts"][0]["text"]
+        self.assertEqual(text.count("[도입 후킹 규칙 · 2026-09-13]"), 1)
+        self.assertIn("제일 먼저 답하면", text)
+        self.assertIn("직접 작성한 앞 지침", text)
+
     def test_next_cycle_uses_new_settings_and_recalculates_changed_wait(self):
         for first_hours, changed_hours in ((6, 1), (1, 6)):
             with self.subTest(first_hours=first_hours, changed_hours=changed_hours):

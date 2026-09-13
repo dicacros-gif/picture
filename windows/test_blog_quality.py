@@ -152,6 +152,17 @@ class EditorialTests(unittest.TestCase):
         self.assertIn('가능해요.', result['paragraphs'][0])
         self.assertEqual(result['review'], article['review'])
 
+    def test_meta_opening_is_repaired_without_discarding_the_article(self):
+        article = valid_article()
+        stale = '검색한 분들이 가장 먼저 알고 싶은 건 어디서 볼 수 있는지입니다.'
+        article['paragraphs'][0] = article['paragraphs'][0].replace('\n\n', '\n\n' + stale + '\n\n', 1)
+        issues = inspect_article(article, KEYWORDS, TOPIC, mode='natural')
+        opening = [item for item in issues if item['code'] == 'opening_hook']
+        self.assertEqual([item['text'] for item in opening], [stale])
+        cleaned, changes = local_cleanup(article, opening, mode='natural')
+        self.assertNotIn(stale, cleaned['paragraphs'][0])
+        self.assertTrue(any(item['code'] == 'opening_hook' for item in changes))
+
     def test_two_cli_repairs_then_code_cleanup_no_third_request(self):
         with tempfile.TemporaryDirectory() as folder:
             workflow = BlogWorkflow(Mock(), Path(folder), Mock())
