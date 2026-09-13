@@ -301,6 +301,7 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
             encoding="utf-8"))
         self.assertEqual(checkpoint["response_name"], "stage-2-antigravity-safe-preserve")
         self.assertTrue(checkpoint["actual_route"]["preserved_previous"])
+        self.assertFalse(Path(result["run_dir"], "stage-2-antigravity-format-retry.prompt.txt").exists())
 
     def test_editorial_without_style_role_uses_last_successful_route(self):
         original = self.bridge.run_text

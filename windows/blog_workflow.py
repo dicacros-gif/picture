@@ -1866,6 +1866,26 @@ class BlogWorkflow:
         candidate.pop("local_validation_error", None)
         return candidate
 
+    @staticmethod
+    def _generated_local_validation_current(candidate, article):
+        index = candidate.get('paragraph_index')
+        if type(index) is not int or not 0 <= index < len(article.get('paragraphs', [])):
+            return False
+        context = _image_context_hash(article, index)
+        paragraph_hash = hashlib.sha256(article['paragraphs'][index].encode('utf-8')).hexdigest()
+        return (
+            candidate.get('approved') is True
+            and candidate.get('local_file_validated') is True
+            and candidate.get('local_validation_policy') == AI_IMAGE_VALIDATION_POLICY
+            and candidate.get('vision_reviewed') is False
+            and candidate.get('reviews') == []
+            and candidate.get('requires_final_semantic_review') is False
+            and candidate.get('image_context_sha256') == context
+            and candidate.get('reviewed_paragraph_sha256') == paragraph_hash
+            and bool(candidate.get('path'))
+            and Path(candidate['path']).is_file()
+        )
+
     def _google_captions(self, run_dir, article, models, stages):
         def valid(values):
             return (isinstance(values, list) and len(values) == 8 and all(isinstance(value, str)
@@ -2066,12 +2086,14 @@ class BlogWorkflow:
             if candidate.get('image_context_sha256') != context:
                 candidate.update(image_context_sha256=context, approved=False, reviews=[],
                                  vision_reviewed=False, requires_final_semantic_review=True)
-            try:
-                self._accept_generated_image_locally(candidate, article)
-                self.log(f"이미지 {index + 1}/8 · 해상도·파일·중복 로컬 검사 통과 · AI 이미지 CLI 검수 생략")
-            except WorkflowError as exc:
-                candidate.update(approved=False, local_file_validated=False,
-                                 local_validation_error=str(exc), rejection_reason=str(exc))
+            already_validated = self._generated_local_validation_current(candidate, article)
+            if not already_validated:
+                try:
+                    self._accept_generated_image_locally(candidate, article)
+                    self.log(f"이미지 {index + 1}/8 · 해상도·파일·중복 로컬 검사 통과 · AI 이미지 CLI 검수 생략")
+                except WorkflowError as exc:
+                    candidate.update(approved=False, local_file_validated=False,
+                                     local_validation_error=str(exc), rejection_reason=str(exc))
             # Store by index after background pumping to avoid holding references
             # into a list that the coordinator may replace.
             _set_image_candidate(manifest, index, candidate)
@@ -2378,6 +2400,12 @@ class BlogWorkflow:
                                 raise WorkflowFormatError(str(exc)) from exc
                         _validate_article(result, keywords, require_visual_style=True, require_overlay_question=True)
                     except WorkflowFormatError as format_error:
+                        if (role == "문체 다듬기" and article is not None
+                                and "문체 단계에서 제목·구역의 수치·날짜·단위가 변경되었습니다" in str(format_error)):
+                            # The outer recovery keeps the already fact-checked
+                            # article. A full format retry would resend a very
+                            # large draft only to reject the same number change.
+                            raise
                         # A formatting retry must not promote a known failed review
                         # to approval merely because the first schema check failed.
                         original_review = result.get("review") if isinstance(result, dict) else None
@@ -2667,12 +2695,13 @@ class BlogWorkflow:
                 while True:
                     self._check_cancelled()
                     if not candidate.get("error"):
-                        try:
-                            self._accept_generated_image_locally(candidate, article)
-                            self.log(f"이미지 {index + 1}/8 · 해상도·파일·중복 로컬 검사 통과 · AI 이미지 CLI 검수 생략")
-                        except WorkflowError as exc:
-                            candidate.update(approved=False, local_file_validated=False,
-                                             local_validation_error=str(exc), rejection_reason=str(exc))
+                        if not self._generated_local_validation_current(candidate, article):
+                            try:
+                                self._accept_generated_image_locally(candidate, article)
+                                self.log(f"이미지 {index + 1}/8 · 해상도·파일·중복 로컬 검사 통과 · AI 이미지 CLI 검수 생략")
+                            except WorkflowError as exc:
+                                candidate.update(approved=False, local_file_validated=False,
+                                                 local_validation_error=str(exc), rejection_reason=str(exc))
                     if candidate.get("approved") and image_retry_limit and any(_duplicate(candidate, prior) for prior in approved_images):
                         candidate.update(approved=False, rejection_reason="이미 검수한 이미지와 시각적으로 중복됩니다.")
                     _save_json(run_dir / "manifest.json", manifest)

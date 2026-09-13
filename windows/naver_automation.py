@@ -2848,11 +2848,21 @@ class NaverAutomation:
                     )
             upload = inputs[-1]
             upload.send_keys(path)
-            WebDriverWait(driver, 45).until(
-                lambda d, expected=before_images + index + 1: (
-                    self._image_component_count(d) >= expected
+            expected = before_images + index + 1
+            try:
+                # SmartEditor creates an optimistic image component before its
+                # upload has a server URL. Starting the next file at that point
+                # made later components disappear during document placement.
+                # Wait for a complete Naver image record for every file.
+                WebDriverWait(driver, 60).until(
+                    lambda d, count=expected: self._completed_image_upload_count(d) >= count
                 )
-            )
+            except TimeoutException as exc:
+                complete = self._completed_image_upload_count(driver)
+                raise RuntimeError(
+                    f"사진 {len(existing)}장 중 {max(0, complete - before_images)}장만 "
+                    "네이버 서버 업로드를 확인했습니다. 현재 글은 발행하지 않고 같은 원고로 다시 시도합니다."
+                ) from exc
 
         expected_count = before_images + len(existing)
         try:
@@ -2866,6 +2876,33 @@ class NaverAutomation:
                 "편집기에서 확인되어 임시저장을 중단했습니다."
             ) from exc
         self.log(f"오늘 캡처 사진 {len(existing)}개 첨부를 확인했습니다.")
+
+    @classmethod
+    def _completed_image_upload_count(cls, driver) -> int:
+        """Count server-backed images, excluding optimistic upload placeholders."""
+        try:
+            data = cls._read_article_document(driver)
+        except Exception:
+            return 0
+        count = 0
+        for item in data.get("document", {}).get("components", []):
+            if item.get("@ctype") != "image" or not item.get("id"):
+                continue
+            try:
+                source = urllib.parse.urlparse(str(item.get("src", "")))
+                ready = (
+                    source.scheme == "https"
+                    and source.hostname is not None
+                    and source.hostname.endswith("pstatic.net")
+                    and isinstance(item.get("path"), str)
+                    and item["path"].startswith("/")
+                    and type(item.get("fileSize")) is int
+                    and item["fileSize"] > 0
+                )
+            except (TypeError, ValueError):
+                ready = False
+            count += int(ready)
+        return count
 
     @classmethod
     def _focus_body_image_position(
@@ -3821,11 +3858,32 @@ class NaverAutomation:
         positions = [image["paragraph_index"] for image in images]
         arranged = self._arrange_article_document(current, paragraphs, image_ids, positions,
             bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style)
-        self._set_article_document(driver, arranged)
-        WebDriverWait(driver, 15).until(lambda d: self._verify_article_document(
-            self._read_article_document(d), paragraphs, image_ids, positions,
-            bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style,
-        ))
+        verified = False
+        for placement_attempt in range(2):
+            self._set_article_document(driver, arranged)
+            try:
+                WebDriverWait(driver, 20).until(lambda d: self._verify_article_document(
+                    self._read_article_document(d), paragraphs, image_ids, positions,
+                    bold_terms=bold_terms, bold_style=self._active_article_bold_style, visual_style=visual_style,
+                ))
+                verified = True
+                break
+            except TimeoutException as exc:
+                if placement_attempt == 0:
+                    self.log("네이버 문서 배치 반영이 늦어 서버 업로드가 끝난 같은 사진과 원고를 한 번 더 적용합니다.")
+                    time.sleep(1)
+                    continue
+                try:
+                    current = self._read_article_document(driver)
+                    current_images = sum(item.get("@ctype") == "image" for item in current.get("document", {}).get("components", []))
+                except Exception:
+                    current_images = 0
+                raise RuntimeError(
+                    f"네이버 문서 배치를 두 번 확인했지만 사진 {len(images)}장 중 {current_images}장만 유지되었습니다. "
+                    "현재 글은 발행하지 않고 준비된 같은 원고로 다음 시도에 이어갑니다."
+                ) from exc
+        if not verified:
+            raise RuntimeError("네이버 문서 배치를 확인하지 못했습니다.")
         return image_ids
 
     @classmethod

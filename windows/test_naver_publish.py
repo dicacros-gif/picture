@@ -239,6 +239,7 @@ class PublishTests(unittest.TestCase):
             upload.get_attribute.return_value = "multiple"
             upload.send_keys.side_effect = lambda _path: state.update(count=state["count"] + 1)
         self.app._image_component_count = MagicMock(side_effect=lambda _driver: state["count"])
+        self.app._completed_image_upload_count = MagicMock(side_effect=lambda _driver: state["count"])
         self.app._find_image_inputs = MagicMock(side_effect=[[upload] for upload in uploads])
 
         NaverAutomation._upload_blog_images(self.app, self.driver, paths)
@@ -247,6 +248,16 @@ class PublishTests(unittest.TestCase):
         for upload, path in zip(uploads, paths):
             upload.send_keys.assert_called_once_with(str(Path(path).resolve()))
             upload.get_attribute.assert_not_called()
+
+    def test_completed_upload_count_ignores_optimistic_placeholders(self):
+        ready = {"@ctype": "image", "id": "ready", "src": "https://blogfiles.pstatic.net/path/file.jpg",
+                 "path": "/path/file.jpg", "fileSize": 1234}
+        pending = {"@ctype": "image", "id": "pending", "src": "blob:https://blog.naver.com/value",
+                   "path": "", "fileSize": 0}
+        wrong_host = {**ready, "id": "wrong", "src": "https://example.com/file.jpg"}
+        with patch.object(NaverAutomation, "_read_article_document",
+                          return_value={"document": {"components": [ready, pending, wrong_host]}}):
+            self.assertEqual(NaverAutomation._completed_image_upload_count(self.driver), 1)
 
     def test_seventeenth_image_and_eleventh_google_reference_are_rejected(self):
         self._append_google_images(11)

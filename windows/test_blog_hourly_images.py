@@ -1,6 +1,7 @@
 """Exercise the actual coordinator's early finish without browser/CLI access."""
 import threading
 import unittest
+from unittest.mock import patch
 
 from blog_cli_bridge import BlogCliError
 from blog_deadline import CycleBudget
@@ -32,6 +33,13 @@ class HourlyImageTests(unittest.TestCase):
         self.assertTrue(all(image['local_file_validated'] for image in result['images']))
         self.assertEqual(sum(self.bridge.active.values()), 0)
         self.assertFalse(self.cancel.is_set())
+
+    def test_completed_local_images_are_not_revalidated_in_poll_loop(self):
+        original = self.workflow._accept_generated_image_locally
+        with patch.object(self.workflow, '_accept_generated_image_locally', wraps=original) as validate:
+            result = self.prepare(early_image_finish=True, budget=CycleBudget())
+        self.assertTrue(result['ready_to_publish'])
+        self.assertEqual(validate.call_count, 6)
 
     def test_image_review_timeout_is_two_minutes_and_writer_ten(self):
         observed = []

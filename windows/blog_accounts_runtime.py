@@ -403,11 +403,14 @@ class AccountWorker(BlogWorkflowControls):
                 except Exception as exc:
                     problem = access_error_from_exception(exc)
                     fatal = isinstance(exc, AccountConfigurationError) or problem is not None
+                    detail = str(exc).strip()
+                    if not detail or detail.rstrip() == 'Message:':
+                        detail = f'{type(exc).__name__}: {repr(exc)}'
                     record.update(status=('cancelled' if self.full_auto_stop.is_set() else 'access_required' if problem else
                                           'deadline' if isinstance(exc, CycleDeadlineExceeded) else
-                                          'review_required' if isinstance(exc, WorkflowReviewRequired) else 'failed'), error=str(exc))
-                    self._naver_log(f"계정 회차 {record['status']}: {exc}")
-                    self.events.put(('auto_error', str(exc)))
+                                          'review_required' if isinstance(exc, WorkflowReviewRequired) else 'failed'), error=detail)
+                    self._naver_log(f"계정 회차 {record['status']}: {detail}")
+                    self.events.put(('auto_error', detail))
                     if problem:
                         self.events.put(('cli_access_required', problem, False))
                 finally:

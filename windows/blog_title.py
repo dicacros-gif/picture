@@ -175,6 +175,16 @@ def fallback_intent_title(article, keywords):
     direct = re.sub(r'\s+', ' ', question).strip() + '?'
     if 45 <= len(direct) <= 70 and any(_has_keyword(direct, value) for value in related):
         return direct
+    current = _clean(article.get('title'))
+    if (30 <= len(current) < 45 and '?' in current and not any(mark in current for mark in ',;:#*<>')
+            and any(_has_keyword(current, value) for value in related)):
+        # Two bounded model repairs may still leave an otherwise useful title a
+        # few characters short. Extend it with a non-factual curiosity clause;
+        # never truncate a Korean word or invent a date, price, or condition.
+        extension = ' 놓치기 쉬운 조건은 무엇일까?'
+        candidate = current.rstrip() + extension
+        if 45 <= len(candidate) <= 70:
+            return candidate
     lead = re.match(r'^([가-힣A-Za-z0-9]+?)(?:은|는|이|가)?\s+', question)
     lead_term = _PARTICLE.sub('', lead.group(1)) if lead else ''
     for chosen in related:

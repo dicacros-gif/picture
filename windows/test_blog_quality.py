@@ -265,6 +265,20 @@ class EditorialTests(unittest.TestCase):
         self.assertIn('즉석밥 소비기한', result['title'])
         self.assertIn('title_intent_fallback', {item['code'] for item in changes})
 
+    def test_short_synthesized_title_gets_grounded_curiosity_extension(self):
+        article = valid_article()
+        article['title'] = '노트북 배터리 관리 방법은 무엇일까? 충전 설정과 교체 조건 확인법'
+        article['title_intent'] = {'question': '노트북 배터리 관리 방법과 충전 설정 및 교체 조건은 어떻게 확인해야 할까',
+                                   'related_keywords': KEYWORDS}
+        article['paragraphs'][-1] += '\n노트북 배터리 충전 설정과 교체 조건 뜻과 의미'
+        # Force the short-title branch while keeping an actual supplied term.
+        article['title'] = '노트북 배터리 관리 방법은 무엇일까? 충전 설정 확인법'
+        issues = [item for item in inspect_article(article, KEYWORDS, TOPIC, mode='natural')
+                  if item['code'] == 'title_synthesis']
+        result, _ = local_cleanup(article, issues, mode='natural')
+        self.assertTrue(45 <= len(result['title']) <= 70)
+        self.assertTrue(result['title'].endswith('무엇일까?'))
+
     def test_two_cli_repairs_then_code_cleanup_no_third_request(self):
         with tempfile.TemporaryDirectory() as folder:
             workflow = BlogWorkflow(Mock(), Path(folder), Mock())
