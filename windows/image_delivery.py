@@ -13,8 +13,8 @@ from pathlib import Path
 
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter, ImageChops
 
-COVER_RENDER_VERSION = "center-question-overlay-v5"
-CAPTION_RENDER_VERSION = "center-question-overlay-v2"
+COVER_RENDER_VERSION = "center-question-overlay-v6"
+CAPTION_RENDER_VERSION = "center-question-overlay-v3"
 # White keeps complete sentences readable. Fluorescent green and red mark
 # different hook words so both generated covers and Google captures have a
 # clear hierarchy on the translucent black panel.
@@ -111,10 +111,11 @@ def _line_layout(headline, drawing, font, maximum_width, maximum_height, counts=
 def _overlay_layout(pixels, headline, font_path):
     width, height = pixels.size
     drawing = ImageDraw.Draw(pixels)
-    start = max(24, round(min(width, height) * .14))
+    short = len(headline) <= 12
+    start = max(24, round(min(width, height) * (.17 if short else .14)))
     # Prefer a readable two-line phrase over three oversized lines that leave
     # an adverb ("지금", "언제") attached to the wrong meaning group.
-    counts = (2, 3) if len(headline.split()) >= 2 else (1,)
+    counts = ((1, 2) if short else (2, 3)) if len(headline.split()) >= 2 else (1,)
     for count in counts:
         minimum = max(20, round(min(width, height) * .085)) if count == 2 else 20
         for size in range(start, minimum - 1, -2):
@@ -177,8 +178,8 @@ def _draw_question_overlay(pixels, headline, font_path=None):
     panel_width, panel_height = min(width, text_width + margin * 2), min(height, text_height + margin * 2)
     panel_left, panel_top = (width - panel_width) / 2, (height - panel_height) / 2
     draw.rectangle((round(panel_left), round(panel_top), round(panel_left + panel_width), round(panel_top + panel_height)), fill=(0, 0, 0, 140))
-    shadow_x, shadow_y = max(3, round(font.size * .075)), max(5, round(font.size * .12))
-    stroke = max(2, round(font.size * .035))
+    shadow_x, shadow_y = max(3, round(font.size * .055)), max(7, round(font.size * .14))
+    stroke = max(2, round(font.size * .045))
     for index, line in enumerate(lines):
         bounds = draw.textbbox((0, 0), line, font=font)
         glyph_width, glyph_height = bounds[2] - bounds[0], bounds[3] - bounds[1]
@@ -186,18 +187,18 @@ def _draw_question_overlay(pixels, headline, font_path=None):
         y = (height - text_height) / 2 + index * (line_height + spacing) + (line_height - glyph_height) / 2 - bounds[1]
         draw.text((x + shadow_x, y + shadow_y), line, font=font, fill=(5, 9, 12, 255),
                   stroke_width=max(1, round(font.size * .018)), stroke_fill=(5, 9, 12, 255))
-        draw.text((x, y), line, font=font, fill=OVERLAY_TEXT_COLORS[0], stroke_width=stroke, stroke_fill=(20, 25, 30, 210))
+        draw.text((x, y), line, font=font, fill=OVERLAY_TEXT_COLORS[0], stroke_width=stroke, stroke_fill=(0, 0, 0, 245))
         for emphasis_index, word in enumerate(emphasis):
             for match in re.finditer(re.escape(word), line):
                 prefix_width = draw.textlength(line[:match.start()], font=font)
                 accent = OVERLAY_TEXT_COLORS[1 + emphasis_index % (len(OVERLAY_TEXT_COLORS) - 1)]
                 draw.text((x + prefix_width, y), word, font=font, fill=accent,
-                          stroke_width=stroke, stroke_fill=(20, 25, 30, 210))
+                          stroke_width=stroke, stroke_fill=(0, 0, 0, 245))
     return Image.alpha_composite(background.convert("RGBA"), overlay).convert("RGB"), {
         "text_color": OVERLAY_TEXT_COLORS[1], "text_colors": list(OVERLAY_TEXT_COLORS),
         "text_lines": lines, "emphasis_words": emphasis, "font": font_path.name,
         "blur_radius": radius, "panel_color": "#000000", "panel_opacity": 140 / 255,
-        "text_alignment": "center", "placement": "center"}
+        "typography_policy": "gothic-short-hook-v1", "text_alignment": "center", "placement": "center"}
 
 
 def _draw_caption(pixels: Image.Image, caption: str, font_path: str | Path | None = None) -> tuple[Image.Image, dict]:

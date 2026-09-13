@@ -5,10 +5,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image, ImageColor, ImageChops, ImageDraw, PngImagePlugin
-from image_delivery import COVER_RENDER_VERSION, OVERLAY_TEXT_COLORS, _draw_cover, clean_export
+from image_delivery import COVER_RENDER_VERSION, OVERLAY_TEXT_COLORS, _draw_cover, _draw_question_overlay, clean_export
 
 
 class ImageDeliveryTests(unittest.TestCase):
+    def test_short_hook_keeps_word_spacing_in_one_readable_line(self):
+        image, style = _draw_question_overlay(Image.new('RGB', (1024, 1024), 'gray'), '의외의 진실?')
+        self.assertEqual(style['text_lines'], ['의외의 진실?'])
+        self.assertEqual(image.size, (1024, 1024))
+        self.assertIn('#8CE88C', style['text_colors'])
+
     def test_png_metadata_removed_and_original_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory)/"generated.png", Path(directory)/"upload.jpg"
@@ -115,7 +121,7 @@ class ImageDeliveryTests(unittest.TestCase):
             cover = clean_export(source, Path(directory) / 'cover.jpg', headline='물가지표의 밤')
             plain = clean_export(source, Path(directory) / 'plain.jpg')
             self.assertEqual(cover['cover_render_version'], COVER_RENDER_VERSION)
-            self.assertEqual(COVER_RENDER_VERSION, 'center-question-overlay-v5')
+            self.assertEqual(COVER_RENDER_VERSION, 'center-question-overlay-v6')
             self.assertEqual(cover['cover_text_alignment'], 'center')
             self.assertEqual(cover['cover_panel_color'], '#000000')
             self.assertAlmostEqual(cover['cover_panel_opacity'], 140 / 255)

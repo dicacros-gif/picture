@@ -21,7 +21,7 @@ class ImageCaptionTests(unittest.TestCase):
         self.assertNotEqual(result.tobytes(), original)
         self.assertEqual(style["caption_text_colors"], ['#FFFFFF', '#8CE88C', '#FF4040'])
         self.assertEqual(style["caption_render_version"], CAPTION_RENDER_VERSION)
-        self.assertIn(len(style["caption_text_lines"]), (2, 3))
+        self.assertIn(len(style["caption_text_lines"]), (1, 2, 3))
         self.assertEqual(' '.join(style["caption_text_lines"]), "재고 언제 확인할까?")
 
     def test_export_metadata_identifies_center_caption_without_changing_source(self):

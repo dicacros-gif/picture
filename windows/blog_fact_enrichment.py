@@ -2,6 +2,7 @@
 import copy
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
@@ -42,7 +43,13 @@ def requests_for(article, today=None):
     # Leave room for the native bridge's shared permissions/material instructions.
     while claims and len(fact_instruction + json.dumps(claims, ensure_ascii=False)) > 3500:
         claims.pop()
-    fact_prompt = fact_instruction + json.dumps(claims, ensure_ascii=False)
+    claims = claims[:8]
+    context = '\n주제: ' + str(article.get('title', ''))[:160]
+    source_urls = [item.get('url', '') for item in article.get('sources', []) if isinstance(item, dict)]
+    context += '\n우선 확인할 기존 공개 자료(검증 사실로 간주하지 않음): ' + json.dumps(
+        [url for url in source_urls if isinstance(url, str) and url.startswith('https://')][:4], ensure_ascii=False)[:700]
+    context += '\n검색은 최대 2개 질의와 핵심 페이지 2개로 좁히고, 조사 70초 안에 마친 뒤 JSON을 반환한다.'
+    fact_prompt = fact_instruction + json.dumps(claims, ensure_ascii=False) + context
     sections = []
     for index, section in enumerate(article['paragraphs']):
         heading = next((line.strip('❝ ') for line in section.splitlines() if line.startswith('❝')), '')
@@ -58,7 +65,7 @@ def requests_for(article, today=None):
         'JSON만 반환: {"additions":[{"index":0,"text":"새 정보입니다.","changed_on":"YYYY-MM-DD",'
         '"source_urls":["https://..."]}],"sources":[{"title":"공식 자료 제목","url":"https://...",'
         '"verified":true,"is_primary":true,"supports":["확인한 사실"]}]}.\n'
-        + json.dumps(sections, ensure_ascii=False))
+        + json.dumps(sections, ensure_ascii=False) + context)
     return claims, {'facts': fact_prompt, 'additions': addition_prompt}
 
 
@@ -192,10 +199,15 @@ def run_enrichment(bridge, article, provider, model, backup_model, run_dir, stag
                    parse, canned_phrases=(), timeout=120, on_tick=None):
     claims, prompts = requests_for(article)
     responses, errors, completed_routes = {}, {}, {}
+    timings = {}
     def invoke(kind, route, selected_model):
         prompt = prompts[kind]
         (run_dir / f'{stage_name}-{kind}-{route}.prompt.txt').write_text(prompt, encoding='utf-8')
-        raw = bridge.run_text(route, prompt, model=selected_model, timeout=timeout, cancel_event=cancel)
+        started = time.monotonic()
+        try:
+            raw = bridge.run_text(route, prompt, model=selected_model, timeout=timeout, cancel_event=cancel)
+        finally:
+            timings[f'{route}:{kind}'] = round(time.monotonic() - started, 1)
         (run_dir / f'{stage_name}-{kind}-{route}.response.txt').write_text(raw, encoding='utf-8')
         parsed = parse(raw)
         key = 'checks' if kind == 'facts' else 'additions'
@@ -225,6 +237,11 @@ def run_enrichment(bridge, article, provider, model, backup_model, run_dir, stag
         pending = [kind for kind in pending if kind not in responses]
     result, report = apply_results(article, claims, responses, canned_phrases)
     report.update(completed=list(responses), failed=pending, errors=errors, completed_routes=completed_routes,
-                  prompt_lengths={key: len(value) for key, value in prompts.items()})
-    log(f"팩트 보강 완료 · 반영 {report['applied']}개 · 무시 {report['ignored']}개 · 실패 {len(pending)}개")
+                  prompt_lengths={key: len(value) for key, value in prompts.items()}, elapsed_seconds=timings,
+                  verified_sources=sum(len(valid_sources(value)) for value in responses.values()))
+    report['outcome'] = ('updated' if report['applied'] else 'unavailable' if not responses
+                         else 'partial' if pending else 'no_verified_change')
+    if not report['applied']:
+        log("팩트 보강 · 검증된 추가·수정 정보 없음 · 원고 유지" if responses else "팩트 보강 · 요청 실패로 원고 유지")
+    log(f"팩트 보강 응답 {len(responses)}개 · 근거 {report['verified_sources']}개 · 반영 {report['applied']}개 · 무시 {report['ignored']}개 · 실패 {len(pending)}개")
     return result, report

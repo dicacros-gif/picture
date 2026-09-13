@@ -91,6 +91,19 @@ class FactEnrichmentTests(unittest.TestCase):
         self.assertNotIn('30일', result['paragraphs'][0])
         self.assertTrue(tick.called)
 
+    def test_empty_response_is_not_reported_as_verified_enrichment(self):
+        logs = []
+        def run(provider, prompt, **kwargs):
+            return json.dumps({'checks': [], 'additions': [], 'sources': []})
+        with tempfile.TemporaryDirectory() as folder:
+            result, report = run_enrichment(SimpleNamespace(run_text=run), article(), 'chatgpt', '', '',
+                Path(folder), 'fact', threading.Event(), logs.append, json.loads)
+        self.assertEqual(report['outcome'], 'no_verified_change')
+        self.assertEqual(report['verified_sources'], 0)
+        self.assertEqual(len(report['elapsed_seconds']), 2)
+        self.assertEqual(result['paragraphs'], article()['paragraphs'])
+        self.assertTrue(any('검증된 추가·수정 정보 없음' in line for line in logs))
+
     def test_all_timeouts_keep_original_after_four_calls(self):
         run = Mock(side_effect=TimeoutError('timeout'))
         with tempfile.TemporaryDirectory() as folder:

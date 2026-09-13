@@ -2036,14 +2036,14 @@ class NaverAutomation:
         output_dir.mkdir(parents=True, exist_ok=True)
         search_options = {
             "tbm": "isch", "hl": "en" if english_only else "ko", "safe": "active", "tbs": "il:cl",
-            "q": keyword + (" site:commons.wikimedia.org" if reuse_only else "")
+            "q": keyword + (" site:commons.wikimedia.org" if reuse_only or english_only else "")
         }
         if english_only:
             search_options["lr"] = "lang_en"
         search_url = "https://www.google.com/search?" + urllib.parse.urlencode(search_options)
         # Current Google image results use unclassified dimg_* images inside
         # result cards. YQ4gaf now also occurs on tiny suggestion chips.
-        selector = "div[data-img-wrapper] img, div[data-preview-id] img, img.YQ4gaf, img.rg_i, div[data-ri] img"
+        selector = "div[data-img-wrapper] img, div[data-preview-id] img, img.YQ4gaf, img.rg_i, div[data-ri] img, img[id^='dimg_'], a[href*='imgres'] img"
         candidates: list[dict] = []
         candidate_started = None
         termination_reason = ""
@@ -2102,6 +2102,14 @@ class NaverAutomation:
                     if rect["width"] < 110 or rect.get("height", 0) < 80:
                         latest_rejections.append((rank, "thumbnail_too_small", {"width": rect["width"], "height": rect.get("height")}))
                         continue
+                    description = thumbnail.get_attribute("alt")
+                    if isinstance(description, str) and re.search(r"\b(infographic|watermarked|worksheet|presentation slide|word cloud)\b", description, re.I):
+                        latest_rejections.append((rank, "text_heavy_thumbnail", {}))
+                        continue
+                    if (english_only or reuse_only) and isinstance(description, str) and re.search(
+                            r"\b(istock|shutterstock|getty images|alamy|adobe stock|dreamstime)\b", description, re.I):
+                        latest_rejections.append((rank, "stock_thumbnail", {}))
+                        continue
                     element_id = thumbnail.get_attribute("id")
                     latest_photos.append((rank, thumbnail, element_id if isinstance(element_id, str) else ""))
                 except StaleElementReferenceException:
@@ -2120,10 +2128,22 @@ class NaverAutomation:
                 raise RuntimeError("사용자가 작업을 중지했습니다.")
             driver.get(search_url)
             try:
-                WebDriverWait(driver, 20, poll_frequency=.4).until(settled_photos)
+                WebDriverWait(driver, 8, poll_frequency=.4).until(settled_photos)
                 diagnostics["results_stabilized"] = True
             except TimeoutException:
                 diagnostics["results_stabilized"] = False
+                if not latest_photos and "/sorry/" not in driver.current_url:
+                    alternate = dict(search_options)
+                    alternate.pop("tbm", None)
+                    alternate["udm"] = "2"
+                    diagnostics["alternate_search_used"] = True
+                    self.log("Google 이미지 결과 형식을 바꿔 한 번 더 조회합니다.")
+                    driver.get("https://www.google.com/search?" + urllib.parse.urlencode(alternate))
+                    try:
+                        WebDriverWait(driver, 8, poll_frequency=.4).until(settled_photos)
+                        diagnostics["results_stabilized"] = True
+                    except TimeoutException:
+                        pass
             eligible_thumbnails = latest_photos
         except RuntimeError:
             finish("cancelled")
@@ -2222,7 +2242,7 @@ class NaverAutomation:
                             thumbnail = current[0]
                         stage = "preview"
                         driver.execute_script("arguments[0].scrollIntoView({block:'center'}); arguments[0].click();", thumbnail)
-                        preview, info = WebDriverWait(driver, 5, poll_frequency=.25).until(preview_ready)
+                        preview, info = WebDriverWait(driver, 3, poll_frequency=.25).until(preview_ready)
                         links = driver.execute_script("""
                             const links=[];
                             for (const start of arguments) {

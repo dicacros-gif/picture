@@ -1034,7 +1034,7 @@ class ReferenceLicenseTests(unittest.TestCase):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(driver.get.call_args.args[0]).query)
             self.assertEqual(query["hl"], ["en"])
             self.assertEqual(query["lr"], ["lang_en"])
-            self.assertEqual(query["q"], ["consumer price index"])
+            self.assertEqual(query["q"], ["consumer price index site:commons.wikimedia.org"])
 
     def test_file_specific_cc0_proof_sets_rights_and_no_required_attribution(self):
         result = self.evidence()
@@ -1312,7 +1312,7 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
             with patch("naver_automation.WebDriverWait", self.PollingWait):
                 self.assertEqual(app.capture_google_reference_candidates("wallet coins photograph", Path(folder)), [])
             self.assertEqual(state["clicks"], 0)
-            self.assertEqual(state["photo_polls"], 8)
+            self.assertEqual(state["photo_polls"], 16)
             app._inspect_reference_license.assert_not_called()
             record = json.loads((Path(folder) / "google_reference_diagnostics.json").read_text(encoding="utf-8"))
             self.assertEqual(record["status"], "no_results")

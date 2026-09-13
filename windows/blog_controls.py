@@ -439,8 +439,15 @@ class BlogWorkflowControls(UnattendedControls):
         settings = ttk.Frame(self.blog_tab, padding=9)
         settings.grid(row=0, column=0, sticky="ew")
         settings.columnconfigure(1, weight=1)
-        ttk.Label(settings, text="주제 입력어").grid(row=0, column=0, sticky="w")
-        ttk.Entry(settings, textvariable=self.topic).grid(row=0, column=1, columnspan=5, sticky="ew", padx=7)
+        topics = ttk.Frame(settings)
+        topics.grid(row=0, column=0, columnspan=7, sticky="ew")
+        topics.columnconfigure((1, 3), weight=1, uniform="account_topics")
+        self.account_topic_entries = []
+        for index, variable in enumerate((self.topic, self.secondary_topic)):
+            ttk.Label(topics, text=f"계정 {index + 1} 주제 입력어").grid(row=0, column=index * 2, sticky="w")
+            entry = ttk.Entry(topics, textvariable=variable)
+            entry.grid(row=0, column=index * 2 + 1, sticky="ew", padx=7)
+            self.account_topic_entries.append(entry)
         sequence = ttk.Frame(settings)
         sequence.grid(row=1, column=0, columnspan=7, sticky="ew", pady=6)
         ttk.Label(sequence, text="실행 단계").grid(row=0, column=0)

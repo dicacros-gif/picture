@@ -12,6 +12,20 @@ import test_blog_controls as support
 class LinkedUiTests(unittest.TestCase):
     make_app = support.BlogUiTests.make_app
 
+    def test_account_topics_are_separate_and_secondary_event_does_not_overwrite_primary(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = self.make_app(folder, {'topic': '첫 계정', 'secondary_topic': '다음 계정'})
+            self.assertEqual(len(app.account_topic_entries), 2)
+            self.assertEqual(app.topic.get(), '첫 계정')
+            self.assertEqual(app.secondary_topic.get(), '다음 계정')
+            app.events.put(('account_event', 'secondary', '에지', ('auto_topic', {}, '새 주제', [], {})))
+            app._poll()
+            self.assertEqual(app.topic.get(), '첫 계정')
+            self.assertEqual(app.secondary_topic.get(), '새 주제')
+            app._autosave_general_settings()
+            saved = json.loads((Path(folder) / 'settings.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['secondary_topic'], '새 주제')
+
     def test_comment_ids_browser_and_selection_persist_and_share_live_variables(self):
         with tempfile.TemporaryDirectory() as folder:
             app = self.make_app(folder, {'blog_id': 'first', 'writer_accounts': [

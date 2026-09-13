@@ -294,6 +294,10 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
                                      _IMAGE_REALISM_POLICY_BLOCK)
         text = _append_marked_policy(text, "[도입부·소제목·문장 리듬 규칙 · 2026-09-13]",
                                      _EDITORIAL_FLOW_POLICY_BLOCK)
+        typography_marker = "[썸네일 타이포그래피 · 2026-09-13]"
+        if typography_marker in default_prompt:
+            text = _append_marked_policy(text, typography_marker,
+                typography_marker + default_prompt.split(typography_marker, 1)[1].rstrip())
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)

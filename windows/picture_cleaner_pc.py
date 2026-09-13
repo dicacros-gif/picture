@@ -678,7 +678,8 @@ class PictureCleanerApp(BlogWorkflowControls):
         )
         loaded_history = load_json(AUTO_HISTORY_FILE, [])
         self.auto_history = loaded_history if isinstance(loaded_history, list) else []
-        self.topic = StringVar()
+        self.topic = StringVar(value=self.settings.get("topic", ""))
+        self.secondary_topic = StringVar(value=self.settings.get("secondary_topic", ""))
         self.image_slots = BooleanVar(value=True)
         self.phone_auto_images = BooleanVar(value=True)
         self.claude_cli_model = StringVar(
@@ -728,7 +729,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.root.after(300, lambda: self.run_realtime(startup=True))
 
     def _general_settings_snapshot(self):
-        names = ("folder", "today_only", "recycle", "claude_cli_model", "antigravity_cli_model",
+        names = ("topic", "secondary_topic", "folder", "today_only", "recycle", "claude_cli_model", "antigravity_cli_model",
                  "blog_id", "comment_days", "comment_interval", "neighbor_interval", "neighbor_max", "comment_browser",
                  "dark_mode", "blog_auto_images", "auto_use_claude", "auto_use_antigravity",
                  "auto_interval_hours", "auto_image_count")
@@ -2504,7 +2505,9 @@ class PictureCleanerApp(BlogWorkflowControls):
                 if kind == 'account_event':
                     _, account, label, inner = event
                     if account != 'primary':
-                        if inner[0] == 'cli_article':
+                        if inner[0] == 'auto_topic':
+                            self.secondary_topic.set(inner[2])
+                        elif inner[0] == 'cli_article':
                             self.account_articles = getattr(self, 'account_articles', {})
                             self.account_articles[account] = inner[1]
                         elif inner[0] == 'cli_topic_consumed':
