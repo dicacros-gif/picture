@@ -4,18 +4,22 @@ import random
 import re
 import unicodedata
 
-IMAGE_POLICY = "korean-camera-grain-cover-v2"
+IMAGE_POLICY = "korean-camera-grain-cover-v3"
+LOCAL_IMAGE_VALIDATION_POLICY = "local-file-cover-v1"
 PHOTO_DIRECTION = (
     "Create one original high-quality PHOTOREALISTIC editorial photograph, as if captured with a real camera. "
     "When people are present, depict fictional Korean adults in a believable contemporary Korean setting, "
     "with varied natural appearances and everyday clothing appropriate to the section. Never depict a real celebrity. "
-    "Use a medium-wide or wide environmental photograph taken from a few metres away. Keep people relatively small "
+    "Use a medium-wide or wide environmental photograph taken from several metres away. Keep people relatively small "
     "within the scene, preferably full body with ample surroundings, so their activity and environment tell the story. "
-    "No close-up faces, headshots, beauty portraits, selfie framing or faces filling the frame. "
-    "Use soft natural available light, realistic skin pores and fabric texture, restrained natural colors, "
-    "gentle highlight roll-off and subtle optical depth of field appropriate to a 35mm or 50mm lens. "
-    "Add noticeable fine organic 35mm film grain, visible in midtones at normal viewing size, "
+    "People must never look straight into the camera or pose front-on; show a three-quarter angle, side profile, "
+    "back view, or a candid activity. No close-up faces, headshots, beauty portraits, selfie framing or faces filling the frame. "
+    "Use directional natural window light or outdoor daylight, realistic skin pores and fabric texture, restrained natural colors, "
+    "gentle highlight roll-off and shallow optical depth of field appropriate to a real 35mm or 50mm lens. "
+    "Keep the subject recognizable while the foreground or background falls naturally out of focus with optical bokeh. "
+    "Add clearly visible but fine organic 35mm film grain at a moderate strength across midtones and shadows, "
     "with gentle optical halation around bright highlights; preserve crisp subject detail. "
+    "Include subtle real-camera optical imperfections: very slight barrel distortion, mild corner vignetting and restrained chromatic aberration. "
     "Retain small natural tonal irregularities, believable lens rendering and real material "
     "texture instead of the perfectly smooth surface of a synthetic image. "
     "Avoid heavy noise, coarse grain, dust, scratches, vintage damage, excessive blur, plastic skin, "

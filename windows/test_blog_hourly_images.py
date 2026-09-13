@@ -26,9 +26,10 @@ class HourlyImageTests(unittest.TestCase):
         result = self.prepare(early_image_finish=True, budget=CycleBudget())
         self.assertTrue(result['ready_to_publish'])
         self.assertEqual(len(result['images']), 6)
-        self.assertEqual(len([call for call in self.bridge.calls if call['images']]), 6)
+        self.assertEqual(len([call for call in self.bridge.calls if call['images']]), 0)
         self.assertEqual(result['images'][0]['paragraph_index'], 0)
         self.assertTrue(all(image['approved'] for image in result['images']))
+        self.assertTrue(all(image['local_file_validated'] for image in result['images']))
         self.assertEqual(sum(self.bridge.active.values()), 0)
         self.assertFalse(self.cancel.is_set())
 

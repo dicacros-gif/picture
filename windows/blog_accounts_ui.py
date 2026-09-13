@@ -44,7 +44,7 @@ class WriterAccountsControls:
         self.app = app
         self.rows = []
         self.frame = ttk.LabelFrame(parent, text='발행 브라우저 · 계정별 글쓰기 · 공통 30일 중복 방지', padding=5)
-        self.frame.grid(row=7, column=0, columnspan=7, sticky='ew', pady=(7, 0))
+        self.frame.grid(row=8, column=0, columnspan=7, sticky='ew', pady=(7, 0))
         current = normalized_writer_accounts(app.settings, app.blog_id.get())
         for index, row in enumerate(current):
             enabled = BooleanVar(value=row['enabled'])

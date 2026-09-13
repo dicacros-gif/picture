@@ -15,7 +15,7 @@ class WorkflowNumericImageIntegrationTests(unittest.TestCase):
     setUp = support.BlogWorkflowTests.setUp
     prepare = support.BlogWorkflowTests.prepare
 
-    def test_actual_cover_dimensions_and_classified_minor_quality_reach_publisher(self):
+    def test_actual_cover_dimensions_reach_publisher_without_cli_image_review(self):
         def classified(review, index):
             review.update(image_review_classification_schema())
             review.update(quality_score=70, issues=['약간의 구도 차이'],
@@ -25,37 +25,18 @@ class WorkflowNumericImageIntegrationTests(unittest.TestCase):
         self.bridge.image_callback = classified
         result = self.prepare()
         cover = result['images'][0]
-        review = cover['reviews'][0]
-        self.assertTrue(review['approved'])
-        self.assertTrue(review['square_1_to_1'])
-        self.assertFalse(review['eligibility']['raw_review']['square_1_to_1'])
-        self.assertTrue(review['eligibility']['relaxed_quality'])
-        call = next(call for call in self.bridge.calls if call['images'])
-        context = json.loads(call['prompt'].split('BEGIN_UNTRUSTED_IMAGE_CONTEXT_JSON\n')[1]
-                             .split('\nEND_UNTRUSTED_IMAGE_CONTEXT_JSON')[0])
-        self.assertEqual(context['decoded_image_size'], {'width': 800, 'height': 800, 'square_1_to_1': True})
+        self.assertEqual(cover['reviews'], [])
+        self.assertTrue(cover['local_file_validated'])
+        self.assertEqual((cover['width'], cover['height']), (800, 800))
+        self.assertFalse(any(call['images'] for call in self.bridge.calls))
         NaverAutomation._validate_publish_article(result)
 
-    def test_changed_review_policy_reuses_exhausted_cover_without_new_generation(self):
-        def reject_cover(review, index):
-            if index == 0:
-                review.update(approved=False, square_1_to_1=False, issues=['미리보기 비율 오판'])
-        self.bridge.image_callback = reject_cover
-        with patch.object(self.workflow, '_vision_plan_hash', return_value='old-review-policy'):
-            with self.assertRaisesRegex(WorkflowError, '첫 사진'):
-                self.prepare(image_retry_limit=2)
-        manifest_path = next((self.root / 'runs').glob('*/manifest.json'))
-        failed = json.loads(manifest_path.read_text(encoding='utf-8'))
-        self.assertEqual(failed['image_generation_attempts']['0'], 3)
-        original_generations = len(self.bridge.generations)
-        original_file = Path(failed['image_candidates'][0]['path']).read_bytes()
-        self.bridge.image_callback = None
-        resumed = self.workflow.resume(manifest_path.parent)
-        self.assertTrue(resumed['ready_to_publish'])
-        self.assertEqual(len(self.bridge.generations), original_generations)
-        self.assertEqual(resumed['image_generation_attempts']['0'], 3)
-        self.assertEqual(Path(resumed['images'][0]['path']).read_bytes(), original_file)
-        self.assertTrue(resumed['images'][0]['previous_vision_reviews'])
+    def test_changed_review_policy_does_not_affect_local_image_acceptance(self):
+        with patch.object(self.workflow, '_vision_plan_hash', return_value='unused-review-policy'):
+            result = self.prepare(image_retry_limit=2)
+        self.assertTrue(result['ready_to_publish'])
+        self.assertEqual(len(self.bridge.generations), 8)
+        self.assertTrue(all(item['local_file_validated'] for item in result['images']))
 
     def test_verified_cc_by_photo_keeps_credit_after_korean_caption(self):
         source = self.root / 'google.png'

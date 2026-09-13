@@ -79,13 +79,14 @@ class WorkflowRecoveryTests(unittest.TestCase):
         self.assertEqual(len(denied), 2)
         self.assertFalse(result["reviews"][1].get("reused", False))
 
-    def test_final_and_image_reviews_keep_distinct_models_on_same_provider(self):
+    def test_final_reviews_keep_distinct_models_while_ai_images_skip_cli_review(self):
         stages = [{"provider": "chatgpt", "model": "draft-model", "role": "작성"},
                   {"provider": "chatgpt", "model": "review-model", "role": "교차 검수"}]
         result = self.prepare(steps=["chatgpt", "chatgpt"], stage_configs=stages, review_mode=REVIEW_MODES[2])
         self.assertEqual([item["model"] for item in result["final_reviews"]], ["draft-model", "review-model"])
-        self.assertEqual([item["model"] for item in result["images"][0]["reviews"]], ["draft-model", "review-model"])
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 16)
+        self.assertEqual(result["images"][0]["reviews"], [])
+        self.assertTrue(result["images"][0]["local_file_validated"])
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 0)
 
     def test_failed_text_provider_is_not_reused_for_final_review(self):
         stages, denied = self.configured_recovery()
@@ -96,7 +97,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         self.assertEqual(result["final_reviews"][0]["model"], "writer")
         self.assertCountEqual([g["provider"] for g in self.bridge.generations], ["antigravity", "chatgpt"] * 4)
 
-    def test_only_rejected_image_is_regenerated_and_visually_checked_again(self):
+    def test_ai_visual_rejection_callback_is_skipped(self):
         seen = {}
         def review(result, index):
             seen[index] = seen.get(index, 0) + 1
@@ -105,11 +106,10 @@ class WorkflowRecoveryTests(unittest.TestCase):
         self.bridge.image_callback = review
         result = self.prepare(steps=["chatgpt"], image_retry_limit=2)
         self.assertTrue(result["ready_to_publish"])
-        self.assertEqual(len(self.bridge.generations), 9)
-        self.assertEqual(self.bridge.generations[-1]["provider"], "antigravity")
-        self.assertEqual(seen[2], 2)
-        self.assertTrue(all(count == 1 for index, count in seen.items() if index != 2))
-        self.assertEqual(result["image_generation_attempts"]["2"], 2)
+        self.assertEqual(len(self.bridge.generations), 8)
+        self.assertEqual(seen, {})
+        self.assertEqual(result["image_generation_attempts"]["2"], 1)
+        self.assertTrue(all(item["local_file_validated"] for item in result["images"]))
 
     def test_generation_failure_retries_only_that_file(self):
         self.bridge.missing_image_index = 1
@@ -152,7 +152,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         result = self.prepare(steps=["chatgpt"], google_candidates=self.google_candidates(10))
         self.assertEqual(len(result["images"]), 6)
         self.assertEqual(len(result["google_images"]), 10)
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 28)
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 20)
         for item in result["google_images"]:
             self.assertTrue(item["original_text_free"])
             self.assertTrue(item["source_reviews"][0]["text_free"])
@@ -177,7 +177,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         result = self.prepare(steps=["chatgpt"], google_candidates=self.google_candidates(1))
         self.assertEqual(result["google_images"], [])
         self.assertFalse(result["google_candidates"][0]["original_text_free"])
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 9)
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 1)
 
     def test_google_caption_ocr_mismatch_is_rejected(self):
         def review(result, index):
@@ -243,8 +243,9 @@ class WorkflowRecoveryTests(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertEqual(result["final_reviews"][0]["provider"], "chatgpt")
         self.assertEqual(result["final_reviews"][0]["requested_provider"], "antigravity")
-        # Successful image reading remains available despite later text auth failure.
-        self.assertTrue(all(item["reviews"][0]["provider"] == "antigravity" for item in result["images"]))
+        # Generated images remain available without any CLI visual-review dependency.
+        self.assertTrue(all(item["local_file_validated"] for item in result["images"]))
+        self.assertTrue(all(item["reviews"] == [] for item in result["images"]))
 
     def test_english_photo_search_uses_configured_model_and_preserves_korean_copy(self):
         original_copy = json.loads(json.dumps(self.bridge.article))

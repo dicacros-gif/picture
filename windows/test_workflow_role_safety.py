@@ -321,7 +321,7 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         self.assertEqual(len(denied), 1)
         self.assertEqual(repair_routes, [("chatgpt", "writer"), ("chatgpt", "writer")])
 
-    def test_changed_vision_model_rechecks_existing_files_without_regeneration(self):
+    def test_changed_model_reuses_locally_validated_images_without_regeneration(self):
         original = self.bridge.run_text
         blocked = True
         def run(provider, prompt, **kwargs):
@@ -342,9 +342,8 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         self.assertTrue(result["ready_to_publish"])
         self.assertEqual(len(self.bridge.generations), 8)
         visual = [call for call in self.bridge.calls if call["images"]]
-        self.assertEqual(len(visual), 8)
-        self.assertTrue(all(call["model"] == "new-model" for call in visual))
-        self.assertTrue(all(item["previous_vision_reviews"] for item in result["image_candidates"]))
+        self.assertEqual(visual, [])
+        self.assertTrue(all(item["local_file_validated"] for item in result["image_candidates"]))
 
 
 if __name__ == "__main__":

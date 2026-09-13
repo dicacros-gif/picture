@@ -94,6 +94,23 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertIn("제일 먼저 답하면", text)
         self.assertIn("직접 작성한 앞 지침", text)
 
+    def test_marked_prompt_receives_canned_phrase_and_real_photo_policies_once(self):
+        marked = ("직접 작성한 앞 지침\n\n[제목 통합 작성 규칙 · 2026-09-13 v2]\n"
+                  "45~68자 제목\n\n[이미지 문구 최신 규칙 · 2026-09-13]\n이미지 지침")
+        value = {"prompts": [{"id": "saved", "name": "저장값", "text": marked}],
+                 "selected_prompt_id": "saved"}
+        first = normalize_preferences(value, "기본")
+        second = normalize_preferences(first, "기본")
+        text = second["prompts"][0]["text"]
+        self.assertEqual(text.count("[상투적 연결 표현 금지 · 2026-09-13]"), 1)
+        self.assertEqual(text.count("[실사 이미지 질감 규칙 · 2026-09-13 v2]"), 1)
+        for phrase in ("앞에서 본 핵심은", "그래서", "앞 구역의 답은 명확했어요", "그 다음에",
+                       "이 흐름이 가능했던 배경은", "많은 분들이"):
+            self.assertIn(phrase, text)
+        self.assertIn("정면 응시", text)
+        self.assertIn("광학 왜곡", text)
+        self.assertIn("Google 캡처만", text)
+
     def test_next_cycle_uses_new_settings_and_recalculates_changed_wait(self):
         for first_hours, changed_hours in ((6, 1), (1, 6)):
             with self.subTest(first_hours=first_hours, changed_hours=changed_hours):

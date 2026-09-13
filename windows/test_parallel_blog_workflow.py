@@ -74,7 +74,8 @@ class ParallelWorkflowTests(unittest.TestCase):
         self.assertEqual(set(writers), {owner})
         self.assertEqual(result['image_generation_attempts'], {str(i): 1 for i in range(8)})
         self.assertEqual(sorted(call['index'] for call in self.bridge.generations), list(range(8)))
-        self.assertEqual(len([call for call in self.bridge.calls if call['images']]), 8)
+        self.assertEqual(len([call for call in self.bridge.calls if call['images']]), 0)
+        self.assertTrue(all(item['local_file_validated'] for item in result['images']))
 
     def test_out_of_order_completion_is_checkpointed_before_slow_cover_finishes(self):
         second_saved = threading.Event()
@@ -123,7 +124,7 @@ class ParallelWorkflowTests(unittest.TestCase):
         time.sleep(.08)
         self.assertEqual(path.read_bytes(), before)
 
-    def test_validated_draft_prefetch_overlaps_later_writing_and_gets_final_semantic_review(self):
+    def test_validated_draft_prefetch_overlaps_later_writing_and_gets_local_context_check(self):
         writing = threading.Event()
         overlap = threading.Event()
         call = self.bridge.run_text
@@ -152,7 +153,8 @@ class ParallelWorkflowTests(unittest.TestCase):
         self.assertFalse(changed['requires_final_semantic_review'])
         self.assertEqual(changed['reviewed_paragraph_sha256'], hashlib.sha256(result['paragraphs'][2].encode()).hexdigest())
         contexts = [entry['prompt'] for entry in self.bridge.calls if entry['images']]
-        self.assertTrue(any(marker in prompt for prompt in contexts))
+        self.assertEqual(contexts, [])
+        self.assertTrue(changed['local_file_validated'])
         request = json.loads((Path(result['run_dir']) / 'request.json').read_text(encoding='utf-8'))
         self.assertNotIn('budget', request)
         self.assertNotIn('resolve_google_candidates', request)
@@ -194,8 +196,8 @@ class ParallelWorkflowTests(unittest.TestCase):
         self.assertEqual(cover['cover_headline'], result['cover_headline'])
         self.assertTrue(cover['approved'])
         cover_reviews = [call for call in self.bridge.calls if call['images'] and 'image-1-antigravity' in str(call['images'][0])]
-        self.assertEqual(len(cover_reviews), 1)
-        self.assertIn(result['cover_headline'], cover_reviews[0]['prompt'])
+        self.assertEqual(cover_reviews, [])
+        self.assertTrue(cover['local_file_validated'])
 
     def test_resume_keeps_final_vision_approvals_for_unchanged_prefetched_images(self):
         original = self.bridge.run_text

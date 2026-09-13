@@ -24,8 +24,9 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable
-from blog_visual_style import (IMAGE_POLICY, BODY_TEXT_COLOR, line_style_runs, cover_headline,
-                               quote_parts, choose_visual_style, supplement_bold_phrases)
+from blog_visual_style import (IMAGE_POLICY, LOCAL_IMAGE_VALIDATION_POLICY, BODY_TEXT_COLOR,
+                               line_style_runs, cover_headline, quote_parts, choose_visual_style,
+                               supplement_bold_phrases)
 from image_delivery import COVER_RENDER_VERSION, CAPTION_RENDER_VERSION, OVERLAY_TEXT_COLORS
 
 import requests
@@ -3438,10 +3439,26 @@ class NaverAutomation:
                                      and item.get("attribution_required") is False)):
                     raise ValueError("참고 이미지에는 CC0·공개 도메인 또는 출처 표시를 갖춘 CC BY 라이선스 확인이 필요합니다.")
             reviews = item.get("reviews")
-            if item.get("approved") is not True or not isinstance(reviews, list) or not reviews or any(
-                not isinstance(review, dict) or review.get("approved") is not True for review in reviews
-            ):
-                raise ValueError("모든 발행 이미지에는 통과한 CLI 시각 검수 기록이 필요합니다.")
+            if item.get("approved") is not True:
+                raise ValueError("승인되지 않은 이미지는 발행할 수 없습니다.")
+            if item.get("provider") == "google":
+                if (not isinstance(reviews, list) or not reviews or any(
+                        not isinstance(review, dict) or review.get("approved") is not True for review in reviews)):
+                    raise ValueError("Google 캡처에는 통과한 CLI 시각 검수 기록이 필요합니다.")
+                source_reviews = item.get("source_reviews")
+                if source_reviews is not None and (not isinstance(source_reviews, list) or not source_reviews or any(
+                        not isinstance(review, dict) or review.get("approved") is not True
+                        or review.get("text_free") is not True for review in source_reviews)):
+                    raise ValueError("Google 원사진의 글자·로고·워터마크 검수 기록이 필요합니다.")
+            else:
+                local_ok = (item.get("local_file_validated") is True
+                    and item.get("local_validation_policy") == LOCAL_IMAGE_VALIDATION_POLICY
+                    and item.get("vision_reviewed") is False and reviews == []
+                    and item.get("metadata_stripped") is True)
+                legacy_visual_ok = (isinstance(reviews, list) and bool(reviews) and all(
+                    isinstance(review, dict) and review.get("approved") is True for review in reviews))
+                if not (local_ok or legacy_visual_ok):
+                    raise ValueError("AI 생성 이미지의 로컬 검사 또는 이전 버전 CLI 시각 검수 기록이 필요합니다.")
             if item.get("provider") == "google" and (item.get("caption_text") or item.get("caption_applied")):
                 caption = item.get("caption_text")
                 legacy_band = (isinstance(caption, str) and len(caption) <= 10
@@ -3487,7 +3504,7 @@ class NaverAutomation:
             for index, item in enumerate(checked):
                 if item.get("provider") != "google" and item.get("image_policy") != IMAGE_POLICY:
                     raise ValueError("새 이미지 생성 규칙과 다른 사진이 포함되어 있습니다.")
-                for review in item["reviews"]:
+                for review in item["reviews"] if item.get("provider") == "google" else []:
                     if index == 0:
                         if (any(review.get(key) is not True for key in ("cover_text_exact", "cover_text_legible", "no_other_text",
                                 "square_1_to_1", "no_human_face", "bold_gothic", "text_shadow_visible", "approved_text_color"))

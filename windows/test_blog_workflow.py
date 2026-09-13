@@ -11,6 +11,7 @@ from PIL import Image
 
 from blog_workflow import BlogWorkflow, DEFAULT_STEPS, REVIEW_MODES, WorkflowError, _fingerprint, rank_topics
 from blog_visual_style import IMAGE_POLICY, cover_headline
+from image_delivery import COVER_RENDER_VERSION, OVERLAY_TEXT_COLORS
 
 
 TOPIC = "노트북 배터리 관리"
@@ -105,7 +106,8 @@ class FakeBridge:
 
     def generate_image(self, provider, prompt, output_dir, model="", timeout=600, cancel_event=None):
         index = len(self.generations)
-        self.generations.append({"provider": provider, "prompt": prompt, "model": model})
+        slot = int(Path(output_dir).name.split("-")[1]) - 1
+        self.generations.append({"provider": provider, "prompt": prompt, "model": model, "index": slot})
         path = Path(output_dir) / f"generated-{index}.png"
         if index != self.missing_image_index:
             make_image(path, 7 if self.duplicate_images else index + 21)
@@ -129,9 +131,18 @@ class BlogWorkflowTests(unittest.TestCase):
             with Image.open(source) as picture:
                 width, height = picture.size
                 picture.convert("RGB").save(destination, format="JPEG", quality=95)
+            parent = Path(source).parent.name
+            slot = int(parent.split("-")[1]) - 1 if parent.startswith("image-") else None
             return {"path": str(destination), "original_path": str(source), "width": width, "height": height,
-                    "metadata_stripped": True, "delivery_format": "JPEG", "image_style": "photorealistic",
+                    "metadata_stripped": slot not in self.bridge.bad_image_indices,
+                    "delivery_format": "JPEG", "image_style": "photorealistic",
                     "cover_headline": headline, "cover_text_applied": bool(headline),
+                    "cover_render_version": COVER_RENDER_VERSION if headline else "",
+                    "cover_text_alignment": "center" if headline else "",
+                    "cover_placement": "center" if headline else "",
+                    "cover_panel_color": "#000000" if headline else "",
+                    "cover_panel_opacity": 140 / 255 if headline else 0,
+                    "cover_text_colors": list(OVERLAY_TEXT_COLORS) if headline else [],
                     "caption_text": caption, "caption_applied": bool(caption), "caption_placement": "top" if caption else "",
                     "caption_band_height": 80 if caption else 0, "caption_layout": "separate_band" if caption else "",
                     "cover_text_color": "#8CE88C" if headline else "", "cover_aspect_ratio": "1:1" if headline else ""}
@@ -198,11 +209,14 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["images"]), 6)
         self.assertEqual(len(result["image_candidates"]), 8)
         self.assertEqual([g["provider"] for g in self.bridge.generations], ["antigravity", "chatgpt"] * 4)
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 8)
-        self.assertEqual([image["paragraph_index"] for image in result["images"]], [0, 3, 4, 5, 6, 7])
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 0)
+        self.assertEqual([image["paragraph_index"] for image in result["images"]], [0, 1, 2, 3, 4, 5])
         for image in result["images"]:
             self.assertNotEqual(image["sha256"], "not-trusted")
             self.assertTrue(image["approved"])
+            self.assertTrue(image["local_file_validated"])
+            self.assertFalse(image["vision_reviewed"])
+            self.assertEqual(image["reviews"], [])
         self.assertTrue(Path(result["run_dir"], "stage-4-chatgpt.response.txt").is_file())
         self.assertTrue(Path(result["run_dir"], "article.txt").is_file())
 
@@ -212,17 +226,18 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual([call["provider"] for call in self.bridge.calls if not call["images"]], ["claude"])
         self.assertTrue(all(call["provider"] == "claude" for call in self.bridge.calls if call["images"]))
 
-    def test_all_selected_reviewers_inspect_every_actual_image(self):
+    def test_ai_images_skip_all_cli_visual_review_modes(self):
         result = self.prepare(review_mode=REVIEW_MODES[2])
         visual = [call for call in self.bridge.calls if call["images"]]
-        self.assertEqual(len(visual), 24)
-        self.assertEqual([call["provider"] for call in visual[:3]], ["chatgpt", "claude", "antigravity"])
-        self.assertEqual(len(result["images"][0]["reviews"]), 3)
+        self.assertEqual(visual, [])
+        self.assertTrue(all(item["local_file_validated"] for item in result["images"]))
+        self.assertTrue(all(item["reviews"] == [] for item in result["images"]))
         self.assertEqual([review["provider"] for review in result["final_reviews"]], ["chatgpt", "claude", "antigravity"])
 
     def test_last_reviewer_mode_honors_final_selected_cli(self):
-        self.prepare(steps=["chatgpt", "antigravity"], review_mode=REVIEW_MODES[1])
-        self.assertEqual({call["provider"] for call in self.bridge.calls if call["images"]}, {"antigravity"})
+        result = self.prepare(steps=["chatgpt", "antigravity"], review_mode=REVIEW_MODES[1])
+        self.assertFalse(any(call["images"] for call in self.bridge.calls))
+        self.assertEqual(result["final_reviews"][0]["provider"], "antigravity")
 
     def test_two_bad_images_are_discarded_and_six_valid_selected(self):
         self.bridge.bad_image_indices = {1, 7}
@@ -290,7 +305,7 @@ class BlogWorkflowTests(unittest.TestCase):
         result = self.prepare(google_candidates=[{"path": "unlicensed.png", "license_verified": False}])
         self.assertEqual(result["google_images"], [])
         self.assertIn("라이선스", result["google_candidates"][0]["rejection_reason"])
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 8)
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 0)
 
     def test_cc0_google_image_is_visually_reviewed_without_public_sources(self):
         source = self.root / "google.png"
@@ -304,7 +319,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(len(result["google_images"]), 1)
         self.assertEqual(result["attributions"], [])
         self.assertTrue(result["google_images"][0]["approved"])
-        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 10)
+        self.assertEqual(len([call for call in self.bridge.calls if call["images"]]), 2)
         self.assertTrue(result["google_images"][0]["original_text_free"])
         self.assertTrue(result["google_images"][0]["caption_applied"])
         self.assertNotIn("https://", result["text"])
@@ -319,10 +334,11 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(result["google_images"], [])
         self.assertIn("표시 의무 없는", result["google_candidates"][0]["rejection_reason"])
 
-    def test_malformed_quality_score_is_rejected_instead_of_crashing(self):
+    def test_ai_image_review_callback_is_not_used_for_quality_score(self):
         self.bridge.image_callback = lambda review, index: review.pop("quality_score", None)
-        manifest = self.assert_blocked("첫 사진")
-        self.assertEqual(manifest["image_candidates"][0]["quality_score"], 0)
+        manifest = self.prepare()
+        self.assertEqual(manifest["image_candidates"][0]["quality_score"], 100)
+        self.assertFalse(any(call["images"] for call in self.bridge.calls))
 
     def test_structural_error_retries_current_provider_once_then_continues(self):
         def malformed_first(article, stage):
@@ -352,9 +368,11 @@ class BlogWorkflowTests(unittest.TestCase):
         self.bridge.article["paragraphs"][-1] = self.bridge.article["paragraphs"][-1].replace("#", "")
         self.assert_blocked("해시태그")
 
-    def test_illustrated_images_fail_photorealistic_gate(self):
+    def test_ai_visual_callback_cannot_delay_generated_images(self):
         self.bridge.image_callback = lambda review, index: review.update({"photorealistic": False})
-        self.assert_blocked("첫 사진")
+        result = self.prepare()
+        self.assertTrue(result["ready_to_publish"])
+        self.assertFalse(any(call["images"] for call in self.bridge.calls))
 
     def test_failed_cover_cannot_be_replaced_by_a_text_free_photo(self):
         self.bridge.bad_image_indices = {0}
@@ -378,19 +396,24 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assert_blocked('정확히 하나')
         self.assertFalse(self.bridge.generations)
 
-    def test_cover_ocr_mismatch_blocks_even_when_cli_claims_approval(self):
+    def test_cover_uses_exact_app_rendered_headline_without_cli_ocr(self):
         def mismatch(review, index):
             if index == 0:
                 review['detected_text'] = '다른 키워드 무엇부터 확인할까요?'
         self.bridge.image_callback = mismatch
-        self.assert_blocked('첫 사진')
+        result = self.prepare()
+        self.assertEqual(result['images'][0]['cover_headline'], self.bridge.article['cover_headline'])
+        self.assertTrue(result['images'][0]['local_file_validated'])
+        self.assertFalse(any(call['images'] for call in self.bridge.calls))
 
     def test_camera_korean_grain_prompts_and_cover_metadata(self):
         result = self.prepare()
         self.assertEqual(result['image_policy'], IMAGE_POLICY)
         for item in self.bridge.generations:
             self.assertIn('fictional Korean adults', item['prompt'])
-            self.assertIn('noticeable fine organic 35mm film grain', item['prompt'])
+            self.assertIn('clearly visible but fine organic 35mm film grain', item['prompt'])
+            self.assertIn('must never look straight into the camera', item['prompt'])
+            self.assertIn('very slight barrel distortion', item['prompt'])
             self.assertIn('Avoid heavy noise', item['prompt'])
         self.assertIn('central area calm and uncluttered', self.bridge.generations[0]['prompt'])
         self.assertIn('1:1 square', self.bridge.generations[0]['prompt'])
@@ -403,6 +426,14 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertTrue(all(not item['cover_text_applied'] for item in result['images'][1:]))
         saved=json.loads(Path(result['run_dir'],'manifest.json').read_text(encoding='utf-8'))
         self.assertEqual(saved['visual_style'],result['visual_style'])
+
+    def test_article_prompt_bans_canned_transitions_and_requires_real_camera_texture(self):
+        prompt = BlogWorkflow._article_prompt(TOPIC, KEYWORDS, "사용자 지침", editorial_mode="natural")
+        for phrase in ("앞에서 본 핵심은", "그래서", "앞 구역의 답은 명확했어요", "그 다음에",
+                       "이 흐름이 가능했던 배경은", "많은 분들이"):
+            self.assertIn(phrase, prompt)
+        for phrase in ("정면 응시", "아웃포커싱", "35mm 필름 그레인", "렌즈 왜곡", "비네팅", "색수차"):
+            self.assertIn(phrase, prompt)
 
     def test_semantic_selection_cannot_invent_related_keywords(self):
         self.bridge.raw_response = json.dumps({"selected": True, "topic": TOPIC, "keywords": ["다른 주제"],
@@ -455,7 +486,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assert_blocked("permission")
         self.assertEqual(len(calls), 1)
 
-    def test_provisional_images_are_reused_but_visually_reviewed_against_final_text(self):
+    def test_provisional_images_are_reused_and_locally_checked_against_final_text(self):
         call = self.bridge.run_text
         def failed_stage(provider, prompt, **kwargs):
             if provider == "antigravity" and not kwargs.get("images"):
@@ -474,15 +505,23 @@ class BlogWorkflowTests(unittest.TestCase):
             seeds.append({"provider": provider, "paragraph_index": index, "path": str(path), "status": "generated",
                           "metadata_stripped": True, "approved": False, "image_policy": IMAGE_POLICY,
                           "cover_headline": self.bridge.article['cover_headline'] if index == 0 else "",
-                          "cover_text_applied": index == 0, **_fingerprint(path)})
+                          "cover_text_applied": index == 0,
+                          "cover_render_version": COVER_RENDER_VERSION if index == 0 else "",
+                          "cover_text_alignment": "center" if index == 0 else "",
+                          "cover_placement": "center" if index == 0 else "",
+                          "cover_panel_color": "#000000" if index == 0 else "",
+                          "cover_text_color": "#8CE88C" if index == 0 else "",
+                          "cover_text_colors": list(OVERLAY_TEXT_COLORS) if index == 0 else [],
+                          **_fingerprint(path)})
         (run / "provisional-images.json").write_text(json.dumps({"candidates": seeds}), encoding="utf-8")
         self.bridge.run_text = call
         result = self.workflow.resume(run)
         self.assertEqual(len(result["images"]), 6)
         self.assertFalse(self.bridge.generations)
         visual_calls = [entry for entry in self.bridge.calls if entry["images"]]
-        self.assertEqual(len(visual_calls), 8)
-        self.assertTrue(all(image["vision_reviewed"] for image in result["images"]))
+        self.assertEqual(len(visual_calls), 0)
+        self.assertTrue(all(image["local_file_validated"] for image in result["images"]))
+        self.assertTrue(all(not image["vision_reviewed"] for image in result["images"]))
 
     def test_resume_reviews_corrected_failed_revision_without_restoring_removed_claims(self):
         marker = "확인되지 않은 이전 설명은 삭제하고 현재 남은 내용만 정리했어요."

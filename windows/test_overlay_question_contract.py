@@ -99,19 +99,17 @@ class OverlayQuestionWorkflowTests(unittest.TestCase):
         self.assertEqual(result['cover_headline'], '쉬는날판도')
         self.assertEqual(checkpoint.read_bytes(), before)
         self.assertEqual(len([call for call in self.bridge.calls if not call['images']]), original_calls)
-        image_prompts = [call['prompt'] for call in self.bridge.calls if call['images']]
-        self.assertTrue(any('물음표 없는 기존 승인 문구' in prompt for prompt in image_prompts))
+        image_prompts = [call['prompt'] for call in self.bridge.generations]
+        self.assertFalse(any('쉬는날판도' in prompt for prompt in image_prompts))
 
-    def test_image_review_checks_real_question_grammar_and_can_reject_it(self):
+    def test_app_validated_question_does_not_wait_for_cli_image_review(self):
         def reject(review, index):
             if index == 0:
                 review.update(approved=False, issues=['문구의 한국어 문법이 자연스럽지 않습니다.'])
         self.bridge.image_callback = reject
-        with self.assertRaisesRegex(workflow.WorkflowError, '첫 사진'):
-            self.prepare(steps=['chatgpt'])
-        prompt = next(call['prompt'] for call in self.bridge.calls if call['images'])
-        self.assertIn('자연스러운 한국어 어절·띄어쓰기·문법', prompt)
-        self.assertIn('approved=false와 blocking_issues', prompt)
+        result = self.prepare(steps=['chatgpt'])
+        self.assertTrue(result['images'][0]['local_file_validated'])
+        self.assertEqual([call for call in self.bridge.calls if call['images']], [])
 
 
 if __name__ == '__main__':

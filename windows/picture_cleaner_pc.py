@@ -1051,6 +1051,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             "global_progress_log",
             "cli_log",
             "cli_blocked_terms",
+            "cli_canned_phrases",
         )]
         progress = getattr(self, "progress_panel", None)
         if progress:

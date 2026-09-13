@@ -16,8 +16,9 @@ from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from blog_cli_bridge import BlogCliBridge
-from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, STAGE_ROLES, normalize_preferences,
-                              store_prompt, normalize_blocked_terms, blocked_term_hits, atomic_json_write, save_settings_json)
+from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, DEFAULT_CANNED_PHRASES,
+                              STAGE_ROLES, normalize_preferences, store_prompt, normalize_blocked_terms,
+                              normalize_canned_phrases, blocked_term_hits, atomic_json_write, save_settings_json)
 from blog_workflow import (BlogWorkflow, REVIEW_MODES, WorkflowError, WorkflowReviewRequired,
                            _related_to_topic, _text_review_schema_valid)
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
@@ -493,8 +494,18 @@ class BlogWorkflowControls(UnattendedControls):
         duplicate_titles.pack(side="left")
         duplicate_keywords.bind("<FocusOut>", self._save_cli_selection)
         duplicate_titles.bind("<FocusOut>", self._save_cli_selection)
+        canned = ttk.Frame(settings)
+        canned.grid(row=6, column=0, columnspan=7, sticky="ew", pady=(6, 0))
+        ttk.Label(canned, text="상투 표현 금지어\n쉼표 또는 줄바꿈").pack(side="left", padx=(0, 8))
+        self.cli_canned_phrases = ScrolledText(canned, height=2, wrap="word", font=("맑은 고딕", 9))
+        self.cli_canned_phrases.pack(side="left", fill="x", expand=True)
+        self.cli_canned_phrases.insert("1.0", ", ".join(self.cli_preferences["canned_phrases"]))
+        self.cli_canned_phrases.bind("<FocusOut>", self._save_cli_selection)
+        self.cli_canned_phrases.bind("<KeyRelease>", self._schedule_prompt_save)
+        ttk.Button(canned, text="금지어 저장", command=self._save_cli_selection).pack(side="left", padx=5)
+        ttk.Button(canned, text="기본값 복원", command=self._restore_canned_phrases).pack(side="left")
         policy_row = ttk.Frame(settings)
-        policy_row.grid(row=6, column=0, columnspan=7, sticky="ew", pady=(6, 0))
+        policy_row.grid(row=7, column=0, columnspan=7, sticky="ew", pady=(6, 0))
         ttk.Label(policy_row, text="글 구성").pack(side="left")
         for variable, values, width in ((self.cli_editorial_mode, ["자연스러운 구성", "구역별 분량·밀도"], 19),
                                        (self.cli_image_retries, ["1", "2", "3"], 3),
@@ -581,6 +592,7 @@ class BlogWorkflowControls(UnattendedControls):
             editorial_mode="natural" if self.cli_editorial_mode.get() == "자연스러운 구성" else "strict",
             auto_start_on_launch=self.auto_start_on_launch.get(),
             blocked_terms=normalize_blocked_terms(self.cli_blocked_terms.get("1.0", "end")),
+            canned_phrases=normalize_canned_phrases(self.cli_canned_phrases.get("1.0", "end")),
             duplicate_keyword_threshold=threshold(self.cli_duplicate_keywords, "duplicate_keyword_threshold", .4),
             duplicate_title_threshold=threshold(self.cli_duplicate_titles, "duplicate_title_threshold", .5),
         )
@@ -600,6 +612,11 @@ class BlogWorkflowControls(UnattendedControls):
     def _restore_blocked_terms(self):
         self.cli_blocked_terms.delete("1.0", "end")
         self.cli_blocked_terms.insert("1.0", ", ".join(DEFAULT_BLOCKED_TERMS))
+        self._save_cli_selection()
+
+    def _restore_canned_phrases(self):
+        self.cli_canned_phrases.delete("1.0", "end")
+        self.cli_canned_phrases.insert("1.0", ", ".join(DEFAULT_CANNED_PHRASES))
         self._save_cli_selection()
 
     @staticmethod
@@ -684,6 +701,7 @@ class BlogWorkflowControls(UnattendedControls):
                 "include_google": pref["include_google"], "publish": pref["publication_mode"] == "자동 발행",
                 "save_draft": pref["publication_mode"] == "임시저장까지만", "completion_label": pref["publication_mode"],
                 "blocked_terms": pref["blocked_terms"],
+                "canned_phrases": pref["canned_phrases"],
                 "duplicate_keyword_threshold": pref["duplicate_keyword_threshold"],
                 "duplicate_title_threshold": pref["duplicate_title_threshold"],
                 "blog_id": self.blog_id.get().strip(), "prompt_id": selected["id"]}
@@ -764,6 +782,7 @@ class BlogWorkflowControls(UnattendedControls):
         resume_options["quality_topic"] = config.get("quality_topic", topic)
         resume_options["image_retry_limit"] = config.get("image_retry_limit", 2)
         resume_options["editorial_mode"] = config.get("editorial_mode", "natural")
+        resume_options["canned_phrases"] = config.get("canned_phrases", [])
         for key in ("revision_feedback", "final_review_feedback", "stage_configs"):
             if config.get(key):
                 resume_options[key] = config[key]

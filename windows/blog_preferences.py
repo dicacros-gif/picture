@@ -30,6 +30,12 @@ DEATH_BLOCKED_TERMS = [
     "사고사", "시신", "장례", "추모", "사망자", "유족", "운명하다", "타계",
 ]
 DEFAULT_BLOCKED_TERMS = SPORTS_BLOCKED_TERMS + DEATH_BLOCKED_TERMS
+DEFAULT_CANNED_PHRASES = [
+    "앞에서 본 핵심은", "그래서", "앞 구역의 답은 명확했어요", "그 다음에",
+    "이 흐름이 가능했던 배경은", "많은 분들이", "를 확인했다면 이제",
+    "를 명확히 구분했다면", "여기서", "차근차근 짚어보면", "이제 살펴볼",
+    "알아볼 필요가 있습니다", "짚어볼 필요가 있어요", "권해 드립니다",
+]
 
 _TITLE_POLICY_BLOCK_V2 = """[제목 통합 작성 규칙 · 2026-09-13 v2]
 첫 제목은 첫줄 후킹과 마지막 SEO 제목의 핵심 정보를 실제로 한 제목에 합쳐 작성합니다. 두 제목 중 하나만 고르거나 짧은 검색어 꼬리만 붙이지 않습니다. 독자가 궁금해하는 점과 본문에서 답하는 서로 다른 정보 두 가지 이상을 담고 공백 포함 45~68자로 쓰되 70자를 넘지 않습니다. 입력된 실제 연관 검색어 중 중요한 2개를 자연스럽게 포함합니다.
@@ -38,6 +44,18 @@ _TITLE_POLICY_BLOCK_V2 = """[제목 통합 작성 규칙 · 2026-09-13 v2]
 _OPENING_POLICY_BLOCK = """[도입 후킹 규칙 · 2026-09-13]
 첫 구역은 검색이나 블로그를 찾아온 과정을 설명하지 않고, 끝까지 읽어야 놓치기 쉬운 차이와 판단 기준을 알 수 있는 이유를 구체적인 상황이나 의문문으로 먼저 보여줍니다.
 '검색한 분들이', '제일 먼저 답하면', '검색창을 옮겨 다니다 보면', '블로그마다', '이 글에서는 알아보겠습니다' 같은 상투 문장은 출력하지 않습니다. 정답을 첫 문장에 모두 소진하지 않고 가까운 문장에서 이유와 답을 자연스럽게 풉니다."""
+
+_CANNED_TRANSITION_POLICY_BLOCK = """[상투적 연결 표현 금지 · 2026-09-13]
+'앞에서 본 핵심은', '앞 구역의 답은 명확했어요', '그 다음에', '이 흐름이 가능했던 배경은', '많은 분들이', '~를 확인했다면 이제', '~를 명확히 구분했다면', '차근차근 짚어보면', '이제 살펴볼', '알아볼 필요가 있습니다', '짚어볼 필요가 있어요', '권해 드립니다'가 들어간 문장은 공개 원고에서 삭제합니다. '그래서'와 '여기서'가 문장 첫머리에 나오면 그 앞부분만 제거합니다. 앞 구역을 기계적으로 요약하지 말고 현재 구역의 구체적인 사실·상황·이유로 바로 이어갑니다."""
+
+_EDITORIAL_FLOW_POLICY_BLOCK = """[도입부·소제목·문장 리듬 규칙 · 2026-09-13]
+첫 구역 첫 문장은 의외의 사실, 둘째 문장은 글을 끝까지 읽고 얻을 구체적인 결과 약속이며 합계 90자 이내입니다. 제목 연관어를 이 두 문장에 자연스럽게 포함하고 검색어만 따로 한 줄로 쓰지 않습니다. 도입부 후보 3개를 완성 본문에 근거해 검토하고 금지어·길이·근거 구역 검사를 통과한 후보만 사용합니다.
+8개 소제목은 질문형·단정형·반전형·장면형을 각각 두 번씩, 같은 유형이 연속하지 않게 씁니다. 2~8구역은 앞 구역 요약 없이 내용으로 바로 시작합니다. 1~7구역 마지막에는 다음 소제목의 구체적인 궁금증을 남기고 8구역은 실행 가능한 정리로 닫습니다.
+처음 나오는 어려운 용어는 생활 비유를 먼저 쓰고 정의합니다. 문장은 보통 45자 안팎, 최대 60자로 쓰며 일반 문장은 2~3문장씩 묶고 굵은 문장·형광 문장·구역 끝 궁금증만 따로 띄웁니다. 수치는 같은 문장이나 바로 다음 문장에 비교 대상을 밝힙니다."""
+
+_IMAGE_REALISM_POLICY_BLOCK = """[실사 이미지 질감 규칙 · 2026-09-13 v2]
+생성 이미지는 실제 카메라 사진처럼 눈에 보이는 중간 강도의 고운 35mm 필름 그레인, 자연광, 자연스러운 렌즈 보케와 아웃포커싱, 아주 약한 광학 왜곡·비네팅·색수차를 사용합니다. 디지털 노이즈나 과한 빈티지 손상은 피하고 피부·옷감·사물의 미세한 실제 질감을 유지합니다.
+인물은 가상의 한국인 성인만 사용하며 몇 미터 떨어진 중거리·원경에 작게 배치합니다. 정면 응시·정면 포즈·셀피·얼굴 클로즈업은 금지하고 측면·비스듬한 각도·뒷모습이나 자연스러운 활동 장면으로 표현합니다. 첫 이미지는 사람 얼굴을 전혀 넣지 않습니다. AI 생성 이미지는 앱의 해상도·파일·중복·첫 썸네일 문구 검사만 하고 CLI 시각 검수는 생략하며, Google 캡처만 글자·로고·워터마크·본문 관련성을 CLI로 검수합니다."""
 
 
 def _migrate_title_policy_prompt(text: str) -> str:
@@ -62,6 +80,13 @@ def _migrate_opening_policy_prompt(text: str) -> str:
     if marker in text:
         return text.replace(marker, _OPENING_POLICY_BLOCK + "\n\n" + marker, 1)
     return text.rstrip() + "\n\n" + _OPENING_POLICY_BLOCK
+
+
+def _append_marked_policy(text: str, marker: str, block: str) -> str:
+    """Append a new app policy once without changing unrelated user presets."""
+    if not isinstance(text, str) or marker in text or "[제목 통합 작성 규칙 · 2026-09-13 v2]" not in text:
+        return text
+    return text.rstrip() + "\n\n" + block
 
 
 def atomic_json_write(path: str | Path, value) -> None:
@@ -201,6 +226,19 @@ def normalize_blocked_terms(value=None) -> list[str]:
     return terms
 
 
+def normalize_canned_phrases(value=None) -> list[str]:
+    if value is None or not isinstance(value, (str, list, tuple)):
+        value = DEFAULT_CANNED_PHRASES
+    if isinstance(value, str):
+        value = re.split(r"[,;\n\r]+", value)
+    phrases = []
+    for item in value:
+        text = re.sub(r"\s+", " ", str(item)).strip()
+        if 1 <= len(text) <= 80 and text not in phrases:
+            phrases.append(text)
+    return phrases[:80]
+
+
 def blocked_term_hits(value, blocked_terms=None) -> list[str]:
     """Case/spacing-insensitive substring blocking, including every related result."""
     def strings(item):
@@ -226,8 +264,13 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         identifier = str(preset.get("id", "")).strip()
         name = str(preset.get("name", "")).strip()
         text = _migrate_opening_policy_prompt(
-            _migrate_title_policy_prompt(str(preset.get("text", "")).strip())
-        )
+            _migrate_title_policy_prompt(str(preset.get("text", "")).strip()))
+        text = _append_marked_policy(text, "[상투적 연결 표현 금지 · 2026-09-13]",
+                                     _CANNED_TRANSITION_POLICY_BLOCK)
+        text = _append_marked_policy(text, "[실사 이미지 질감 규칙 · 2026-09-13 v2]",
+                                     _IMAGE_REALISM_POLICY_BLOCK)
+        text = _append_marked_policy(text, "[도입부·소제목·문장 리듬 규칙 · 2026-09-13]",
+                                     _EDITORIAL_FLOW_POLICY_BLOCK)
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)
@@ -292,6 +335,7 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         "editorial_mode": value.get("editorial_mode") if value.get("editorial_mode") in ("natural", "strict") else "natural",
         "auto_start_on_launch": value.get("auto_start_on_launch", True) is True,
         "blocked_terms": normalize_blocked_terms(value.get("blocked_terms")),
+        "canned_phrases": normalize_canned_phrases(value.get("canned_phrases")),
         "duplicate_keyword_threshold": threshold("duplicate_keyword_threshold", .4),
         "duplicate_title_threshold": threshold("duplicate_title_threshold", .5),
         "publication_mode": {"발행": "자동 발행", "자동 발행": "자동 발행", "임시저장": "임시저장까지만",
@@ -320,6 +364,7 @@ def automation_config_snapshot(settings: dict | None, fallback: dict | None = No
             publish=pref["publication_mode"] == "자동 발행",
             save_draft=pref["publication_mode"] == "임시저장까지만",
             completion_label=pref["publication_mode"], blocked_terms=pref["blocked_terms"],
+            canned_phrases=pref["canned_phrases"],
             duplicate_keyword_threshold=pref["duplicate_keyword_threshold"],
             duplicate_title_threshold=pref["duplicate_title_threshold"],
         )

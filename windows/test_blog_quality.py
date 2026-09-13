@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from blog_quality import inspect_article, apply_patches, local_cleanup
+from blog_quality import (inspect_article, apply_patches, local_cleanup, layout_article,
+                          validate_intro_candidates, apply_selected_intro)
 from blog_workflow import BlogWorkflow, WorkflowFormatError, rank_topics
 from blog_stage_roles import check_role_change
 from test_blog_workflow import valid_article, KEYWORDS, TOPIC
@@ -109,7 +110,7 @@ class EditorialTests(unittest.TestCase):
         article['paragraphs'][7] = '짧습니다.'
         codes = {i['code'] for i in inspect_article(article, KEYWORDS, TOPIC)}
         self.assertTrue({'section_length', 'ending', 'tool_attribution', 'public_source', 'forbidden',
-            'bridge', 'heading_keyword', 'density', 'duplication'} <= codes)
+            'heading_keyword', 'density', 'duplication'} <= codes)
         article['paragraphs'] = ['짧아요.'] * 8
         codes = {i['code'] for i in inspect_article(article, KEYWORDS, TOPIC)}
         self.assertTrue({'total_length', 'specificity'} <= codes)
@@ -173,6 +174,81 @@ class EditorialTests(unittest.TestCase):
                 self.assertTrue(any(item['text'] == stale for item in hooks))
                 cleaned, _ = local_cleanup(article, hooks, mode='natural')
                 self.assertNotIn(stale, cleaned['paragraphs'][0])
+
+    def test_canned_transitions_are_banned_and_removed_locally(self):
+        stale_sentences = (
+            '앞에서 본 핵심은 보관 조건이 중요하다는 점이었어요.',
+            '그래서 포장 상태를 먼저 확인해야 합니다.',
+            '앞 구역의 답은 명확했어요.',
+            '그 다음에 용기를 씻어야 합니다.',
+            '이 흐름이 가능했던 배경은 제조 기술입니다.',
+            '많은 분들이 소비기한을 헷갈려요.',
+        )
+        article = valid_article()
+        article['paragraphs'][1] += '\n' + '\n'.join(stale_sentences)
+        issues = [item for item in inspect_article(article, KEYWORDS, TOPIC, mode='natural')
+                  if item['code'] == 'canned_transition']
+        self.assertEqual({item['text'] for item in issues}, set(stale_sentences))
+        cleaned, changes = local_cleanup(article, issues, mode='natural')
+        for stale in stale_sentences:
+            self.assertNotIn(stale, cleaned['paragraphs'][1])
+        self.assertIn('포장 상태를 먼저 확인해야 합니다.', cleaned['paragraphs'][1])
+        self.assertEqual(len(changes), len(stale_sentences))
+
+    def test_expanded_canned_transitions_distinguish_prefix_and_sentence_removal(self):
+        article = valid_article()
+        lines = ('여기서 실제 조건은 포장 상태입니다.', '차근차근 짚어보면 알 수 있습니다.',
+                 '사용자가 저장한 금지 표현으로 넘어갑니다.')
+        article['paragraphs'][2] += '\n' + '\n'.join(lines)
+        issues = [item for item in inspect_article(article, KEYWORDS, TOPIC, mode='natural',
+                  canned_phrases=['사용자가 저장한 금지 표현']) if item['code'] == 'canned_transition']
+        cleaned, _ = local_cleanup(article, issues, mode='natural')
+        self.assertIn('실제 조건은 포장 상태입니다.', cleaned['paragraphs'][2])
+        self.assertNotIn('여기서', cleaned['paragraphs'][2])
+        self.assertNotIn(lines[1], cleaned['paragraphs'][2])
+        self.assertNotIn(lines[2], cleaned['paragraphs'][2])
+
+    def test_intro_candidates_require_grounding_length_keyword_and_selection(self):
+        article = valid_article()
+        fact = '배터리 교체 시점은 충전 횟수만으로 정해지지 않아요.'
+        promise = '배터리 수명 판단 기준을 끝까지 구분할 수 있어요.'
+        article['paragraphs'][3] += '\n' + fact
+        article['intro_candidates'] = [
+            {'surprising_fact': fact, 'promise': promise, 'fact_source': 4},
+            {'surprising_fact': '근거 없는 배터리 정보입니다.', 'promise': promise, 'fact_source': 2},
+            {'surprising_fact': fact, 'promise': '가' * 90, 'fact_source': 4},
+        ]
+        article['selected_intro'] = 0
+        valid = validate_intro_candidates(article, KEYWORDS)
+        self.assertEqual([item['candidate_index'] for item in valid], [0])
+        result, details = apply_selected_intro(article, KEYWORDS)
+        self.assertEqual(details['status'], 'selected')
+        self.assertEqual(result['intro']['fact_source'], 4)
+        self.assertEqual(result['intro']['surprising_fact'], fact)
+
+    def test_subheading_hook_rhythm_definition_and_number_checks(self):
+        article = valid_article()
+        article['subheading_types'] = ['질문형'] * 8
+        article['hook_endings'] = ['이어질까요?'] * 8
+        long_sentence = '아주 긴 문장이라서 독자가 한 번에 이해하기 어렵고 같은 뜻이 끝없이 이어지는 문장을 일부러 만들어 육십 자를 훨씬 넘게 씁니다.'
+        for index in range(8):
+            article['paragraphs'][index] += '\n' + ' '.join([long_sentence] * 3)
+        article['paragraphs'][0] += '\n계절조정이란 계절 차이를 없애는 계산입니다.\n가격은 100원입니다.'
+        codes = {item['code'] for item in inspect_article(article, KEYWORDS, TOPIC, mode='natural')}
+        self.assertTrue({'subheading_types', 'hook_ending', 'sentence_rhythm',
+                         'definition_without_analogy', 'numeric_comparison', 'complex_word'} <= codes)
+
+    def test_layout_groups_normal_sentences_and_isolates_emphasis(self):
+        article = valid_article()
+        body = '첫 문장입니다. 둘째 문장이지요. 중요한 문장입니다. 넷째 문장이에요. 다섯째 문장입니다.'
+        article['paragraphs'][0] = '──────────────\n❝ 배터리 수명\n\n' + body
+        article['bold_phrases'] = ['중요한 문장입니다.']
+        article['highlight_phrases'] = []
+        article['hook_endings'] = [''] * 8
+        result, changed = layout_article(article)
+        self.assertEqual(changed, [0])
+        self.assertIn('첫 문장입니다. 둘째 문장이지요.\n\n중요한 문장입니다.\n\n넷째 문장이에요. 다섯째 문장입니다.',
+                      result['paragraphs'][0])
 
     def test_code_fallback_uses_existing_title_intent_after_two_short_edits(self):
         article = valid_article()
