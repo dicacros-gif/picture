@@ -622,6 +622,155 @@ def _apply_fact_recovery_response(article, response, review, keywords):
     return result, details
 
 
+_FACT_TOKEN_SUFFIXES = (
+    "에서는", "으로는", "이라고", "이라는", "이라면", "에서", "으로", "까지", "부터",
+    "않습니다", "하다고", "하다는", "합니다", "됩니다", "입니다",
+    "에게", "처럼", "보다", "하고", "하며", "하면", "하는", "되는", "되어", "이라고",
+    "습니다", "어요", "아요", "이지요", "니까요", "인가요", "까요",
+    "에는", "에도", "만큼", "이라", "라고", "이란", "의", "은", "는", "이", "가",
+    "을", "를", "와", "과", "로", "에", "도", "만", "나",
+)
+_FACT_TOKEN_STOP = {
+    "따르면", "안내", "설명", "확인", "확인한", "자료", "내용", "관련", "대한", "통해",
+    "이것", "그것", "해당", "현재", "실제", "가장", "먼저", "다시", "있다", "없다",
+}
+
+
+def _fact_match_tokens(text):
+    """Return conservative Korean/Latin stems used only to remove rejected claims."""
+    values = set()
+    for raw in re.findall(r"[가-힣A-Za-z0-9]+", str(text or "")):
+        value = raw.casefold()
+        for suffix in _FACT_TOKEN_SUFFIXES:
+            if len(value) >= len(suffix) + 2 and value.endswith(suffix):
+                value = value[:-len(suffix)]
+                break
+        if len(value) >= 2 and value not in _FACT_TOKEN_STOP:
+            values.add(value)
+    return values
+
+
+def _source_issue_indices(review, source_count):
+    issues = review.get("issues", []) if isinstance(review, dict) else []
+    if not issues or any(not isinstance(issue, str) or not issue.strip() for issue in issues):
+        return None
+    groups = []
+    for issue in issues:
+        found = {int(value) for value in re.findall(r"sources\s*\[\s*(\d+)\s*\]", issue, re.I)}
+        if not found or any(index >= source_count for index in found):
+            return None
+        groups.append(found)
+    return set().union(*groups)
+
+
+def _source_organization_names(source):
+    title = source.get("title", "") if isinstance(source, dict) else ""
+    return {word for word in re.findall(r"[가-힣]{4,}", title)
+            if word.endswith(("부", "처", "청", "원", "공사", "위원회"))}
+
+
+def _apply_exhausted_source_fallback(article, review, keywords):
+    """Remove claims tied to explicitly rejected source indexes after two failed CLI repairs.
+
+    This deliberately supports only the narrow case where the reviewer approved the
+    remaining facts, intent and prose, and every issue names a concrete sources[N].
+    It never replaces a fact or invents prose; an independent final audit still runs.
+    """
+    if (not isinstance(review, dict) or review.get("facts_verified") is not True
+            or review.get("sources_verified") is not False
+            or review.get("search_intent_satisfied") is not True
+            or review.get("natural_korean") is not True):
+        return None, None
+    sources = article.get("sources")
+    if not isinstance(sources, list) or len(sources) < 2:
+        return None, None
+    rejected = _source_issue_indices(review, len(sources))
+    if not rejected or len(rejected) >= len(sources):
+        return None, None
+
+    patches = []
+    matched_sources = set()
+    for source_index in sorted(rejected):
+        source = sources[source_index]
+        supports = source.get("supports", []) if isinstance(source, dict) else []
+        support_tokens = [_fact_match_tokens(claim) for claim in supports if isinstance(claim, str)]
+        organizations = _source_organization_names(source)
+        for paragraph_index, paragraph in enumerate(article.get("paragraphs", [])):
+            for line in paragraph.splitlines():
+                sentence = line.strip()
+                if (not sentence or sentence.startswith(("❝", "─", "#"))
+                        or not re.search(r"[.!?。！？]$", sentence)
+                        or paragraph.count(sentence) != 1):
+                    continue
+                tokens = _fact_match_tokens(sentence)
+                attributed = any(name in sentence for name in organizations)
+                supported = False
+                for claim_tokens in support_tokens:
+                    overlap = len(tokens & claim_tokens)
+                    if overlap >= 3 and (overlap / max(1, len(tokens)) >= .22
+                            or overlap / max(1, len(claim_tokens)) >= .22):
+                        supported = True
+                        break
+                if attributed or supported:
+                    issue_index = next(i for i, issue in enumerate(review["issues"])
+                                       if re.search(rf"sources\s*\[\s*{source_index}\s*\]", issue, re.I))
+                    patches.append({"index": paragraph_index, "old": sentence, "new": "",
+                                    "reason": f"검수에서 sources[{source_index}] 연결 오류가 확인되어 이 자료에 의존한 완전한 문장을 제거",
+                                    "source_urls": [], "issue_index": issue_index})
+                    matched_sources.add(source_index)
+    unique = []
+    seen = set()
+    for patch in patches:
+        key = (patch["index"], patch["old"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(patch)
+    patches = unique
+    if matched_sources != rejected or not patches or len(patches) > 16:
+        return None, None
+
+    preview = copy.deepcopy(article)
+    for patch in patches:
+        preview["paragraphs"][patch["index"]] = preview["paragraphs"][patch["index"]].replace(
+            patch["old"], "", 1)
+    bridges = []
+    previous_bridges = article.get("bridge_sentences", [])
+    for index, paragraph in enumerate(preview["paragraphs"]):
+        previous = previous_bridges[index] if isinstance(previous_bridges, list) and len(previous_bridges) == 8 else ""
+        candidates = [line.strip() for line in paragraph.splitlines()
+                      if line.strip() and not line.lstrip("\ufeff \t").startswith(("❝", "─", "#"))]
+        bridges.append(previous if previous and previous in paragraph else (candidates[-1] if candidates else ""))
+    visual = choose_visual_style(preview["paragraphs"], article.get("bold_phrases", []),
+                                 article.get("highlight_phrases", []), enrich_body_bold=True,
+                                 bold_terms=article.get("bold_terms", []))
+    highlights = list(visual["highlight_phrases"])
+    if not highlights:
+        highlights = next(([line.strip()] for paragraph in preview["paragraphs"] for line in paragraph.splitlines()
+            if 12 <= len(line.strip()) <= 200 and line.strip().endswith((".", "?", "!"))
+            and not line.lstrip("\ufeff \t").startswith("❝")
+            and sum(p.count(line.strip()) for p in preview["paragraphs"]) == 1), [])
+    numeric = [claim for claim in article.get("numeric_claims", []) if isinstance(claim, dict)
+               and type(claim.get("section_index")) is int and 0 <= claim["section_index"] < 8
+               and isinstance(claim.get("quote"), str)
+               and claim["quote"] in preview["paragraphs"][claim["section_index"]]]
+    response = {
+        "fact_corrections": patches,
+        "fact_additions": [],
+        "sources": [copy.deepcopy(source) for index, source in enumerate(sources) if index not in rejected],
+        "changes": [f"연결이 거절된 출처 {len(rejected)}개와 이에 의존한 문장 {len(patches)}개를 제거"],
+        "bridge_sentences": bridges,
+        "bold_phrases": visual["bold_phrases"],
+        "highlight_phrases": highlights,
+        "numeric_claims": numeric,
+    }
+    result, details = _apply_fact_recovery_response(article, response, review, keywords)
+    details.update(rejected_source_indices=sorted(rejected), removed_claim_count=len(patches),
+                   recovery="remove-rejected-source-claims-v1")
+    result["fact_recovery_protocol"] = "remove-rejected-source-claims-v1"
+    result["fact_recovery_changes"] = details
+    return result, details
+
+
 def derive_bold_terms(article: dict, keywords: list[str]) -> list[str]:
     """Formatting metadata only; never insert markup or new visible claims."""
     body = "\n".join(article.get("paragraphs", []))
@@ -1171,7 +1320,8 @@ class BlogWorkflow:
                                         "section_index": 0, "quote": "수정 본문에 실제 있는 수치와 단위를 포함한 원문"}]}}, ensure_ascii=False)
             + "\nEND_UNTRUSTED_FACT_REPAIR_JSON")
         response = self._text_call(run_dir, name, route["provider"], prompt,
-            {**models, route["provider"]: route.get("model", "")}, retry_transient=False, reserve_seconds=300)
+            {**models, route["provider"]: route.get("model", "")}, timeout=120,
+            retry_transient=False, reserve_seconds=120)
         if on_response:
             on_response()
         result, details = _apply_fact_recovery_response(article, response, review, keywords)
@@ -1296,37 +1446,50 @@ class BlogWorkflow:
             article = recovered
         if saved.get("status") in {"rejected", "repairing", "repair_failed"}:
             retry_after = _fact_repair_retry_after(path, saved)
-            if retry_after:
-                raise WorkflowReviewRequired("최근 1시간의 사실 부분 수정 2회를 사용했습니다. 다음 예약에서 같은 원고의 보완과 최종 검수를 이어갑니다.", path.parent, retry_after=retry_after)
-            self._check_budget(300)
-            number = len(saved["repair_attempts"]) + 1
-            attempt = {"number": number, "status": "started", "upstream_sha256": _json_hash(article),
-                       "provider": route["provider"], "model": route.get("model", ""),
-                       "started_at": datetime.fromtimestamp(time.time(), timezone.utc).isoformat()}
-            saved["repair_attempts"].append(attempt)
-            saved["status"] = "repairing"
-            _save_json(path, saved)  # Count the CLI request before starting it.
-            self.log(f"최종 검수 지적 부분 수정 · 누적 {number}회 · 시간당 최대 2회 · 기존 작성 단계 유지")
-            name = path.stem + f"-repair-{number}"
-            def remember_response():
-                attempt.update(response_received=True, response_protocol='ledger-v1', response_artifacts={
-                    suffix: hashlib.sha256((path.parent / (name + suffix)).read_bytes()).hexdigest()
-                    for suffix in ('.prompt.txt', '.response.txt', '.json')})
-                _save_json(path, saved)
-            try:
-                article = self._repair_final_findings(path.parent, article, saved["last_audit"], keywords,
-                    topic, base_prompt, route, models, name, feedback, editorial_mode, on_response=remember_response)
-                self._check_cancelled()
-                attempt.update(status="completed", article_sha256=_json_hash(article))
+            fallback = None
+            if len(saved["repair_attempts"]) >= 2:
+                fallback_article, fallback = _apply_exhausted_source_fallback(
+                    article, saved.get("last_audit", {}).get("review"), keywords)
+            if fallback is not None:
+                article = fallback_article
+                recovery = {**fallback, "created_at": datetime.now(timezone.utc).isoformat(),
+                            "article_sha256": _json_hash(article)}
+                saved.setdefault("deterministic_fact_recoveries", []).append(recovery)
                 saved.update(article=article, article_sha256=_json_hash(article), status="awaiting_audit")
                 _save_json(path, saved)
-            except Exception as exc:
-                category = ('cancelled' if self.cancel_event.is_set() else 'format' if isinstance(exc, WorkflowFormatError)
-                            else 'review' if isinstance(exc, WorkflowError) and not getattr(exc, 'code', None) else 'transport')
-                attempt.update(status="failed", error=str(exc), error_category=category)
-                saved["status"] = "repair_failed"
-                _save_json(path, saved)
-                raise
+                self.log(f"사실 수정 2회 응답 지연 · 거절 출처와 연결 문장 {fallback['removed_claim_count']}개만 제거하고 같은 원고를 최종 검수합니다.")
+            elif retry_after:
+                raise WorkflowReviewRequired("최근 1시간의 사실 부분 수정 2회를 사용했습니다. 다음 예약에서 같은 원고의 보완과 최종 검수를 이어갑니다.", path.parent, retry_after=retry_after)
+            self._check_budget(300)
+            if saved.get("status") != "awaiting_audit":
+                number = len(saved["repair_attempts"]) + 1
+                attempt = {"number": number, "status": "started", "upstream_sha256": _json_hash(article),
+                           "provider": route["provider"], "model": route.get("model", ""),
+                           "started_at": datetime.fromtimestamp(time.time(), timezone.utc).isoformat()}
+                saved["repair_attempts"].append(attempt)
+                saved["status"] = "repairing"
+                _save_json(path, saved)  # Count the CLI request before starting it.
+                self.log(f"최종 검수 지적 부분 수정 · 누적 {number}회 · 시간당 최대 2회 · 기존 작성 단계 유지")
+                name = path.stem + f"-repair-{number}"
+                def remember_response():
+                    attempt.update(response_received=True, response_protocol='ledger-v1', response_artifacts={
+                        suffix: hashlib.sha256((path.parent / (name + suffix)).read_bytes()).hexdigest()
+                        for suffix in ('.prompt.txt', '.response.txt', '.json')})
+                    _save_json(path, saved)
+                try:
+                    article = self._repair_final_findings(path.parent, article, saved["last_audit"], keywords,
+                        topic, base_prompt, route, models, name, feedback, editorial_mode, on_response=remember_response)
+                    self._check_cancelled()
+                    attempt.update(status="completed", article_sha256=_json_hash(article))
+                    saved.update(article=article, article_sha256=_json_hash(article), status="awaiting_audit")
+                    _save_json(path, saved)
+                except Exception as exc:
+                    category = ('cancelled' if self.cancel_event.is_set() else 'format' if isinstance(exc, WorkflowFormatError)
+                                else 'review' if isinstance(exc, WorkflowError) and not getattr(exc, 'code', None) else 'transport')
+                    attempt.update(status="failed", error=str(exc), error_category=category)
+                    saved["status"] = "repair_failed"
+                    _save_json(path, saved)
+                    raise
         self._check_cancelled()
         # Once a reviewer has found a problem, keep that exact provider/model.
         # No connection fallback may substitute a more permissive approval.

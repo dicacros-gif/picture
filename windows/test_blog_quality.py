@@ -163,6 +163,17 @@ class EditorialTests(unittest.TestCase):
         self.assertNotIn(stale, cleaned['paragraphs'][0])
         self.assertTrue(any(item['code'] == 'opening_hook' for item in changes))
 
+    def test_any_search_or_blog_meta_opening_is_removed(self):
+        for stale in ('검색 결과부터 차근차근 보겠습니다.', '블로그 내용을 비교해 봤어요.'):
+            with self.subTest(stale=stale):
+                article = valid_article()
+                article['paragraphs'][0] = article['paragraphs'][0].replace('\n\n', '\n\n' + stale + '\n\n', 1)
+                hooks = [item for item in inspect_article(article, KEYWORDS, TOPIC, mode='natural')
+                         if item['code'] == 'opening_hook']
+                self.assertTrue(any(item['text'] == stale for item in hooks))
+                cleaned, _ = local_cleanup(article, hooks, mode='natural')
+                self.assertNotIn(stale, cleaned['paragraphs'][0])
+
     def test_code_fallback_uses_existing_title_intent_after_two_short_edits(self):
         article = valid_article()
         article['title'] = '즉석밥 오래 둬도 괜찮을까? 소비기한 확인법'

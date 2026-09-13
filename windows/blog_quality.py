@@ -13,7 +13,7 @@ ATTRIBUTION = re.compile(r"(?:Antigravity|안티그래비티|ChatGPT|Claude|클�
 PUBLIC_SOURCE = re.compile(r"https?\S*|www\.\S*|출처|참고\s*자료", re.I)
 SPECIFIC = re.compile(r"\d[\d,.]*\s*(?:원|만원|억원|일|주|개월|년|시간|분|회|번|%)|(?:경우|조건|대상|자격|이상|이하|미만|초과)")
 OPENING_META = re.compile(
-    r"(?:검색(?:한|하신|하는)\s*(?:분|사람)|검색창을\s*옮겨\s*다니|블로그마다|"
+    r"(?:검색|블로그|"
     r"제일\s*먼저\s*답하면|가장\s*먼저\s*알고\s*싶은\s*(?:건|것은)|"
     r"(?:이|이번)\s*글(?:에서는|은)\s*(?:알아|살펴))"
 )

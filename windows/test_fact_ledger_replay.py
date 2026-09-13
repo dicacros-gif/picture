@@ -5,7 +5,8 @@ from pathlib import Path
 
 import test_blog_workflow as support
 import test_final_fact_resume as resume_support
-from blog_workflow import _apply_fact_recovery_response, _json_hash, WorkflowError
+from blog_workflow import (_apply_exhausted_source_fallback, _apply_fact_recovery_response,
+                           _json_hash, WorkflowError)
 
 
 def ledger(article):
@@ -15,6 +16,36 @@ def ledger(article):
 
 
 class FactLedgerAssemblyTests(unittest.TestCase):
+    def test_exhausted_source_fallback_removes_only_rejected_source_and_linked_claim(self):
+        article = support.valid_article()
+        claim = '전자레인지용 용기는 표시된 조리 시간과 방법을 지켜 사용하면 안전합니다.'
+        article['paragraphs'][4] += '\n\n전자레인지 조리 표시와 시간을 지키면 용기를 안전하게 사용할 수 있습니다.'
+        article['sources'][0] = {'title': '식품의약품안전처 전자레인지 용기 안내',
+            'url': 'https://primary.example/wrong', 'verified': True, 'is_primary': True,
+            'supports': [claim]}
+        article['sources'].append({'title': '제조사 배터리 안내', 'url': 'https://primary.example/kept',
+            'verified': True, 'is_primary': True, 'supports': ['기기마다 배터리 관리 조건은 달라집니다.']})
+        review = {'approved': False, 'facts_verified': True, 'sources_verified': False,
+                  'search_intent_satisfied': True, 'natural_korean': True,
+                  'issues': ['sources[0] 주소가 다른 문서여서 전자레인지 용기 주장을 증빙하지 못합니다.']}
+        result, details = _apply_exhausted_source_fallback(article, review, support.KEYWORDS)
+        self.assertIsNotNone(result)
+        self.assertEqual(details['rejected_source_indices'], [0])
+        self.assertNotIn('전자레인지 조리 표시와 시간을', result['paragraphs'][4])
+        self.assertEqual([source['url'] for source in result['sources']], ['https://primary.example/kept'])
+        self.assertEqual(result['paragraphs'][:4], article['paragraphs'][:4])
+        self.assertEqual(result['paragraphs'][5:], article['paragraphs'][5:])
+
+    def test_exhausted_source_fallback_refuses_ambiguous_or_factual_rejection(self):
+        article = support.valid_article()
+        article['sources'].append(copy.deepcopy(article['sources'][0]))
+        base = {'approved': False, 'facts_verified': True, 'sources_verified': False,
+                'search_intent_satisfied': True, 'natural_korean': True,
+                'issues': ['자료 연결이 올바르지 않습니다.']}
+        self.assertEqual(_apply_exhausted_source_fallback(article, base, support.KEYWORDS), (None, None))
+        base.update(facts_verified=False, issues=['sources[0]의 사실도 틀렸습니다.'])
+        self.assertEqual(_apply_exhausted_source_fallback(article, base, support.KEYWORDS), (None, None))
+
     def test_ledger_only_preserves_every_unlisted_part(self):
         article = support.valid_article()
         response = ledger(article)

@@ -97,6 +97,51 @@ class FinalFactResumeTests(unittest.TestCase):
         self.assertEqual(saved['status'], 'rejected')
         self.assertEqual(len(saved['repair_attempts']), 2)
 
+    def test_two_timed_out_repairs_remove_indexed_bad_source_then_reaudit_same_copy(self):
+        bad_sentence = '전자레인지 조리 표시와 시간을 지키면 용기를 안전하게 사용할 수 있습니다.'
+        self.bridge.article['paragraphs'][4] += '\n\n' + bad_sentence
+        self.bridge.article['sources'][0] = {'title': '식품의약품안전처 전자레인지 용기 안내',
+            'url': 'https://primary.example/wrong', 'verified': True, 'is_primary': True,
+            'supports': ['전자레인지용 용기는 표시된 조리 시간과 방법을 지켜 사용하면 안전합니다.']}
+        self.bridge.article['sources'].append({'title': '제조사 배터리 안내',
+            'url': 'https://primary.example/kept', 'verified': True, 'is_primary': True,
+            'supports': ['기기마다 배터리 관리 조건은 달라집니다.']})
+        original = self.bridge.run_text
+        audit_count = 0
+        repair_count = 0
+        def run(provider, prompt, **kwargs):
+            nonlocal audit_count, repair_count
+            if prompt.startswith('EDITORIAL_NATURAL_FINISH'):
+                return json.dumps({'paragraph_patches': []})
+            if prompt.startswith('FINAL_FACT_TARGETED_REPAIR'):
+                repair_count += 1
+                self.assertEqual(kwargs.get('timeout'), 120)
+                raise BlogCliError('timeout', '부분 수정 제한 시간 초과', provider=provider)
+            if prompt.startswith('FINAL_ARTICLE_REVIEW'):
+                audit_count += 1
+                review = copy.deepcopy(self.bridge.article['review'])
+                if audit_count == 1:
+                    review.update(approved=False, sources_verified=False,
+                        issues=['sources[0] 주소가 다른 문서여서 용기 주장을 증빙하지 못합니다.'])
+                return json.dumps(review)
+            return original(provider, prompt, **kwargs)
+        self.bridge.run_text = run
+        inspection = patch('blog_workflow.inspect_article', return_value=[])
+        inspection.start()
+        self.addCleanup(inspection.stop)
+        run_dir = self.fail_initial()
+        for _ in range(2):
+            with self.assertRaisesRegex(WorkflowError, '부분 수정 제한 시간 초과'):
+                self.workflow.resume(run_dir)
+        result = self.workflow.resume(run_dir)
+        self.assertTrue(result['ready_to_publish'])
+        self.assertEqual((repair_count, audit_count), (2, 2))
+        self.assertNotIn(bad_sentence, '\n'.join(result['paragraphs']))
+        saved = json.loads((run_dir / 'editorial.pending.json').read_text(encoding='utf-8'))
+        self.assertEqual(saved['status'], 'approved')
+        self.assertEqual(len(saved['repair_attempts']), 2)
+        self.assertEqual(len(saved['deterministic_fact_recoveries']), 1)
+
     def test_later_hour_resumes_same_reviewer_and_retains_all_charged_attempts(self):
         self.bridge_for_recovery(always_reject=True)
         started = time.time()
