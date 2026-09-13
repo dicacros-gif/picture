@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / 'windows'))
 sys.path.insert(0, str(ROOT / 'mac-app/backend'))
 
 from engine import MacRun, WorkflowError, atomic_json_write, read_json, validate_settings
+from image_delivery import CAPTION_RENDER_VERSION, COVER_RENDER_VERSION, OVERLAY_TEXT_COLORS, clean_export
 
 
 def settings(mode='local', text='사용자 기본 문체를 유지합니다.'):
@@ -90,6 +91,23 @@ class MacEngineTests(unittest.TestCase):
     def make_run(self):
         return MacRun(self.root, self.log, self.cancel, bridge=self.bridge, bot=self.bot,
                       workflow_type=lambda *_args: self.workflow)
+
+    def test_shared_image_export_uses_current_centered_multicolor_overlay(self):
+        from PIL import Image
+        source = self.root / 'overlay-source.png'
+        Image.new('RGB', (720, 720), (42, 83, 72)).save(source)
+        cover = clean_export(source, self.root / 'cover.jpg', headline='맥 블로그 잘 보일까?', target_long_side=720)
+        caption = clean_export(source, self.root / 'caption.jpg', caption='맥 사진 어디서 볼까?', target_long_side=720)
+        colors = list(OVERLAY_TEXT_COLORS)
+        self.assertEqual(colors, ['#FFFFFF', '#8CE88C', '#FF4040'])
+        self.assertEqual(cover['cover_render_version'], COVER_RENDER_VERSION)
+        self.assertEqual(cover['cover_text_alignment'], 'center')
+        self.assertEqual(cover['cover_text_colors'], colors)
+        self.assertEqual(caption['caption_render_version'], CAPTION_RENDER_VERSION)
+        self.assertEqual(caption['caption_text_alignment'], 'center')
+        self.assertEqual(caption['caption_text_colors'], colors)
+        self.assertTrue(cover['metadata_stripped'])
+        self.assertTrue(caption['metadata_stripped'])
 
     def pending(self, mode='local', phase='preparing', ready=False):
         data = {'config': validate_settings(settings(mode)), 'requested_keyword': '정기예금', 'phase': phase,

@@ -7,6 +7,35 @@ const { StringDecoder } = require('node:string_decoder');
 
 const ROLES = ['작성', '교차 검수', '팩트·최신 정보 보강', '문체 다듬기'];
 const PROVIDERS = ['chatgpt', 'claude', 'antigravity'];
+const PROMPT_POLICY_MARKER = '[맥 공통 글쓰기 규칙 · 2026-09-13 v2]';
+const PROMPT_POLICY_BLOCK = `${PROMPT_POLICY_MARKER}
+이 규칙은 앞에 저장된 이미지·제목 규칙과 충돌하면 우선합니다. 첫 제목은 후킹과 마지막 SEO 제목의 서로 다른 정보를 중복 없이 합쳐 실제 연관어 2개를 자연스럽게 넣고 공백 포함 45~68자, 최대 70자로 씁니다. 첫 구역은 검색 과정을 말하지 않고 의외의 사실과 끝까지 읽을 이유로 시작합니다. 상투적인 구역 연결어 없이 구체적인 내용으로 바로 이어가며 8개 소제목은 질문형·단정형·반전형·장면형을 고르게 사용합니다.
+생성 이미지는 자연광, 중간 강도의 고운 35mm 필름 그레인, 자연스러운 아웃포커싱·보케, 아주 약한 렌즈 왜곡·비네팅·색수차를 사용합니다. 한국인 인물은 몇 미터 떨어진 중거리·원경의 측면·비스듬한 각도·뒷모습으로만 두고 정면 응시·셀피·얼굴 클로즈업을 금지합니다. 첫 이미지는 얼굴 없는 1:1 실사 사진이며 자연스러운 한글 질문을 공백 포함 최대 28자로 쓰고 반드시 ?로 끝냅니다.
+앱은 첫 이미지와 Google 캡처의 질문을 굵고 읽기 쉬운 고딕체로 두세 줄 가운데 정렬합니다. 일반 문구는 흰색, 서로 다른 핵심 단어는 형광 녹색 #8CE88C~#95F095와 형광 빨간색으로 강조하고 짙은 그림자와 원사진이 보이는 반투명 검정 배경을 사용합니다. Google 이미지는 핵심 키워드를 영어로 검색해 이미지 탭 앞쪽 후보부터 확인하고 글자·로고·워터마크와 사용 조건을 통과한 캡처만 여백을 보수적으로 잘라 사용합니다. AI 생성 이미지는 파일·해상도·중복만 검사하고 CLI 시각 검수는 생략하며 Google 캡처만 시각 검수합니다.`;
+
+function migratePrompt(text = '', bundledPrompt = '') {
+  text = String(text || '').trim();
+  if (!text) return String(bundledPrompt || '').trim();
+  if (text.includes(PROMPT_POLICY_MARKER)) return text;
+  // Add a final precedence block to 2.0.1 defaults. The old text may contain
+  // user edits, so never replace the full preset just because legacy wording
+  // is still present.
+  const legacyDefault = text.includes('8자 안팎, 최대 12자')
+    && text.includes('위쪽 32%는 글자가 잘 읽히도록')
+    && text.includes('아주 약한 미세 필름 그레인만');
+  if (legacyDefault) return `${text}\n\n${PROMPT_POLICY_BLOCK}`.trim();
+  const oldMarker = '[이미지 문구 최신 규칙 · 2026-09-13]';
+  if (text.includes(oldMarker)) {
+    text = text.replace(/\[이미지 문구 최신 규칙 · 2026-09-13\][\s\S]*?(?=\n+\[[^\]\n]+\]|$)/, PROMPT_POLICY_BLOCK);
+    return text.trim();
+  }
+  // Only prompts that already carry an app-owned policy marker are extended.
+  // A short user-created preset remains byte-for-byte unchanged.
+  if (/\[(?:제목 통합 작성 규칙|도입 후킹 규칙|상투적 연결 표현 금지|도입부·소제목·문장 리듬 규칙)/.test(text)) {
+    return `${text}\n\n${PROMPT_POLICY_BLOCK}`.trim();
+  }
+  return text;
+}
 function defaults(prompt = '') {
   return { automationEnabled: false, intervalHours: 1, mode: 'draft', keyword: '',
     prompts: [{ id: 'default', name: '기본 글쓰기', text: prompt }], selectedPromptId: 'default',
@@ -21,7 +50,7 @@ function normalizeBlog(input = {}, prompt = '') {
   value.mode = ['draft', 'publish', 'local'].includes(value.mode) ? value.mode : 'draft';
   value.keyword = String(value.keyword || '').normalize('NFC').trim().slice(0, 160);
   value.prompts = Array.isArray(value.prompts) ? value.prompts.filter(p => p && typeof p.id === 'string' && typeof p.name === 'string' && typeof p.text === 'string')
-    .slice(0, 30).map(p => ({ id: p.id.slice(0, 100), name: p.name.slice(0, 100), text: p.text.slice(0, 40000) })) : [];
+    .slice(0, 30).map(p => ({ id: p.id.slice(0, 100), name: p.name.slice(0, 100), text: migratePrompt(p.text, prompt).slice(0, 40000) })) : [];
   value.prompts = value.prompts.filter((p, i, all) => p.id && p.name && all.findIndex(v => v.id === p.id) === i);
   if (!value.prompts.length) value.prompts = defaults(prompt).prompts;
   if (!value.prompts.some(p => p.id === value.selectedPromptId)) value.selectedPromptId = value.prompts[0].id;
@@ -48,7 +77,7 @@ function atomicJson(file, data) {
 class SettingsStore {
   constructor(directory, prompt) { this.file = path.join(directory, 'settings.json'); this.prompt = prompt; }
   get() {
-    let saved = {}, recovered = false;
+    let saved = {}, recovered = false, primaryLoaded = false;
     const read = file => {
       const value = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
       if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -58,7 +87,7 @@ class SettingsStore {
       return value;
     };
     if (fs.existsSync(this.file) || fs.existsSync(`${this.file}.last-good`)) {
-      try { saved = read(this.file); }
+      try { saved = read(this.file); primaryLoaded = true; }
       catch {
         try { saved = read(`${this.file}.last-good`); recovered = true; }
         catch { throw new Error('설정 파일을 읽지 못했습니다. 기존 파일을 보존했으니 실행 자료 폴더의 settings.json을 확인하세요.'); }
@@ -68,7 +97,14 @@ class SettingsStore {
     // A backup may predate the user's Stop click. Recovery must never silently
     // re-enable publication while preserving all writing preferences.
     if (recovered) blog.automationEnabled = false;
-    return { ...saved, blog };
+    const normalized = { ...saved, blog };
+    if (primaryLoaded && JSON.stringify(saved.blog) !== JSON.stringify(blog)) {
+      // Prompt and schema migrations are durable immediately, so restarting
+      // before another UI edit cannot restore obsolete writing rules.
+      atomicJson(`${this.file}.last-good`, normalized);
+      atomicJson(this.file, normalized);
+    }
+    return normalized;
   }
   set(patch, { automation = false } = {}) {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)
@@ -244,4 +280,4 @@ class BlogController {
     return this.state();
   }
 }
-module.exports = { defaults, normalizeBlog, atomicJson, SettingsStore, BackendRunner, BlogController, safeLog };
+module.exports = { defaults, normalizeBlog, migratePrompt, atomicJson, SettingsStore, BackendRunner, BlogController, safeLog };

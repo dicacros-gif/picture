@@ -362,10 +362,15 @@ def main():
             original = args.data_dir / 'self-test-original.png'
             Image.new('RGB', (640, 480), (42, 83, 72)).save(original)
             caption = clean_export(original, args.data_dir / 'self-test-caption.jpg',
-                                   caption='맥 한글 확인', target_long_side=640)
+                                   caption='맥 사진 어디서 볼까?', target_long_side=640)
             cover = clean_export(original, args.data_dir / 'self-test-cover.jpg',
-                                 headline='맥 블로그', target_long_side=640)
-            if not caption.get('caption_text') or not cover.get('cover_text_applied'):
+                                 headline='맥 블로그 잘 보일까?', target_long_side=640)
+            expected_colors = ['#FFFFFF', '#8CE88C', '#FF4040']
+            if (not caption.get('caption_text') or not cover.get('cover_text_applied')
+                    or cover.get('cover_text_alignment') != 'center'
+                    or cover.get('cover_text_colors') != expected_colors
+                    or caption.get('caption_text_alignment') != 'center'
+                    or caption.get('caption_text_colors') != expected_colors):
                 raise RuntimeError('한국어 이미지 출력 검사를 통과하지 못했습니다.')
             emit('result', result={'ok': True, 'platform': sys.platform, 'engine': 'shared-cli-workflow',
                                   'korean_image_export': True})

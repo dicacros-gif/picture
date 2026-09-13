@@ -48,7 +48,7 @@ jobs:
         # These publication/recovery changes are imported directly by the Mac adapter.
         # Exercise them on ARM64 as well as the Mac-specific tests above.
         working-directory: windows
-        run: python -m unittest test_cover_render_recovery test_publish_late_recovery test_published_hashtag_colors -q
+        run: python -m unittest test_cover_render_recovery test_publish_late_recovery test_published_hashtag_colors test_naver_publish test_publish_panel_open test_image_delivery test_blog_visual_style -q
       - name: Bundle shared Blog engine for M1
         working-directory: mac-app
         run: bash scripts/build-backend.sh
