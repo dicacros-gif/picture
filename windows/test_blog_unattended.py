@@ -128,7 +128,7 @@ class CandidateRetryTests(unittest.TestCase):
             app._rank_longtail_topics.assert_called_once()
             self.assertFalse((Path(folder) / "pending-blog-topic.json").exists())
 
-    def test_exhausted_quality_attempts_save_private_draft_and_release_next_topic(self):
+    def test_quality_failure_saves_private_draft_without_repeating_and_releases_next_topic(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
             app, config = self.make_cycle(folder)
             run = Path(folder) / "blog-runs" / "quality-hold"
@@ -140,12 +140,13 @@ class CandidateRetryTests(unittest.TestCase):
             }), encoding="utf-8")
             (run / "manifest.json").write_text(json.dumps({"images": [], "image_candidates": []}), encoding="utf-8")
             workflow.return_value.select_topic.return_value = {"topic": "A", "keywords": ["A 방법"]}
-            app._prepare_cli_worker.side_effect = WorkflowError("품질 검수 실패", run)
+            app._prepare_cli_worker.side_effect = WorkflowError(
+                "팩트 보강 단계가 기존 제목·문단을 변경했습니다", run)
             app._publish_cli_worker.return_value = {"saved": True, "published": False, "status": "draft_saved"}
 
             app._cli_automation_cycle(config)
 
-            self.assertEqual(app._prepare_cli_worker.call_count, 3)
+            self.assertEqual(app._prepare_cli_worker.call_count, 1)
             self.assertEqual(app._publish_cli_worker.call_count, 1)
             args, kwargs = app._publish_cli_worker.call_args
             self.assertFalse(args[1]["publish"])

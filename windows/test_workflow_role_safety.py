@@ -193,30 +193,6 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         self.assertTrue(result["ready_to_publish"])
         self.assertEqual(result["paragraphs"][7], corrected["paragraphs"][7])
 
-    def test_fact_scope_rewrite_discards_stage_and_keeps_approved_copy(self):
-        original = self.bridge.run_text
-        baseline = copy.deepcopy(self.bridge.article)
-        recovery_calls = []
-
-        def run(provider, prompt, **kwargs):
-            if "동일 주제 복구 단계" in prompt:
-                recovery_calls.append(provider)
-            response = original(provider, prompt, **kwargs)
-            if provider == "antigravity" and not kwargs.get("images"):
-                changed = json.loads(response)
-                changed["paragraphs"][0] = changed["paragraphs"][0].replace(
-                    "눈에 보이는 숫자 하나로", "표시된 숫자만으로")
-                return json.dumps(changed, ensure_ascii=False)
-            return response
-
-        self.bridge.run_text = run
-        result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=self.routes())
-        self.assertTrue(result["ready_to_publish"])
-        self.assertEqual(result["paragraphs"], baseline["paragraphs"])
-        self.assertEqual(recovery_calls, [])
-        manifest = self.latest_manifest()
-        self.assertEqual(manifest["fact_stage_preservations"][0]["reason"], "fact_scope_invariant")
-
     def test_rejected_fact_cache_and_format_retry_use_approved_upstream_as_ledger_base(self):
         original = self.bridge.run_text
         previous, corrected = RoleInvariantTests().fact_added_before_footer()

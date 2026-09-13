@@ -1261,6 +1261,20 @@ class BlogWorkflowControls(UnattendedControls):
                         "quality_hold": True})
         return article
 
+    @staticmethod
+    def _quality_hold_error(exc):
+        if isinstance(exc, WorkflowReviewRequired):
+            return True
+        message = str(exc)
+        return any(marker in message for marker in (
+            "팩트 보강 단계가 기존 제목·문단을 변경했습니다",
+            "최종 검수",
+            "검수를 통과한 서로 다른 이미지",
+            "이미지가 필요합니다",
+            "원고 보완이 필요",
+            "본문 사실·출처·자연스러운 문장 검수",
+        ))
+
     def _save_quality_hold_draft(self, config, pending, topic, keywords, run_dir, attempts, budget=None):
         article = self._quality_draft_from_run(run_dir, topic, keywords)
         if article is None:
@@ -1357,6 +1371,13 @@ class BlogWorkflowControls(UnattendedControls):
                 problem = access_error_from_exception(exc)
                 if problem:
                     raise problem from exc
+                if self._quality_hold_error(exc) and self._quality_draft_from_run(
+                        resume_dir or recovery_config.get("resume_run_dir"), topic, keywords) is not None:
+                    attempts.append({"topic": topic, "stage": "quality_hold", "error": str(exc),
+                                     "run_dir": resume_dir})
+                    self._write_cycle_attempts(attempts)
+                    self._naver_log(f"'{topic}' 품질 기준 미달 · 반복 수정을 중단하고 네이버 임시저장으로 전환합니다.")
+                    break
                 if isinstance(exc, WorkflowReviewRequired):
                     pending.setdefault('config', copy.deepcopy(config))
                     pending['phase'] = 'review_required'
