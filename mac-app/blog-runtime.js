@@ -42,7 +42,7 @@ function defaults(prompt = '') {
   return { automationEnabled: false, intervalHours: 1, mode: 'draft', keyword: '',
     prompts: [{ id: 'default', name: '기본 글쓰기', text: prompt }], selectedPromptId: 'default',
     stages: ['chatgpt', 'claude', 'antigravity', 'chatgpt'].map((provider, i) => ({ provider, role: ROLES[i], model: '' })),
-    imageRetryLimit: 2, includeGoogle: true, googleReferenceCount: 4, progressHeight: 170, progressCollapsed: false };
+    imageRetryLimit: 2, includeGoogle: true, googleReferenceCount: 2, progressHeight: 170, progressCollapsed: false };
 }
 function normalizeBlog(input = {}, prompt = '') {
   if (!input || typeof input !== 'object' || Array.isArray(input)) input = {};
@@ -63,7 +63,7 @@ function normalizeBlog(input = {}, prompt = '') {
   if (!value.stages.length) value.stages = defaults(prompt).stages.slice(0, 1);
   value.imageRetryLimit = [0, 1, 2].includes(Number(value.imageRetryLimit)) ? Number(value.imageRetryLimit) : 2;
   value.includeGoogle = value.includeGoogle !== false;
-  value.googleReferenceCount = Math.round(Math.max(1, Math.min(10, Number(value.googleReferenceCount) || 4)));
+  value.googleReferenceCount = Math.round(Math.max(1, Math.min(2, Number(value.googleReferenceCount) || 2)));
   value.progressHeight = Math.round(Math.max(60, Math.min(600, Number(value.progressHeight) || 170)));
   value.progressCollapsed = value.progressCollapsed === true;
   return value;

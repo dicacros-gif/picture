@@ -518,7 +518,7 @@ function collectBlogSettings() {
     stages: stageDrafts.slice(0, stageCount).map(stage => ({ ...stage })),
     imageRetryLimit: Number($("blogImageRetries").value),
     includeGoogle: $("blogIncludeGoogle").checked,
-    googleReferenceCount: Math.max(1, Math.min(10, Number($("blogGoogleCount").value) || 4)),
+    googleReferenceCount: Math.max(1, Math.min(2, Number($("blogGoogleCount").value) || 2)),
     progressHeight,
     progressCollapsed
   };
@@ -920,7 +920,7 @@ window.addEventListener("beforeunload", event => {
     $("blogKeyword").value = preferences.keyword || "";
     $("blogIncludeGoogle").checked = preferences.includeGoogle !== false;
     $("blogImageRetries").value = String(preferences.imageRetryLimit ?? 2);
-    $("blogGoogleCount").value = preferences.googleReferenceCount ?? 4;
+    $("blogGoogleCount").value = preferences.googleReferenceCount ?? 2;
     progressHeight = Number(preferences.progressHeight) || 178;
     progressCollapsed = Boolean(preferences.progressCollapsed);
     blogRuntime.automationEnabled = Boolean(preferences.automationEnabled);

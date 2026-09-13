@@ -158,7 +158,7 @@ test('normalization allows only intervals 1–6 and caps models, presets and sta
     prompts: [{ id: 'id', name: 'one', text: 'one' }, { id: 'id', name: 'two', text: 'two' }], selectedPromptId: 'missing', googleReferenceCount: 2.7 });
   assert.equal(value.stages.length, 4); assert.equal(value.stages[0].model.length, 120);
   assert.equal(value.stages[0].provider, 'chatgpt'); assert.equal(value.prompts.length, 1);
-  assert.equal(value.selectedPromptId, 'id'); assert.equal(value.googleReferenceCount, 3);
+  assert.equal(value.selectedPromptId, 'id'); assert.equal(value.googleReferenceCount, 2);
 });
 
 test('runner decodes UTF-8 split inside Korean and accepts final line without newline', async () => {

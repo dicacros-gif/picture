@@ -5,6 +5,7 @@ const { spawn, execFileSync } = require("child_process");
 const crypto = require("crypto");
 const { SettingsStore, BackendRunner, BlogController, atomicJson, safeLog } = require('./blog-runtime');
 const isSmokeTest = process.argv.includes("--smoke-test");
+if (isSmokeTest && process.env.BLOG_SMOKE_DARK === '1') require('electron').nativeTheme.themeSource = 'dark';
 // Preserve the old Mac settings location even though the visible app name is Blog.
 if (isSmokeTest) {
   app.setPath('userData', path.join(app.getPath('temp'), `blog-mac-smoke-${process.pid}`));

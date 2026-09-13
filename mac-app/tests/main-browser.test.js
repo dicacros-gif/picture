@@ -55,7 +55,7 @@ function fixture({ owner, fetch: fetchImpl = async () => response(), firstInstan
   };
   const context = vm.createContext({
     require: name => mocks[name] || require(name),
-    process: { platform: 'darwin', argv: smokeTest ? ['--smoke-test'] : [], pid: 123 }, __dirname: '/app', Buffer, URL, AbortSignal, WebSocket: Socket,
+    process: { env: {}, platform: 'darwin', argv: smokeTest ? ['--smoke-test'] : [], pid: 123 }, __dirname: '/app', Buffer, URL, AbortSignal, WebSocket: Socket,
     fetch: (...args) => { requests.push(args); return fetchImpl(...args); },
     setTimeout: (fn, delay) => { const timer = { fn, delay }; timers.set(timer, timer); return timer; },
     clearTimeout: timer => timers.delete(timer)

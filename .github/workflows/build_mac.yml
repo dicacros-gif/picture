@@ -95,7 +95,7 @@ jobs:
           path: |
             mac-app/dist/Blog-M1-*.zip
             mac-app/dist/Blog-M1-*.sha256
-            mac-app/dist/Blog-M1-ui.png
+            mac-app/dist/Blog-M1-ui*.png
             mac-app/dist/signing-verification.json
             mac-app/dist/notarization.json
           if-no-files-found: error
