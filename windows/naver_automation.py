@@ -4042,6 +4042,34 @@ class NaverAutomation:
     @classmethod
     def _find_publish_control(cls, driver, final: bool = False):
         def finder():
+            # Naver's 2026 CSS-module panel can report an empty ``innerText``
+            # to WebDriver even while the final control is visible. Resolve the
+            # element and its containing panel atomically in the page first.
+            try:
+                direct = driver.execute_script(r"""
+                    const wantFinal=arguments[0];
+                    const normalized=e=>(e.innerText || e.textContent || '').replace(/\s+/g,' ').trim();
+                    const visible=e=>Boolean(e.getClientRects().length)
+                      && getComputedStyle(e).visibility!=='hidden'
+                      && getComputedStyle(e).display!=='none'
+                      && !e.disabled && e.getAttribute('aria-disabled')!=='true';
+                    const selector='[role="dialog"], .layer_publish, [class*="layer_publish"], '
+                      + '[class*="publish_layer"], [class*="publishLayer"], [class*="publish_container"], '
+                      + '[data-testid="publish-layer"]';
+                    const matched=[...document.querySelectorAll('button')].filter(e=>{
+                      if(!visible(e) || (normalized(e)!=='발행' && e.getAttribute('aria-label')!=='발행'
+                          && e.getAttribute('data-testid')!=='seOnePublishBtn')) return false;
+                      const panel=e.closest(selector), content=panel ? (panel.innerText || panel.textContent || '') : '';
+                      const inSettings=Boolean(panel && (/공개|카테고리|발행 설정|주제/.test(content)
+                        || e.getAttribute('data-testid')==='seOnePublishBtn'));
+                      return wantFinal ? inSettings : !panel;
+                    });
+                    return matched.length===1 ? matched[0] : null;
+                """, final)
+                if direct is not None and callable(getattr(direct, "click", None)):
+                    return direct
+            except Exception:
+                pass
             candidates = driver.find_elements(
                 By.XPATH,
                 "//button[normalize-space(.)='발행' or @aria-label='발행' or @data-testid='seOnePublishBtn']",

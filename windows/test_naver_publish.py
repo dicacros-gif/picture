@@ -1357,6 +1357,17 @@ class ReferenceCaptureLoadingTests(unittest.TestCase):
 
 
 class PublishControlTests(unittest.TestCase):
+    def test_atomic_current_panel_lookup_returns_unique_dom_control(self):
+        driver, final = MagicMock(), MagicMock()
+        driver.execute_script.return_value = final
+        with patch.object(NaverAutomation, "_find_across_frames", side_effect=lambda _d, finder: finder()):
+            self.assertIs(NaverAutomation._find_publish_control(driver, final=True), final)
+        driver.find_elements.assert_not_called()
+        script, requested_final = driver.execute_script.call_args.args
+        self.assertIn("seOnePublishBtn", script)
+        self.assertIn("textContent", script)
+        self.assertTrue(requested_final)
+
     def test_observed_css_module_publish_panel_without_dialog_role_finds_final_button(self):
         # Minimal actual 2026-09-12 Naver DOM: CSS-module suffixes, no role=dialog.
         html = '''<div><button class="publish_btn__v_kS9"><span>발행</span></button>
