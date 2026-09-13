@@ -4042,7 +4042,10 @@ class NaverAutomation:
     @classmethod
     def _find_publish_control(cls, driver, final: bool = False):
         def finder():
-            candidates = driver.find_elements(By.XPATH, "//button[normalize-space(.)='발행' or @aria-label='발행']")
+            candidates = driver.find_elements(
+                By.XPATH,
+                "//button[normalize-space(.)='발행' or @aria-label='발행' or @data-testid='seOnePublishBtn']",
+            )
             matched = []
             for button in candidates:
                 if not button.is_displayed() or not button.is_enabled():
@@ -4050,7 +4053,9 @@ class NaverAutomation:
                 scope = driver.execute_script("""
                     const e=arguments[0];
                     const panel=e.closest('[role="dialog"], .layer_publish, [class*="layer_publish"], [class*="publish_layer"], [class*="publishLayer"], [class*="publish_container"], [data-testid="publish-layer"]');
-                    return {inside:Boolean(panel), settings:Boolean(panel && /공개|카테고리|발행 설정|주제/.test(panel.innerText))};
+                    const content=panel ? (panel.innerText || panel.textContent || '') : '';
+                    return {inside:Boolean(panel), settings:Boolean(panel &&
+                      (/공개|카테고리|발행 설정|주제/.test(content) || e.matches('[data-testid="seOnePublishBtn"]')))};
                 """, button) or {}
                 if (final and scope.get("inside") and scope.get("settings")) or (not final and not scope.get("inside")):
                     matched.append(button)

@@ -1400,6 +1400,8 @@ class PublishControlTests(unittest.TestCase):
         with patch.object(NaverAutomation, "_find_across_frames", side_effect=lambda _d, finder: finder()):
             self.assertIs(NaverAutomation._find_publish_control(driver, final=False), buttons[0])
             self.assertIs(NaverAutomation._find_publish_control(driver, final=True), buttons[1])
+            self.assertIn("textContent", driver.execute_script.call_args.args[0])
+            self.assertIn("seOnePublishBtn", driver.find_elements.call_args.args[1])
             tree.find(".//p").text = "알 수 없는 안내"
             self.assertIsNone(NaverAutomation._find_publish_control(driver, final=True))
 
