@@ -7,13 +7,34 @@ from unittest.mock import Mock, patch
 
 from blog_quality import (inspect_article, apply_patches, local_cleanup, layout_article,
                           validate_intro_candidates, apply_selected_intro)
-from blog_workflow import BlogWorkflow, WorkflowFormatError, rank_topics
+from blog_workflow import (BlogWorkflow, WorkflowFormatError, rank_topics,
+                           bounded_editorial_issues, apply_title_fallback)
 from blog_stage_roles import check_role_change
 from test_blog_workflow import valid_article, KEYWORDS, TOPIC
 import test_blog_controls as ui_tests
 
 
 class EditorialTests(unittest.TestCase):
+    def test_editorial_prompt_bounds_repeated_findings_by_section(self):
+        issues = [{'code': 'sentence_rhythm', 'index': 0, 'text': f'긴 문장 {i}', 'detail': '나누기'}
+                  for i in range(40)]
+        issues += [{'code': 'numeric_comparison', 'index': 2, 'text': '숫자', 'detail': '비교'}]
+        selected = bounded_editorial_issues(issues)
+        self.assertLessEqual(len(selected), 20)
+        self.assertEqual(sum(item['code'] == 'sentence_rhythm' for item in selected), 1)
+        self.assertEqual(selected[0]['code'], 'numeric_comparison')
+
+    def test_invalid_title_uses_declared_search_intent_without_body_rewrite(self):
+        article = valid_article()
+        article['title'] = '짧은 제목'
+        article['title_intent'] = {
+            'question': '노트북 배터리 관리 방법은 무엇이며 충전 설정과 교체 시점은 어떻게 정해야 할까요',
+            'related_keywords': [KEYWORDS[0]],
+        }
+        paragraphs = copy.deepcopy(article['paragraphs'])
+        self.assertTrue(apply_title_fallback(article, KEYWORDS))
+        self.assertEqual(article['paragraphs'], paragraphs)
+        self.assertIn('?', article['title'])
     def numeric_article(self):
         article = valid_article()
         article['numeric_claims'] = []

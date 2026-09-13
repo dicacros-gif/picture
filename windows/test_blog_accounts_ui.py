@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import test_blog_controls as support
 from blog_accounts_ui import normalized_writer_accounts, validate_writer_accounts, writer_data_dir
@@ -52,3 +53,30 @@ class AccountsUiTests(unittest.TestCase):
         accounts = normalized_writer_accounts({}, 'firstblog')
         self.assertEqual(writer_data_dir(root, accounts[0]), root)
         self.assertEqual(writer_data_dir(root, accounts[1]), root / 'writer-accounts' / 'secondary' / 'edge')
+
+    def test_comment_automation_can_select_saved_edge_account_and_reuse_bot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.make_app(directory, {'blog_id': 'firstblog'})
+            _, enabled, browser, identifier = app.writer_accounts_ui.rows[1]
+            enabled.set(True)
+            browser.set('에지')
+            identifier.set('secondblog')
+            app.writer_accounts_ui.save()
+            app.comment_browser.set('에지')
+            edge_bot = MagicMock()
+            with patch('blog_browser.create_blog_browser', return_value=edge_bot) as create:
+                first = app._comment_automation_target()
+                second = app._comment_automation_target()
+            self.assertEqual(first, (edge_bot, 'secondblog'))
+            self.assertEqual(second, first)
+            create.assert_called_once()
+            app._autosave_general_settings()
+            saved = json.loads((Path(directory) / 'settings.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['comment_browser'], '에지')
+
+    def test_comment_edge_requires_account_two_edge_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = self.make_app(directory, {'blog_id': 'firstblog'})
+            app.comment_browser.set('에지')
+            with self.assertRaisesRegex(ValueError, '계정 2'):
+                app._comment_automation_target()

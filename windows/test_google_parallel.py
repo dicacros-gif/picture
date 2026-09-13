@@ -169,7 +169,7 @@ class GoogleParallelTests(unittest.TestCase):
         self.assertFalse(self.app._browser_task_busy())
         self.assertIs(self.app.naver_bot.stop_event, self.original_stop)
 
-    def test_first_query_pool_keeps_result_order_and_rejects_text_before_goal_count(self):
+    def test_first_query_pool_keeps_result_order_and_allows_scene_text_and_logos(self):
         photos = [self.photo(index) for index in range(8)]
         self.app.naver_bot.capture_google_reference_candidates.return_value = photos
         calls = [0]
@@ -179,18 +179,18 @@ class GoogleParallelTests(unittest.TestCase):
             if calls[0] == 1:
                 for item in result['images']:
                     item['text_free'] = False
+                    item['logo_free'] = False
             return result
         self.planner._text_call.side_effect = review
         self.run_prepare()
         self.app.naver_bot.capture_google_reference_candidates.assert_called_once()
         self.assertEqual(self.app.naver_bot.capture_google_reference_candidates.call_args.kwargs['count'], 8)
-        self.assertEqual([item['path'] for item in self.resolved], [item['path'] for item in photos[4:]])
+        self.assertEqual([item['path'] for item in self.resolved], [item['path'] for item in photos[:4]])
         self.assertEqual(self.planner._text_call.call_args_list[0].kwargs['images'], [item['path'] for item in photos[:4]])
-        self.assertEqual(self.planner._text_call.call_args_list[1].kwargs['images'], [item['path'] for item in photos[4:]])
         self.assertEqual(self.planner._text_call.call_args.args[4]['chatgpt'], 'stage-model')
         self.assertTrue(all('approved' not in item for item in self.resolved))
         sidecar = json.loads((self.run / 'google-search-checkpoint.json').read_text(encoding='utf-8'))
-        self.assertEqual(len(sidecar['prechecks']), 8)
+        self.assertEqual(len(sidecar['prechecks']), 4)
         self.assertEqual(sidecar['candidate_count'], 4)
 
     def test_max_twelve_photos_three_prechecks_with_alternative_query(self):
@@ -214,7 +214,7 @@ class GoogleParallelTests(unittest.TestCase):
         photo = self.photo(0)
         job = _GoogleSearchJob(self.app, '주제', ['연관어'], self.config)
         job.run_dir = self.run
-        for change in ({'index': True}, {'index': 1}, {'text_free': 'true'}, {'image_observed': None}):
+        for change in ({'index': True}, {'index': 1}, {'watermark_free': 'true'}, {'image_observed': None}):
             with self.subTest(change=change):
                 result = self.review_images(images=[photo['path']])
                 result['images'][0].update(change)

@@ -318,6 +318,23 @@ class PublishTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.app._validate_publish_article(invalid)
 
+    def test_fast_google_policy_allows_scene_text_but_never_a_watermark(self):
+        from image_delivery import CAPTION_RENDER_VERSION
+        self._append_google_images(1, captions=True)
+        item = self.article['images'][-1]
+        observed = {'image_observed': True, 'watermark_free': True, 'photorealistic': True}
+        item.update(caption_text='방문 전에 뭘 볼까?', caption_placement='center',
+                    caption_layout='center_overlay', caption_band_height=0,
+                    caption_render_version=CAPTION_RENDER_VERSION,
+                    caption_text_colors=list(OVERLAY_TEXT_COLORS), caption_panel_color='#000000',
+                    original_text_free=False, original_watermark_free=True,
+                    metadata_stripped=True, review_policy='google-watermark-photorealistic-precheck-v2',
+                    source_reviews=[observed], reviews=[observed])
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 7)
+        item['source_reviews'][0]['watermark_free'] = False
+        with self.assertRaisesRegex(ValueError, '워터마크'):
+            self.app._validate_publish_article(self.article)
+
     def test_new_cover_palette_is_white_green_red_while_old_approval_stays_readable(self):
         from image_delivery import COVER_RENDER_VERSION
         self.test_generated_cover_policy_allows_only_separately_verified_reference_captions()

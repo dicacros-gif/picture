@@ -700,6 +700,10 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.comment_interval = StringVar(value=self.settings.get("comment_interval", "5"))
         self.neighbor_interval = StringVar(value=self.settings.get("neighbor_interval", "60"))
         self.neighbor_max = StringVar(value=self.settings.get("neighbor_max", "5"))
+        self.comment_browser = StringVar(
+            value=self.settings.get("comment_browser", "웨일")
+            if self.settings.get("comment_browser", "웨일") in {"웨일", "에지"} else "웨일"
+        )
         self.naver_bot = NaverAutomation(APP_DIR, self._naver_log)
         self.chatgpt_classic = ChatGPTClassicAutomation(
             self._naver_log, self.naver_bot.stop_event
@@ -725,7 +729,7 @@ class PictureCleanerApp(BlogWorkflowControls):
 
     def _general_settings_snapshot(self):
         names = ("folder", "today_only", "recycle", "claude_cli_model", "antigravity_cli_model",
-                 "blog_id", "comment_days", "comment_interval", "neighbor_interval", "neighbor_max",
+                 "blog_id", "comment_days", "comment_interval", "neighbor_interval", "neighbor_max", "comment_browser",
                  "dark_mode", "blog_auto_images", "auto_use_claude", "auto_use_antigravity",
                  "auto_interval_hours", "auto_image_count")
         settings = {name: getattr(self, name).get() for name in names if hasattr(self, name)}
@@ -941,7 +945,8 @@ class PictureCleanerApp(BlogWorkflowControls):
         )
         style.map(
             "TButton",
-            background=[("active", colors["panel_alt"]), ("pressed", colors["border"])],
+            background=[("disabled", colors["panel_alt"]), ("active", colors["panel_alt"]), ("pressed", colors["border"])],
+            foreground=[("disabled", "#d3dbe5" if dark else "#667788")],
         )
         style.configure(
             "Accent.TButton", background=colors["primary"], foreground="#ffffff"
@@ -1026,6 +1031,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             foreground=[
                 ("readonly", colors["text"]),
                 ("focus", colors["text"]),
+                ("disabled", "#d3dbe5" if dark else "#667788"),
             ],
             selectbackground=[("readonly", colors["selection"])],
             selectforeground=[("readonly", colors["text"])],
@@ -1478,19 +1484,26 @@ class PictureCleanerApp(BlogWorkflowControls):
     def _comment_ui(self):
         form = ttk.LabelFrame(
             self.comment_tab,
-            text="네이버 웨일 댓글 자동화 설정",
+            text="네이버 댓글 자동화 설정",
             padding=12,
             style="Panel.TLabelframe",
         )
         form.pack(fill="x")
+        browser_block = ttk.Frame(form)
+        browser_block.grid(row=0, column=0, sticky="w", padx=(0, 14))
+        ttk.Label(browser_block, text="자동화 브라우저").pack(anchor="w")
+        browser_box = ttk.Combobox(browser_block, textvariable=self.comment_browser,
+                                   values=["웨일", "에지"], state="readonly", width=8)
+        browser_box.pack(anchor="w", pady=(3, 0))
+        browser_box.bind("<<ComboboxSelected>>", lambda _event: self._schedule_general_settings_save())
         labels = [
-            ("네이버 블로그 ID", self.blog_id, 18),
+            ("웨일 블로그 ID", self.blog_id, 18),
             ("최근 글 일수", self.comment_days, 8),
             ("답글 간격(초)", self.comment_interval, 8),
             ("이웃 댓글 간격(초)", self.neighbor_interval, 8),
             ("이웃 최대 글 수(최대 200)", self.neighbor_max, 10),
         ]
-        for col, (label, variable, width) in enumerate(labels):
+        for col, (label, variable, width) in enumerate(labels, 1):
             block = ttk.Frame(form)
             block.grid(row=0, column=col, sticky="w", padx=(0, 14))
             ttk.Label(block, text=label).pack(anchor="w")
@@ -1505,6 +1518,11 @@ class PictureCleanerApp(BlogWorkflowControls):
             text="이웃 새글: 입력한 간격과 최대 개수에 따라 다양한 문구를 사용합니다. 처리 기록으로 중복 작성을 막습니다.",
             style="Sub.TLabel",
         ).pack(anchor="w")
+        ttk.Label(
+            self.comment_tab,
+            text="에지는 3번 탭의 계정 2에 저장한 에지 블로그 ID와 전용 로그인 프로필을 사용합니다.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(3, 0))
         actions = ttk.Frame(self.comment_tab)
         actions.pack(fill="x", pady=12)
         ttk.Button(actions, text="내 글 답글·하트 시작", style="Accent.TButton", command=self.start_own_comments).pack(
@@ -1540,16 +1558,17 @@ class PictureCleanerApp(BlogWorkflowControls):
         if diagnostics is not None:
             diagnostics.close()
 
-    def _start_naver_task(self, label, target, *args):
+    def _start_naver_task(self, label, target, *args, bot=None):
         if self._browser_task_busy():
             messagebox.showinfo(APP_NAME, "실시간 조회 또는 브라우저 자동화 작업이 실행 중입니다. 완료하거나 중지한 뒤 실행하세요.")
             return
         self.naver_task_active = True
-        self.naver_bot.reset_stop()
+        bot = bot or self.naver_bot
+        bot.reset_stop()
 
         def work():
             try:
-                if self.naver_bot.stop_event.is_set() or getattr(self, "_closing", False):
+                if bot.stop_event.is_set() or getattr(self, "_closing", False):
                     return
                 self._naver_log(f"{label} 준비 중...")
                 target(*args)
@@ -2039,27 +2058,56 @@ class PictureCleanerApp(BlogWorkflowControls):
         except Exception:
             raise ValueError(f"{label}은(는) {minimum} 이상의 숫자로 입력하세요.")
 
+    def _comment_automation_target(self):
+        """Return the selected owned browser and its verified blog identity."""
+        selected = self.comment_browser.get().strip()
+        if selected == "웨일":
+            blog_id = self.blog_id.get().strip()
+            if not blog_id:
+                raise ValueError("웨일 블로그 ID를 입력하세요.")
+            return self.naver_bot, blog_id
+        from blog_accounts_ui import normalized_writer_accounts, writer_data_dir
+        account = next((row for row in normalized_writer_accounts(self.settings, self.blog_id.get())
+                        if row["id"] == "secondary" and row["browser"] == "edge"), None)
+        if account is None or not account.get("blog_id"):
+            raise ValueError("3번 탭 계정 2에서 에지와 블로그 ID를 저장한 뒤 로그인하세요.")
+        cache = getattr(self, "_account_login_bots", {})
+        self._account_login_bots = cache
+        key = (account["id"], account["browser"], account["blog_id"])
+        bot = cache.get(key)
+        if bot is None:
+            from blog_browser import create_blog_browser
+            label = f"에지 · {account['blog_id']}"
+            logger = lambda message: self.events.put(("account_log", "secondary", label, str(message)))
+            bot = cache[key] = create_blog_browser(
+                writer_data_dir(self.cli_app_dir, account), logger,
+                browser="edge", blog_id=account["blog_id"])
+        return bot, account["blog_id"]
+
     def start_own_comments(self):
         try:
             days = self._positive_int(self.comment_days.get(), "최근 글 일수", 1)
             interval = self._positive_int(self.comment_interval.get(), "답글 간격", 0)
+            bot, blog_id = self._comment_automation_target()
         except ValueError as exc:
             messagebox.showinfo(APP_NAME, str(exc))
             return
         self.status.set(f"최근 {days}일 미응답 댓글·하트 작업을 바로 시작합니다.")
         self._start_naver_task(
             "내 글 답글·하트",
-            self.naver_bot.run_own_posts,
-            self.blog_id.get().strip(),
+            bot.run_own_posts,
+            blog_id,
             days,
             interval,
             True,
+            bot=bot,
         )
 
     def start_neighbor_comments(self):
         try:
             interval = self._positive_int(self.neighbor_interval.get(), "이웃 댓글 간격", 10)
             maximum = self._positive_int(self.neighbor_max.get(), "이웃 최대 글 수", 1)
+            bot, blog_id = self._comment_automation_target()
         except ValueError as exc:
             messagebox.showinfo(APP_NAME, str(exc))
             return
@@ -2069,10 +2117,11 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.status.set(f"이웃 새글 {maximum}개, {interval}초 간격 작업을 바로 시작합니다.")
         self._start_naver_task(
             "이웃 새글 댓글",
-            self.naver_bot.run_neighbor_posts,
-            self.blog_id.get().strip(),
+            bot.run_neighbor_posts,
+            blog_id,
             interval,
             maximum,
+            bot=bot,
         )
 
     def choose_folder(self):

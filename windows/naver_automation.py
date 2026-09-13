@@ -3485,14 +3485,24 @@ class NaverAutomation:
             if item.get("approved") is not True:
                 raise ValueError("승인되지 않은 이미지는 발행할 수 없습니다.")
             if item.get("provider") == "google":
-                if (not isinstance(reviews, list) or not reviews or any(
-                        not isinstance(review, dict) or review.get("approved") is not True for review in reviews)):
-                    raise ValueError("Google 캡처에는 통과한 CLI 시각 검수 기록이 필요합니다.")
                 source_reviews = item.get("source_reviews")
-                if source_reviews is not None and (not isinstance(source_reviews, list) or not source_reviews or any(
-                        not isinstance(review, dict) or review.get("approved") is not True
-                        or review.get("text_free") is not True for review in source_reviews)):
-                    raise ValueError("Google 원사진의 글자·로고·워터마크 검수 기록이 필요합니다.")
+                watermark_policy = item.get("review_policy") == "google-watermark-photorealistic-precheck-v2"
+                if watermark_policy:
+                    if (not isinstance(source_reviews, list) or not source_reviews or any(
+                            not isinstance(review, dict) or review.get("image_observed") is not True
+                            or review.get("watermark_free") is not True
+                            or review.get("photorealistic") is not True for review in source_reviews)):
+                        raise ValueError("Google 원사진의 워터마크 없음·실사 검수 기록이 필요합니다.")
+                    if item.get("metadata_stripped") is not True:
+                        raise ValueError("Google 캡처의 업로드 사본과 메타데이터 정리를 확인하지 못했습니다.")
+                else:
+                    if (not isinstance(reviews, list) or not reviews or any(
+                            not isinstance(review, dict) or review.get("approved") is not True for review in reviews)):
+                        raise ValueError("Google 캡처에는 통과한 CLI 시각 검수 기록이 필요합니다.")
+                    if source_reviews is not None and (not isinstance(source_reviews, list) or not source_reviews or any(
+                            not isinstance(review, dict) or review.get("approved") is not True
+                            or review.get("text_free") is not True for review in source_reviews)):
+                        raise ValueError("Google 원사진의 글자·로고·워터마크 검수 기록이 필요합니다.")
             else:
                 local_ok = (item.get("local_file_validated") is True
                     and item.get("local_validation_policy") == LOCAL_IMAGE_VALIDATION_POLICY
@@ -3518,16 +3528,18 @@ class NaverAutomation:
                                   and isinstance(caption, str) and caption.endswith("?"))
                 if (not isinstance(caption, str) or not 1 <= len(caption) <= 28
                         or not re.search(r"[가-힣]", caption) or re.search(r"https?://|www\.|[\r\n]", caption, re.I)
-                        or item.get("caption_applied") is not True or item.get("original_text_free") is not True
+                        or item.get("caption_applied") is not True
+                        or (not watermark_policy and item.get("original_text_free") is not True)
                         or not (legacy_band or center_overlay)
                         or item.get("cover_headline") or item.get("cover_text_applied")):
-                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 흰색·형광 녹색·빨간색의 가운데 한글 질문 문구가 필요합니다.")
-                for review in reviews:
-                    if (any(review.get(flag) is not True for flag in ("caption_exact", "caption_legible", "no_other_text"))
-                            or review.get("text_free") is not False
-                            or not isinstance(review.get("detected_text"), str)
-                            or re.sub(r"\s+", "", review["detected_text"]) != re.sub(r"\s+", "", caption)):
-                        raise ValueError("Google 참고 이미지에 추가한 캡션의 정확성·가독성·다른 글자 없음 검수가 필요합니다.")
+                    raise ValueError("Google 참고 이미지에는 허용된 원본 검수와 흰색·형광 녹색·빨간색의 가운데 한글 질문 문구가 필요합니다.")
+                if not watermark_policy:
+                    for review in reviews:
+                        if (any(review.get(flag) is not True for flag in ("caption_exact", "caption_legible", "no_other_text"))
+                                or review.get("text_free") is not False
+                                or not isinstance(review.get("detected_text"), str)
+                                or re.sub(r"\s+", "", review["detected_text"]) != re.sub(r"\s+", "", caption)):
+                            raise ValueError("Google 참고 이미지에 추가한 캡션의 정확성·가독성·다른 글자 없음 검수가 필요합니다.")
             checked.append({**item, "path": str(path), "sha256": digest})
         # Stable sort retains caller order when more than one picture shares a paragraph.
         checked.sort(key=lambda item: item["paragraph_index"])

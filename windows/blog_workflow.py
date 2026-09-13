@@ -28,7 +28,7 @@ from blog_numeric_claims import numeric_claim_issues
 from blog_image_review import (evaluate_image_review, image_review_classification_schema,
                                image_review_classification_prompt)
 from blog_parallel_images import ImageGenerationBatch, CombinedCancelSignal, provider_lanes
-from blog_title import build_title_guidance
+from blog_title import build_title_guidance, fallback_intent_title
 from blog_visual_style import (IMAGE_POLICY, LOCAL_IMAGE_VALIDATION_POLICY, cover_headline,
                                choose_visual_style, image_prompt as build_image_prompt)
 
@@ -45,6 +45,58 @@ INTENT_WORDS = (
     "준비", "설정", "오류", "해결", "사용법", "비용", "가격", "주의", "원인", "대상",
 )
 EXPLAINER_WORDS = ("방법", "설정", "오류", "사용법", "청소", "정리", "준비", "절약", "관리", "조건")
+
+
+def bounded_editorial_issues(issues, limit=20):
+    """Keep a representative, actionable repair set instead of resending noise.
+
+    The full report is still inspected again and the deterministic cleanup sees
+    every remaining finding.  The bound only limits the expensive CLI patch
+    request, especially dozens of identical sentence-rhythm observations.
+    """
+    if not isinstance(issues, list):
+        return []
+    priority = {
+        "title_keyword", "title_synthesis", "opening_hook", "public_source",
+        "tool_attribution", "numeric_claim_metadata", "numeric_conflict",
+        "numeric_comparison", "sections", "total_length",
+    }
+    ordered = sorted(enumerate(issues), key=lambda pair: (pair[1].get("code") not in priority, pair[0]))
+    chosen, seen, per_section = [], set(), {}
+    for _position, issue in ordered:
+        if not isinstance(issue, dict):
+            continue
+        code, index = str(issue.get("code", "")), issue.get("index", -1)
+        text = str(issue.get("text", ""))
+        signature = (code, index, text)
+        if signature in seen:
+            continue
+        key = (code, index)
+        allowance = 1 if code in {"sentence_rhythm", "ending", "definition_without_analogy"} else 2
+        if per_section.get(key, 0) >= allowance:
+            continue
+        chosen.append(issue)
+        seen.add(signature)
+        per_section[key] = per_section.get(key, 0) + 1
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def apply_title_fallback(article, keywords):
+    """Repair only an invalid title from the response's declared intent."""
+    if not isinstance(article, dict):
+        return False
+    title = article.get("title")
+    invalid = (not isinstance(title, str) or not 8 <= len(title.strip()) <= 70 or "\n" in str(title)
+               or "?" not in str(title) or bool(re.search(r"[,\*#`:;<>]", str(title))))
+    if not invalid:
+        return False
+    replacement = fallback_intent_title(article, keywords)
+    if not replacement:
+        return False
+    article["title"] = replacement
+    return True
 
 
 class WorkflowError(RuntimeError):
@@ -267,10 +319,18 @@ def rank_topics(groups: dict, related_by_topic: dict, exclude_topics=None, block
         explainer = any(word in " ".join([topic, *keywords[:10]]) for word in EXPLAINER_WORDS)
         source_bonus = 40 if appearances[key] >= 3 else 25 if appearances[key] == 2 else 0
         related_bonus = min(len(keywords), 30) * 4
+        # Five distinct related queries are the first strong signal that the
+        # trend has a usable question cluster rather than being a bare name.
+        # Keep sparse candidates as a last-resort fallback so a cycle does not
+        # fail when every source is temporarily thin.
+        intent_depth_bonus = min(30, max(0, len(keywords) - 4) * 5)
+        multi_source_intent_bonus = 15 if appearances[key] >= 2 and len(keywords) >= 5 else 0
         score = (
             source_bonus
             + max(0, 10 - best_rank[key])
             + related_bonus
+            + intent_depth_bonus
+            + multi_source_intent_bonus
             + min(len(questions), 6) * 7
             + (14 if explainer else 0)
         )
@@ -280,13 +340,14 @@ def rank_topics(groups: dict, related_by_topic: dict, exclude_topics=None, block
         score = max(0, min(100, score))
         reason = (
             f"검색 의도 기반 CTR 대리지표 {score}/100 (실측 CTR 아님). "
-            f"트렌드 출처 {appearances[key]}개, 연관어 {len(keywords)}개(+{related_bonus}점), 질문형 의도 {len(questions)}개. "
+            f"트렌드 출처 {appearances[key]}개, 연관어 {len(keywords)}개(+{related_bonus + intent_depth_bonus}점), 질문형 의도 {len(questions)}개. "
             + "브랜드·인물 여부보다 연관 검색어가 드러내는 최신 검색 의도를 우선 평가. "
             + "이미지 권리 보증이 아니며 개별 검수가 필요합니다."
         )
         result.append({"topic": topic, "keywords": keywords, "score": score, "reason": reason,
                        "source_count": appearances[key], "source_bonus": source_bonus,
-                       "related_bonus": related_bonus, "raw_score": raw_score,
+                       "related_bonus": related_bonus, "intent_depth_bonus": intent_depth_bonus,
+                       "multi_source_intent_bonus": multi_source_intent_bonus, "raw_score": raw_score,
                        "questions": questions, "image_risk": "개별 확인 필요"})
     return sorted(result, key=lambda item: (-item["score"], -item["raw_score"], -len(item["keywords"]), item["topic"].casefold()))
 
@@ -1579,11 +1640,17 @@ class BlogWorkflow:
         original = json.dumps(article, ensure_ascii=False, sort_keys=True)
         for attempt in range(1, 3):
             self._check_cancelled()
-            issues = inspect_article(article, keywords, topic, mode=editorial_mode,
-                                     canned_phrases=canned_phrases)
-            if not issues:
+            all_issues = inspect_article(article, keywords, topic, mode=editorial_mode,
+                                         canned_phrases=canned_phrases)
+            if not all_issues:
                 break
-            self.log(f"발행 전 원고 검사 · {len(issues)}건 · 부분 수정 {attempt}/2")
+            issues = bounded_editorial_issues(all_issues)
+            omitted = len(all_issues) - len(issues)
+            summary = ", ".join(f"{code} {sum(1 for item in all_issues if item.get('code') == code)}"
+                                for code in sorted({str(item.get('code', '')) for item in all_issues}))
+            self.log(f"발행 전 원고 검사 · {len(all_issues)}건 · CLI에는 대표 {len(issues)}건만 부분 수정 {attempt}/2"
+                     + (f" · 반복 {omitted}건은 코드 보완" if omitted else ""))
+            self.log("원고 검사 요약 · " + summary)
             for issue in issues:
                 self.log(f"원고 검사 [{issue['code']}] {issue['index'] + 1}구역 · {issue['detail']}")
             title_repair = any(issue['code'] in {'title_keyword', 'title_synthesis'} for issue in issues)
@@ -1616,7 +1683,10 @@ class BlogWorkflow:
             )
             record = {'attempt': attempt, 'issues': issues}
             try:
-                response = self._text_call(run_dir, f'editorial-repair-{attempt}', provider, prompt, selected_models)
+                editorial_options = ({'timeout': 180, 'retry_transient': False}
+                                     if self.budget is not None else {})
+                response = self._text_call(run_dir, f'editorial-repair-{attempt}', provider, prompt,
+                                           selected_models, **editorial_options)
                 article = apply_patches(article, response, issues)
                 record['remaining'] = inspect_article(article, keywords, topic, mode=editorial_mode,
                                                       canned_phrases=canned_phrases)
@@ -1792,7 +1862,8 @@ class BlogWorkflow:
                 provider = actual["provider"]
                 try:
                     result = self._text_call(run_dir, f"{name}-review-{sequence}-{provider}", provider, prompt,
-                        {**models, provider: actual.get("model", "")}, images=[str(candidate["path"])])
+                        {**models, provider: actual.get("model", "")}, images=[str(candidate["path"])],
+                        timeout=120, retry_transient=False)
                     break
                 except Exception as exc:
                     self._check_cancelled()
@@ -2132,7 +2203,9 @@ class BlogWorkflow:
             + "\nEND_UNTRUSTED_FINAL_ARTICLE_JSON"
         )
         self.log(f"최종 원고 {provider} CLI 집중 검수")
-        review = self._text_call(run_dir, f"final-review-{sequence}-{provider}", provider, prompt, models, reserve_seconds=300)
+        review = self._text_call(run_dir, f"final-review-{sequence}-{provider}", provider, prompt, models,
+                                 timeout=180 if self.budget is not None else None,
+                                 retry_transient=self.budget is None, reserve_seconds=300)
         return {"provider": provider, "review": review}
 
     def resume(self, run_dir: Path) -> dict:
@@ -2388,10 +2461,21 @@ class BlogWorkflow:
                 result = None
                 review_provider = provider
                 response_name = stage_name
+                # Hourly runs have a hard 50-minute cycle budget.  Drafting may
+                # take longer, while every later pass must hand off quickly to
+                # the next configured CLI instead of waiting twice for the same
+                # transient provider failure.
+                timed_stage = self.budget is not None
+                stage_call_options = ({"timeout": 360 if index == 1 else 180,
+                                       "retry_transient": index == 1}
+                                      if timed_stage else {})
                 try:
                     try:
-                        result = self._text_call(run_dir, stage_name, provider, prompt, stage_models)
+                        result = self._text_call(run_dir, stage_name, provider, prompt, stage_models,
+                                                 **stage_call_options)
                         _canonical_title_intent(result, topic, keywords)
+                        if apply_title_fallback(result, keywords):
+                            self.log(f"{provider} CLI의 제목 형식만 검색 의도 메타데이터로 즉시 보완했습니다.")
                         restore_fact_spacing(result)
                         if role:
                             try:
@@ -2426,9 +2510,13 @@ class BlogWorkflow:
                                          + ("이번 지적은 cover_headline 문구에만 해당한다. cover_headline과 review.changes만 보완하고 제목·본문·출처·이미지 계획·다른 메타데이터는 이전 응답 그대로 반환한다. "
                                             "본문을 다시 쓰지 말고 문구는 자연스럽게 띄어 쓴 의미 있는 한글 질문으로 작성하여 ?로 끝낸다.\n" if overlay_only_repair else "")
                                          + json.dumps({"format_error": str(format_error), "invalid_response": raw}, ensure_ascii=False))
-                        result = self._text_call(run_dir, stage_name + "-format-retry", provider, repair_prompt, stage_models)
+                        retry_options = ({"timeout": 180, "retry_transient": False} if timed_stage else {})
+                        result = self._text_call(run_dir, stage_name + "-format-retry", provider, repair_prompt,
+                                                 stage_models, **retry_options)
                         response_name = stage_name + "-format-retry"
                         _canonical_title_intent(result, topic, keywords)
+                        if apply_title_fallback(result, keywords):
+                            self.log(f"{provider} CLI의 수정 응답 제목만 검색 의도 메타데이터로 보완했습니다.")
                         restore_fact_spacing(result)
                         if overlay_only_repair and ({key: value for key, value in before_overlay_repair.items()
                                                      if key not in {'cover_headline', 'review'}} !=
@@ -2490,21 +2578,45 @@ class BlogWorkflow:
                         backup_models = dict(models)
                         if backup.get("model"):
                             backup_models[backup["provider"]] = backup["model"]
-                        result = self._text_call(run_dir, stage_name + "-recovery", backup["provider"], recovery, backup_models)
-                        response_name = stage_name + "-recovery"
-                        _canonical_title_intent(result, topic, keywords)
-                        restore_fact_spacing(result)
-                        if role:
-                            try:
-                                check_role_change(role, article, result)
-                            except ValueError as exc:
-                                raise WorkflowFormatError(str(exc)) from exc
-                        _validate_article(result, keywords, require_visual_style=True, require_overlay_question=True)
-                        review_provider = backup["provider"]
-                        actual_route = {**requested_route, "provider": review_provider, "model": backup_models.get(review_provider, ""),
-                                        "requested_provider": provider, "requested_model": requested_route["model"]}
-                        manifest.setdefault("recoveries", []).append({"stage": index, "failed_provider": provider,
-                            "provider": backup["provider"], "role": role, "error": str(stage_error)})
+                        try:
+                            recovery_options = ({"timeout": 180, "retry_transient": False} if timed_stage else {})
+                            result = self._text_call(run_dir, stage_name + "-recovery", backup["provider"], recovery,
+                                                     backup_models, **recovery_options)
+                            response_name = stage_name + "-recovery"
+                            _canonical_title_intent(result, topic, keywords)
+                            if apply_title_fallback(result, keywords):
+                                self.log(f"{backup['provider']} CLI 복구 응답의 제목 형식만 즉시 보완했습니다.")
+                            restore_fact_spacing(result)
+                            if role:
+                                try:
+                                    check_role_change(role, article, result)
+                                except ValueError as exc:
+                                    raise WorkflowFormatError(str(exc)) from exc
+                            _validate_article(result, keywords, require_visual_style=True, require_overlay_question=True)
+                            review_provider = backup["provider"]
+                            actual_route = {**requested_route, "provider": review_provider, "model": backup_models.get(review_provider, ""),
+                                            "requested_provider": provider, "requested_model": requested_route["model"]}
+                            manifest.setdefault("recoveries", []).append({"stage": index, "failed_provider": provider,
+                                "provider": backup["provider"], "role": role, "error": str(stage_error)})
+                        except Exception as recovery_error:
+                            self._check_cancelled()
+                            transient_codes = {"empty_response", "timeout", "transport_error",
+                                               "connection_error", "service_unavailable"}
+                            transient_recovery = getattr(recovery_error, "code", "") in transient_codes
+                            if (role not in {"팩트·최신 정보 보강", "문체 다듬기"} or article is None
+                                    or isinstance(recovery_error, WorkflowFormatError) or not transient_recovery):
+                                raise
+                            result = copy.deepcopy(article)
+                            response_name = stage_name + "-safe-preserve"
+                            review_provider = provider
+                            actual_route = {**requested_route, "preserved_previous": True,
+                                            "preserve_reason": "bounded_recovery_failed"}
+                            _save_json(run_dir / f"{response_name}.json", result)
+                            manifest.setdefault("stage_preservations", []).append({
+                                "stage": index, "provider": provider, "backup_provider": backup["provider"],
+                                "role": role, "error": str(stage_error)[:1000],
+                                "recovery_error": str(recovery_error)[:1000]})
+                            self.log(f"{role} 단계의 원응답과 대체 응답이 형식을 지키지 않아 승인된 이전 원고를 유지하고 다음 검수로 진행합니다.")
                 finally:
                     if result is not None:
                         manifest["reviews"].append({**actual_route, "review": result.get("review")})
@@ -2766,18 +2878,29 @@ class BlogWorkflow:
                     candidate["paragraph_index"] = paragraph_index
                     google_source = Path(candidate["path"]).resolve()
                     source_fingerprint = _fingerprint(google_source)
-                    source_candidate = {"provider": "google", "paragraph_index": paragraph_index,
-                                        "path": str(google_source), **source_fingerprint}
-                    self._review_image(run_dir, source_candidate, article["paragraphs"], steps, review_mode, models,
-                                       f"google-{index + 1}-source", effective_stages)
-                    candidate["source_reviews"] = source_candidate["reviews"]
-                    candidate["original_text_free"] = (source_candidate["approved"] is True
-                        and all(review.get("text_free") is True for review in source_candidate["reviews"]))
+                    precheck = candidate.get("google_precheck", {})
+                    observed = precheck.get("result", {}) if isinstance(precheck, dict) else {}
+                    fast_google_review = bool(observed)
+                    if fast_google_review:
+                        candidate["source_reviews"] = [copy.deepcopy(observed)]
+                        candidate["original_watermark_free"] = (observed.get("image_observed") is True
+                            and observed.get("watermark_free") is True and observed.get("photorealistic") is True)
+                    else:
+                        # Direct/manual workflow callers created before the
+                        # collector precheck keep the strict legacy visual gate.
+                        source_candidate = {"provider": "google", "paragraph_index": paragraph_index,
+                                            "path": str(google_source), **source_fingerprint}
+                        self._review_image(run_dir, source_candidate, article["paragraphs"], steps, review_mode, models,
+                                           f"google-{index + 1}-source", effective_stages)
+                        candidate["source_reviews"] = source_candidate["reviews"]
+                        candidate["original_text_free"] = (source_candidate["approved"] is True
+                            and all(review.get("text_free") is True for review in source_candidate["reviews"]))
+                        candidate["original_watermark_free"] = candidate["original_text_free"]
                     candidate["original_sha256"] = source_fingerprint["sha256"]
                     candidate["original_pixel_hash"] = source_fingerprint["pixel_hash"]
                     candidate["original_dhash"] = source_fingerprint["dhash"]
-                    if not candidate["original_text_free"]:
-                        raise WorkflowError("구글 원사진의 글자 없음·화질·본문 관련성 검수를 통과하지 못했습니다.")
+                    if not candidate["original_watermark_free"]:
+                        raise WorkflowError("구글 원사진의 워터마크 없음·실사 검수를 통과하지 못했습니다.")
                     if caption_error:
                         raise WorkflowError(caption_error)
                     if google_captions is None:
@@ -2798,7 +2921,13 @@ class BlogWorkflow:
                         candidate['attribution'] = NaverAutomation.reference_attribution_text(candidate)
                     candidate["path"] = str(Path(delivery["path"]).resolve())
                     candidate.update(_fingerprint(Path(candidate["path"])))
-                    self._review_image(run_dir, candidate, article["paragraphs"], steps, review_mode, models, f"google-{index + 1}", effective_stages)
+                    if fast_google_review:
+                        candidate.update(approved=True, quality_score=90, vision_reviewed=True,
+                                         reviews=candidate["source_reviews"],
+                                         review_policy="google-watermark-photorealistic-precheck-v2")
+                    else:
+                        self._review_image(run_dir, candidate, article["paragraphs"], steps, review_mode, models,
+                                           f"google-{index + 1}", effective_stages)
                     if candidate["approved"] and not any(_duplicate(candidate, item) for item in [*selected, *manifest["google_images"]]):
                         if len(selected) < 6:
                             candidate["replaces_failed_generation"] = True
