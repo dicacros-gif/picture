@@ -1269,8 +1269,11 @@ class BlogWorkflowControls(UnattendedControls):
         draft_config = {**config, "publish": False, "save_draft": True,
                         "completion_label": "품질 미달 임시저장"}
         self._naver_log("품질 기준을 통과하지 못해 공개 발행하지 않고 승인된 이전 원고를 네이버 임시저장합니다.")
-        result = self._publish_cli_worker(article, draft_config,
-            **({"budget": budget} if budget is not None else {}), allow_quality_draft=True)
+        # Once quality is rejected, finish the reversible draft save even when
+        # the 50-minute generation budget is almost exhausted. Browser save has
+        # its own bounded waits and must not be interrupted halfway through.
+        result = self._publish_cli_worker(
+            article, draft_config, allow_quality_draft=True)
         if not result.get("saved"):
             return False
         record = {"topic": topic, "keywords": list(keywords), "providers": config["steps"],
