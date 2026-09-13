@@ -269,6 +269,39 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         self.assertEqual(data["previous_draft"], previous)
         self.assertEqual(result["paragraphs"], revised["paragraphs"])
 
+    def test_numeric_style_rewrite_preserves_approved_copy_and_continues_to_patch_naturalizer(self):
+        original = self.bridge.run_text
+        baseline = copy.deepcopy(self.bridge.article)
+        natural_finish_calls = []
+
+        def run(provider, prompt, **kwargs):
+            if kwargs.get("images") or prompt.startswith("FINAL_ARTICLE_REVIEW"):
+                return original(provider, prompt, **kwargs)
+            if prompt.startswith("EDITORIAL_NATURAL_FINISH"):
+                natural_finish_calls.append(provider)
+                return json.dumps({"paragraph_patches": []})
+            response = json.loads(original(provider, prompt, **kwargs))
+            if provider == "antigravity":
+                response["paragraphs"][0] = response["paragraphs"][0].replace(
+                    "1번 항목", "9번 항목")
+            return json.dumps(response, ensure_ascii=False)
+
+        self.bridge.run_text = run
+        stages = self.routes()
+        stages[-1]["role"] = "문체 다듬기"
+        result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=stages,
+                              editorial_mode="natural")
+        self.assertTrue(result["ready_to_publish"])
+        self.assertEqual(result["paragraphs"], baseline["paragraphs"])
+        self.assertEqual(natural_finish_calls, ["antigravity"])
+        manifest = self.latest_manifest()
+        self.assertEqual(manifest["style_stage_preservations"][0]["reason"],
+                         "numeric_style_invariant")
+        checkpoint = json.loads(Path(result["run_dir"], "stage-2-antigravity.checkpoint.json").read_text(
+            encoding="utf-8"))
+        self.assertEqual(checkpoint["response_name"], "stage-2-antigravity-safe-preserve")
+        self.assertTrue(checkpoint["actual_route"]["preserved_previous"])
+
     def test_editorial_without_style_role_uses_last_successful_route(self):
         original = self.bridge.run_text
         denied, repair_routes = [], []
