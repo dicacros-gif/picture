@@ -3575,6 +3575,53 @@ class NaverAutomation:
         return title, paragraphs, checked
 
     @staticmethod
+    def _validate_quality_draft_article(article: dict) -> tuple[str, list[str], list[dict]]:
+        """Validate enough structure to save a private quality-hold draft.
+
+        This path never grants publication approval.  It accepts the latest
+        checkpointed copy and any intact local generated images so a rejected
+        cycle is visible in Naver's draft list instead of being published or
+        silently discarded.
+        """
+        title = str(article.get("title", "")).strip()
+        paragraphs = article.get("paragraphs")
+        if not title or len(title) > 100 or "\n" in title:
+            raise ValueError("임시저장 제목은 1~100자의 한 줄이어야 합니다.")
+        if not isinstance(paragraphs, list) or len(paragraphs) != 8:
+            raise ValueError("임시저장 본문에는 정확히 8개 구역이 필요합니다.")
+        if any(not isinstance(value, str) or not value.strip() for value in paragraphs):
+            raise ValueError("임시저장할 8개 본문 구역은 비어 있을 수 없습니다.")
+        paragraphs = [value.strip() for value in paragraphs]
+        public_text = "\n".join([title, *paragraphs])
+        if re.search(r"https?://", public_text, re.I):
+            raise ValueError("출처 URL이 남은 원고는 네이버 임시저장에도 입력하지 않습니다.")
+
+        checked, seen = [], set()
+        images = article.get("images", [])
+        if not isinstance(images, list) or len(images) > 16:
+            raise ValueError("임시저장 사진은 최대 16장까지 사용할 수 있습니다.")
+        for item in images:
+            if not isinstance(item, dict) or item.get("provider") == "google":
+                continue
+            position = item.get("paragraph_index")
+            if type(position) is not int or not 0 <= position <= 7:
+                continue
+            path = Path(str(item.get("path", ""))).resolve()
+            if not path.is_file():
+                continue
+            try:
+                with Image.open(path) as image:
+                    image.verify()
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                continue
+            if item.get("sha256") != digest or digest in seen:
+                continue
+            seen.add(digest)
+            checked.append(item)
+        return title, paragraphs, checked
+
+    @staticmethod
     def _article_line_runs(line: str, bold_terms: list[str] | None = None) -> list[tuple[str, bool]]:
         """Split only formatting runs; visible characters remain byte-for-byte intact."""
         if not line:
@@ -4470,7 +4517,8 @@ class NaverAutomation:
         return result
 
     def publish_naver_article(
-        self, blog_id: str, article: dict, *, publish: bool = True, save_draft: bool = False
+        self, blog_id: str, article: dict, *, publish: bool = True, save_draft: bool = False,
+        allow_quality_draft: bool = False,
     ) -> dict:
         """Insert a reviewed article, then publish, save a draft, or leave it entered.
 
@@ -4479,12 +4527,15 @@ class NaverAutomation:
         """
         if publish and save_draft:
             raise ValueError("자동 발행과 임시저장을 동시에 선택할 수 없습니다. 임시저장은 publish=False로 실행하세요.")
+        if allow_quality_draft and (publish or not save_draft):
+            raise ValueError("품질 보류 원고는 발행하지 않고 임시저장만 할 수 있습니다.")
         blog_id = self._clean_blog_id(blog_id)
         if publish:
             prior = self.publication_receipt_for(blog_id, article)
             if prior is not None:
                 return {**prior, "reused_receipt": True}
-        title, paragraphs, images = self._validate_publish_article(article)
+        title, paragraphs, images = (self._validate_quality_draft_article(article)
+                                     if allow_quality_draft else self._validate_publish_article(article))
         key = self._publication_key(blog_id, {"title": title, "paragraphs": paragraphs, "images": images})
         receipt_path = self.data_dir / "publication_receipts" / f"{key}.json"
         driver = self._driver()

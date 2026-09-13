@@ -14,7 +14,7 @@ from picture_cleaner_pc import PictureCleanerApp
 from blog_cli_bridge import BlogCliError
 from blog_preferences import DEFAULT_BLOCKED_TERMS, blocked_term_hits, normalize_preferences
 from blog_runtime import CliAccessRequired, account_problem, restart_command, wait_for_restart_parent
-from blog_workflow import BlogWorkflow, WorkflowError, rank_topics
+from blog_workflow import BlogWorkflow, WorkflowError, _json_hash, rank_topics
 
 
 def bare_app():
@@ -127,6 +127,32 @@ class CandidateRetryTests(unittest.TestCase):
             workflow.return_value.select_topic.assert_called_once()
             app._rank_longtail_topics.assert_called_once()
             self.assertFalse((Path(folder) / "pending-blog-topic.json").exists())
+
+    def test_exhausted_quality_attempts_save_private_draft_and_release_next_topic(self):
+        with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
+            app, config = self.make_cycle(folder)
+            run = Path(folder) / "blog-runs" / "quality-hold"
+            run.mkdir(parents=True)
+            article = {"title": "검토가 더 필요한 제목", "paragraphs": [f"검토 문단 {i}." for i in range(8)]}
+            (run / "stage-1-chatgpt.json").write_text(json.dumps(article, ensure_ascii=False), encoding="utf-8")
+            (run / "stage-1-chatgpt.checkpoint.json").write_text(json.dumps({
+                "response_name": "stage-1-chatgpt", "article_sha256": _json_hash(article)
+            }), encoding="utf-8")
+            (run / "manifest.json").write_text(json.dumps({"images": [], "image_candidates": []}), encoding="utf-8")
+            workflow.return_value.select_topic.return_value = {"topic": "A", "keywords": ["A 방법"]}
+            app._prepare_cli_worker.side_effect = WorkflowError("품질 검수 실패", run)
+            app._publish_cli_worker.return_value = {"saved": True, "published": False, "status": "draft_saved"}
+
+            app._cli_automation_cycle(config)
+
+            self.assertEqual(app._prepare_cli_worker.call_count, 3)
+            self.assertEqual(app._publish_cli_worker.call_count, 1)
+            args, kwargs = app._publish_cli_worker.call_args
+            self.assertFalse(args[1]["publish"])
+            self.assertTrue(args[1]["save_draft"])
+            self.assertTrue(kwargs["allow_quality_draft"])
+            self.assertFalse((Path(folder) / "pending-blog-topic.json").exists())
+            self.assertTrue(app.auto_history[-1]["quality_hold"])
 
     def test_uncertain_publication_does_not_reselect_or_resubmit(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:

@@ -2537,7 +2537,26 @@ class BlogWorkflow:
                         raise
                     numeric_style_violation = (role == "문체 다듬기" and article is not None
                         and "문체 단계에서 제목·구역의 수치·날짜·단위가 변경되었습니다" in str(stage_error))
-                    if numeric_style_violation:
+                    fact_scope_violation = (role == "팩트·최신 정보 보강" and article is not None
+                        and "팩트 보강 단계가 기존 제목·문단을 변경했습니다" in str(stage_error))
+                    if fact_scope_violation:
+                        # An augmentation pass is optional.  If it rewrites the
+                        # approved copy without a complete fact ledger, discard
+                        # that response and continue from the validated upstream
+                        # instead of spending two more cycle attempts on it.
+                        result = copy.deepcopy(article)
+                        response_name = stage_name + "-safe-preserve"
+                        review_provider = provider
+                        actual_route = {**requested_route, "preserved_previous": True,
+                                        "preserve_reason": "fact_scope_invariant"}
+                        _save_json(run_dir / f"{response_name}.json", result)
+                        (run_dir / f"{response_name}.response.txt").write_text(
+                            json.dumps(result, ensure_ascii=False), encoding="utf-8")
+                        manifest.setdefault("fact_stage_preservations", []).append({
+                            "stage": index, "provider": provider, "role": role,
+                            "reason": "fact_scope_invariant", "error": str(stage_error)[:1000]})
+                        self.log("팩트 보강 단계가 승인 원고를 범위 밖에서 바꿔 해당 응답만 버리고 이전 원고로 다음 검수를 진행합니다.")
+                    elif numeric_style_violation:
                         # A stylistic rewrite is optional; the already approved
                         # copy is safer than spending the cycle on another full
                         # rewrite that may change the same facts. The later

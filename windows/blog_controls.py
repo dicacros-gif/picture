@@ -20,7 +20,7 @@ from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, DEFAULT_CA
                               STAGE_ROLES, normalize_preferences, store_prompt, normalize_blocked_terms,
                               normalize_canned_phrases, blocked_term_hits, atomic_json_write, save_settings_json)
 from blog_workflow import (BlogWorkflow, REVIEW_MODES, WorkflowError, WorkflowReviewRequired,
-                           _related_to_topic, _text_review_schema_valid)
+                           _json_hash, _related_to_topic, _text_review_schema_valid)
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
 from blog_artifact_cleanup import ArtifactCleanup, CleanupError
@@ -925,7 +925,7 @@ class BlogWorkflowControls(UnattendedControls):
             raise WorkflowError("이전 발행 결과를 확인할 수 없습니다. 원고와 제출 상태를 보존합니다.")
         return receipt
 
-    def _publish_cli_worker(self, article, config, budget=None):
+    def _publish_cli_worker(self, article, config, budget=None, *, allow_quality_draft=False):
         self._ensure_google_browser_idle()
         # A durable submission is authoritative even after the cycle deadline.
         # This reader is local-only and never clicks or opens the editor.
@@ -943,8 +943,12 @@ class BlogWorkflowControls(UnattendedControls):
         try:
             if budget is not None:
                 self.naver_bot.stop_event = _BudgetStop(budget, self.full_auto_stop, original_stop)
-            result = self.naver_bot.publish_naver_article(config["blog_id"], publish_payload,
-                publish=config["publish"], save_draft=config.get("save_draft", False))
+            publish_options = {"publish": config["publish"],
+                               "save_draft": config.get("save_draft", False)}
+            if allow_quality_draft:
+                publish_options["allow_quality_draft"] = True
+            result = self.naver_bot.publish_naver_article(
+                config["blog_id"], publish_payload, **publish_options)
         except Exception:
             if budget is not None and config.get("publish"):
                 receipt = self._pending_publication_receipt(article, config)
@@ -1204,6 +1208,86 @@ class BlogWorkflowControls(UnattendedControls):
         path = self.cli_app_dir / "pending-blog-topic.json"
         atomic_json_write(path, pending)
 
+    def _quality_draft_from_run(self, run_dir, topic, keywords):
+        """Recover only an app-approved text checkpoint for private draft storage."""
+        if not run_dir:
+            return None
+        run = Path(run_dir).resolve()
+        root = (self.cli_app_dir / "blog-runs").resolve()
+        if root not in run.parents or not run.is_dir():
+            return None
+        checkpoints = sorted(run.glob("stage-*.checkpoint.json"),
+                             key=lambda path: path.stat().st_mtime, reverse=True)
+        article = None
+        for checkpoint_path in checkpoints:
+            try:
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                name = checkpoint.get("response_name")
+                if not isinstance(name, str) or not name or Path(name).name != name:
+                    continue
+                response_path = (run / f"{name}.json").resolve()
+                if response_path.parent != run or not response_path.is_file():
+                    continue
+                candidate = json.loads(response_path.read_text(encoding="utf-8"))
+                if checkpoint.get("article_sha256") != _json_hash(candidate):
+                    continue
+                if (not isinstance(candidate.get("title"), str)
+                        or not isinstance(candidate.get("paragraphs"), list)
+                        or len(candidate["paragraphs"]) != 8
+                        or any(not isinstance(value, str) or not value.strip()
+                               for value in candidate["paragraphs"])):
+                    continue
+                article = candidate
+                break
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+        if article is None:
+            return None
+        try:
+            manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            manifest = {}
+        images, seen = [], set()
+        for item in [*manifest.get("images", []), *manifest.get("image_candidates", [])]:
+            if not isinstance(item, dict) or item.get("provider") == "google":
+                continue
+            key = (item.get("path"), item.get("sha256"), item.get("paragraph_index"))
+            if not key[0] or key in seen:
+                continue
+            seen.add(key)
+            images.append(copy.deepcopy(item))
+        article.update({"topic": topic, "keywords": list(keywords), "run_dir": str(run),
+                        "images": images[:16], "google_images": [], "ready_to_publish": False,
+                        "quality_hold": True})
+        return article
+
+    def _save_quality_hold_draft(self, config, pending, topic, keywords, run_dir, attempts, budget=None):
+        article = self._quality_draft_from_run(run_dir, topic, keywords)
+        if article is None:
+            return False
+        article["source_topic"] = pending.get("choice", {}).get("source_topic", topic)
+        draft_config = {**config, "publish": False, "save_draft": True,
+                        "completion_label": "품질 미달 임시저장"}
+        self._naver_log("품질 기준을 통과하지 못해 공개 발행하지 않고 승인된 이전 원고를 네이버 임시저장합니다.")
+        result = self._publish_cli_worker(article, draft_config,
+            **({"budget": budget} if budget is not None else {}), allow_quality_draft=True)
+        if not result.get("saved"):
+            return False
+        record = {"topic": topic, "keywords": list(keywords), "providers": config["steps"],
+                  "source_topic": article.get("source_topic", topic), "title": article.get("title", ""),
+                  "saved_at": datetime.now().isoformat(timespec="seconds"), "draft_only": True,
+                  "quality_hold": True, "completion_action": "품질 미달 임시저장",
+                  "run_dir": article["run_dir"], "attempts": attempts, "publication": result}
+        self.auto_history = [*[item for item in self.auto_history
+                               if item.get("run_dir") != article["run_dir"]], record][-200:]
+        atomic_json_write(self.cli_app_dir / "automation-history.json", self.auto_history)
+        (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)
+        release = getattr(getattr(self, "topic_history", None), "release", None)
+        if callable(release):
+            release()
+        self._naver_log(f"'{topic}' 품질 보류 원고 임시저장 완료 · 다음 예약 회차는 새 주제를 선정합니다.")
+        return True
+
     def _complete_selected_topic(self, config, groups, related_by_topic, choice, pending, budget=None):
         attempts, article = [], None
         # Once selected, keep the topic fixed throughout preparation and recovery.
@@ -1321,6 +1405,9 @@ class BlogWorkflowControls(UnattendedControls):
                 self._write_cycle_attempts(attempts)
                 self._naver_log(f"'{topic}' 주제 유지 · 준비 재개 필요: {exc}")
         if article is None:
+            if self._save_quality_hold_draft(config, pending, topic, keywords,
+                    recovery_config.get("resume_run_dir"), attempts, budget=budget):
+                return
             raise WorkflowError(f"확정 주제 '{topic}'의 준비를 {len(attempts)}회 시도했지만 준비되지 않았습니다. 주제를 바꾸지 않고 검토 자료를 보존합니다.", recovery_config.get("resume_run_dir"))
         # Browser publication/draft failures never enter the candidate retry loop.
         self._recover_article_keywords(article)

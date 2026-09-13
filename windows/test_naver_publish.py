@@ -541,6 +541,25 @@ class PublishTests(unittest.TestCase):
         self.app._fresh_article_draft_confirmed.assert_called_once_with(self.driver, token)
         self.assertFalse((self.root / "publication_receipts").exists())
 
+    def test_quality_hold_uses_private_draft_path_without_publication_approval(self):
+        button = self._mock_draft_button()
+        self.article.update(ready_to_publish=False, reviews=[], quality_hold=True)
+        self.article["images"][0]["approved"] = False
+        with self.assertRaisesRegex(ValueError, "검수 단계를 통과"):
+            self.app._validate_publish_article(self.article)
+        result = self.app.publish_naver_article(
+            "testblog", self.article, publish=False, save_draft=True, allow_quality_draft=True)
+        self.assertEqual(result["status"], "draft_saved")
+        self.assertTrue(result["saved"])
+        button.click.assert_called_once()
+        self.final.click.assert_not_called()
+
+    def test_quality_hold_can_never_enable_publication(self):
+        with self.assertRaisesRegex(ValueError, "발행하지 않고 임시저장"):
+            self.app.publish_naver_article(
+                "testblog", self.article, publish=True, save_draft=False, allow_quality_draft=True)
+        self.app._driver.assert_not_called()
+
     def test_draft_confirmation_timeout_is_failure_and_never_reclicked(self):
         button = self._mock_draft_button(confirmed=False)
         with self.assertRaisesRegex(RuntimeError, "저장 성공으로 처리하지"):
