@@ -1042,7 +1042,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             widget = getattr(self, name, None)
             if widget:
                 widget.configure(background=colors["panel"])
-        for name in (
+        text_widgets = [getattr(self, name, None) for name in (
             "keyword_text",
             "keyword_prefix_text",
             "base_text",
@@ -1051,8 +1051,11 @@ class PictureCleanerApp(BlogWorkflowControls):
             "global_progress_log",
             "cli_log",
             "cli_blocked_terms",
-        ):
-            widget = getattr(self, name, None)
+        )]
+        progress = getattr(self, "progress_panel", None)
+        if progress:
+            text_widgets.extend(progress.account_texts.values())
+        for widget in text_widgets:
             if widget:
                 widget.configure(
                     background=colors["entry"],
