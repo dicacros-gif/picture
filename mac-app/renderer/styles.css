@@ -91,7 +91,7 @@ h3{margin:0 0 12px;font-size:17px}
 @media(max-width:600px){.cli-accounts{grid-template-columns:1fr}.chip{display:none}.automation-bar>label{font-size:12px}.automation-bar{padding:12px}.manual-search{flex-direction:column}.progress-heading{padding-inline:12px}.progress-heading #blogNextRun{display:none}}
 
 /* 2.1: readable native-like controls in both macOS appearances. */
-button,select,option,label,.top-tabs,.automation-bar,h1,h2,h3{font-weight:700}
+button,select,option,label,.top-tabs,.automation-bar,h1,h2,h3,.source-item,.related-item,.tab-button,summary{font-weight:700}
 button{border:1px solid #176c48;box-shadow:0 3px 0 #11482f;padding:11px 15px;background:#197348;color:#fff}
 button:hover:not(:disabled){filter:brightness(1.12)}
 button:active:not(:disabled){transform:translateY(2px);box-shadow:0 1px 0 #11482f}
@@ -111,4 +111,10 @@ button.secondary{background:#346898;border-color:#81aed5}
 button.danger{background:#ad3947;border-color:#ef8f9a}
 label,.field-help,.save-status,.stage-row label,#progressLog,.progress-heading #blogNextRun{color:#d8e6f1}
 .log-error{color:#ff7b87}.top-tabs button{color:#fff}.result-panel a{color:#8adeae}
+.top-tabs{background:#172638;border-color:#526c89}
+.top-tabs .tab-button{background:#253c55}
+.top-tabs .tab-button.active{background:#28784f;color:#fff;border-color:#a4dabd}
+button.ghost{background:#36526d;color:#fff;border-color:#8aa9c6}
+.card p,.cli-account p{color:#d2deeb}
+.related-pane,.keyword-split{background:#1b293a;color:#eaf1f9}
 }
