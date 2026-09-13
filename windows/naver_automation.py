@@ -4131,6 +4131,56 @@ class NaverAutomation:
         return cls._find_across_frames(driver, finder)
 
     @classmethod
+    def _click_final_publish_control(cls, driver, button) -> str:
+        """Submit the one verified Naver final control exactly once.
+
+        WebDriver's native click can return without dispatching Naver's React
+        handler when Chromium marks a fully occluded writer document hidden.
+        The panel finder has already completed the frozen visual animation. In
+        that one state, revalidate the exact DOM identity and invoke its normal
+        click handler once. No second click is attempted here or by callers.
+        """
+        try:
+            backgrounded = driver.execute_script(
+                "return document.hidden === true;"
+            ) is True
+        except WebDriverException:
+            backgrounded = False
+        if not backgrounded:
+            button.click()
+            return "native"
+        submitted = driver.execute_script(r"""
+            const e=arguments[0];
+            const visible=node=>Boolean(node && node.getClientRects().length)
+              && getComputedStyle(node).visibility!=='hidden'
+              && getComputedStyle(node).display!=='none';
+            const url=new URL(document.location.href);
+            const writer=url.hostname==='blog.naver.com'
+              && (/^\/[^/]+\/postwrite\/?$/i.test(url.pathname)
+                || url.pathname.toLowerCase()==='/postwriteform.naver');
+            const panel=e && e.closest('[role="dialog"], .layer_publish, [class*="layer_publish"], '
+              + '[class*="publish_layer"], [class*="publishLayer"], [class*="publish_container"], '
+              + '[data-testid="publish-layer"]');
+            const wrapper=panel && panel.closest('[class*="layer_popup"]');
+            const content=panel ? (panel.innerText || panel.textContent || '') : '';
+            const unique=[...document.querySelectorAll('[data-testid="seOnePublishBtn"]')];
+            const valid=writer && unique.length===1 && unique[0]===e
+              && e.getAttribute('data-testid')==='seOnePublishBtn'
+              && !e.disabled && e.getAttribute('aria-disabled')!=='true'
+              && visible(e) && visible(wrapper)
+              && /(?:^|\s)is_show(?:__\S+)?(?:\s|$)/.test(wrapper.className || '')
+              && /공개|카테고리|발행 설정|주제/.test(content);
+            if(!valid) return false;
+            e.click();
+            return true;
+        """, button)
+        if submitted is not True:
+            raise RuntimeError(
+                "백그라운드 글쓰기 창의 최종 발행 버튼 상태가 달라져 제출하지 않았습니다."
+            )
+        return "background_dom"
+
+    @classmethod
     def _published_article_url(cls, driver, blog_id: str, title: str) -> str:
         driver.switch_to.default_content()
         url = str(driver.current_url or "")
@@ -4537,7 +4587,11 @@ class NaverAutomation:
             return {**(prior or receipt), "reused_receipt": True,
                     "message": "다른 실행의 발행 기록이 있어 최종 발행을 누르지 않았습니다."}
         try:
-            final_button.click()
+            click_mode = self._click_final_publish_control(driver, final_button)
+            if click_mode == "background_dom":
+                self.log(
+                    "백그라운드 웨일의 검증된 최종 발행 버튼을 DOM에서 1회 제출했습니다."
+                )
             url = WebDriverWait(driver, 30).until(lambda d: self._published_article_url(d, blog_id, title))
         except (WebDriverException, TimeoutError) as exc:
             receipt["error"] = str(exc)

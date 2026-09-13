@@ -1372,6 +1372,39 @@ class PublishControlTests(unittest.TestCase):
         self.assertIn("animation.finish()", script)
         self.assertTrue(requested_final)
 
+    def test_visible_writer_uses_one_native_final_click(self):
+        driver, final = MagicMock(), MagicMock()
+        driver.execute_script.return_value = False
+        self.assertEqual(
+            NaverAutomation._click_final_publish_control(driver, final),
+            "native",
+        )
+        final.click.assert_called_once()
+        self.assertEqual(driver.execute_script.call_count, 1)
+
+    def test_background_writer_revalidates_and_dispatches_one_dom_click(self):
+        driver, final = MagicMock(), MagicMock()
+        driver.execute_script.side_effect = [True, True]
+        self.assertEqual(
+            NaverAutomation._click_final_publish_control(driver, final),
+            "background_dom",
+        )
+        final.click.assert_not_called()
+        self.assertEqual(driver.execute_script.call_count, 2)
+        script, exact_button = driver.execute_script.call_args.args
+        self.assertIs(exact_button, final)
+        self.assertIn('seOnePublishBtn', script)
+        self.assertIn('unique.length===1', script)
+        self.assertIn('is_show', script)
+        self.assertIn('e.click()', script)
+
+    def test_background_writer_refuses_changed_final_control(self):
+        driver, final = MagicMock(), MagicMock()
+        driver.execute_script.side_effect = [True, False]
+        with self.assertRaisesRegex(RuntimeError, "버튼 상태가 달라져"):
+            NaverAutomation._click_final_publish_control(driver, final)
+        final.click.assert_not_called()
+
     def test_observed_css_module_publish_panel_without_dialog_role_finds_final_button(self):
         # Minimal actual 2026-09-12 Naver DOM: CSS-module suffixes, no role=dialog.
         html = '''<div><button class="publish_btn__v_kS9"><span>발행</span></button>

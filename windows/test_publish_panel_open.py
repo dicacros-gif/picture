@@ -20,7 +20,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         self.opener.click.side_effect = None
         self.app._handle_writer_recovery_prompt = MagicMock()
 
-    def javascript_opens_panel(self, script, button):
+    def javascript_opens_panel(self, script, button=None):
+        if script == 'return document.hidden === true;':
+            return False
         self.assertEqual(script, 'arguments[0].click();')
         self.assertIs(button, self.opener)
         self.assertFalse((self.root / 'publication_receipts').exists())
@@ -31,7 +33,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         result = self.app.publish_naver_article('testblog', self.article)
         self.assertTrue(result['published'])
         self.opener.click.assert_not_called()
-        self.driver.execute_script.assert_not_called()
+        self.driver.execute_script.assert_called_once_with(
+            'return document.hidden === true;'
+        )
         self.final.click.assert_called_once()
         self.app._prepare_article_in_writer.assert_called_once()
         self.assertEqual(self.app._article_ready_to_publish.call_count, 2)
@@ -54,7 +58,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         result = self.app.publish_naver_article('testblog', self.article)
         self.assertTrue(result['published'])
         self.opener.click.assert_called_once()
-        self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
+        self.assertEqual(self.driver.execute_script.call_args_list,
+                         [unittest.mock.call('arguments[0].click();', self.opener),
+                          unittest.mock.call('return document.hidden === true;')])
         self.final.click.assert_called_once()
         self.assertEqual(self.app._article_ready_to_publish.call_count, 3)
         self.app._prepare_article_in_writer.assert_called_once()
@@ -68,7 +74,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         result = self.app.publish_naver_article('testblog', self.article)
         self.assertTrue(result['published'])
         self.opener.click.assert_called_once()
-        self.driver.execute_script.assert_not_called()
+        self.driver.execute_script.assert_called_once_with(
+            'return document.hidden === true;'
+        )
 
     def test_panel_arriving_during_revalidation_is_not_toggled_closed(self):
         self.failed_native_opener()
@@ -78,7 +86,9 @@ class PublishPanelOpenTests(unittest.TestCase):
             return True
         self.app._article_ready_to_publish.side_effect = validated
         self.assertTrue(self.app.publish_naver_article('testblog', self.article)['published'])
-        self.driver.execute_script.assert_not_called()
+        self.driver.execute_script.assert_called_once_with(
+            'return document.hidden === true;'
+        )
         self.opener.click.assert_called_once()
 
     def test_fallback_is_not_repeated_when_settings_still_do_not_open(self):
@@ -86,7 +96,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '1회 보완하고 추가 대기한 뒤에도'):
             self.app.publish_naver_article('testblog', self.article)
         self.opener.click.assert_called_once()
-        self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
+        self.driver.execute_script.assert_called_once_with(
+            'arguments[0].click();', self.opener
+        )
         self.assert_not_submitted()
 
     def test_panel_that_opens_during_final_grace_period_is_published_without_another_toggle(self):
@@ -111,7 +123,11 @@ class PublishPanelOpenTests(unittest.TestCase):
 
         self.assertTrue(result['published'])
         self.opener.click.assert_called_once()
-        self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
+        self.assertEqual(
+            self.driver.execute_script.call_args_list,
+            [unittest.mock.call('arguments[0].click();', self.opener),
+             unittest.mock.call('return document.hidden === true;')],
+        )
         self.final.click.assert_called_once()
 
     def test_replaced_or_missing_header_is_not_clicked_with_javascript(self):
@@ -176,7 +192,9 @@ class PublishPanelOpenTests(unittest.TestCase):
         self.assertEqual(second['status'], 'uncertain')
         self.assertTrue(second['reused_receipt'])
         self.final.click.assert_called_once()
-        self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
+        self.assertEqual(self.driver.execute_script.call_args_list,
+                         [unittest.mock.call('arguments[0].click();', self.opener),
+                          unittest.mock.call('return document.hidden === true;')])
 
 
 if __name__ == '__main__':
