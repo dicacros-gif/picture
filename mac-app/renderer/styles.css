@@ -89,3 +89,26 @@ h3{margin:0 0 12px;font-size:17px}
 .keyword-actions{flex-wrap:wrap}.keyword-actions button{min-width:0;font-size:12px}
 @media(max-width:900px){.automation-bar{gap:10px}.automation-bar .save-status{display:none}.blog-grid{grid-template-columns:1fr}.naver-account{flex-wrap:wrap}.naver-account>div{flex-basis:100%}}
 @media(max-width:600px){.cli-accounts{grid-template-columns:1fr}.chip{display:none}.automation-bar>label{font-size:12px}.automation-bar{padding:12px}.manual-search{flex-direction:column}.progress-heading{padding-inline:12px}.progress-heading #blogNextRun{display:none}}
+
+/* 2.1: readable native-like controls in both macOS appearances. */
+button,select,option,label,.top-tabs,.automation-bar,h1,h2,h3{font-weight:700}
+button{border:1px solid #176c48;box-shadow:0 3px 0 #11482f;padding:11px 15px;background:#197348;color:#fff}
+button:hover:not(:disabled){filter:brightness(1.12)}
+button:active:not(:disabled){transform:translateY(2px);box-shadow:0 1px 0 #11482f}
+button.secondary{background:#315c8d;border-color:#183c66;color:#fff}
+button.danger{background:#a52d37;border-color:#761e27;color:#fff}
+select,option{background:#e0f3f2;color:#123b3b;border-color:#418c89}
+button:disabled{opacity:.55}
+.log-error{color:#c02435;font-weight:700}
+@media(prefers-color-scheme:dark){
+:root{color-scheme:dark}
+body,main{background:#111923;color:#f2f6fa}
+.card,.automation-bar,.settings-panel,.cli-account,.progress-dock,.source-pane,.source-list,.result-panel{background:#1e2b3a;color:#eef4fa;border-color:#49617b}
+input,textarea{background:#15212e;color:#fff;border-color:#607b95}
+select,option{background:#234b55;color:#fff;border-color:#75b6c2}
+button{background:#247d54;color:#fff;border-color:#77bd9a;box-shadow:0 3px 0 #0b3824}
+button.secondary{background:#346898;border-color:#81aed5}
+button.danger{background:#ad3947;border-color:#ef8f9a}
+label,.field-help,.save-status,.stage-row label,#progressLog,.progress-heading #blogNextRun{color:#d8e6f1}
+.log-error{color:#ff7b87}.top-tabs button{color:#fff}.result-panel a{color:#8adeae}
+}

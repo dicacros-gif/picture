@@ -578,17 +578,31 @@ function renderStages() {
   $("blogStages").replaceChildren(...stageDrafts.slice(0, count).map((stage, index) => {
     const row = document.createElement("div");
     row.className = "stage-row";
-    row.innerHTML = `<div class="stage-heading"><span>${index + 1}</span><select aria-label="${index + 1}단계 CLI"></select><select aria-label="${index + 1}단계 역할"></select></div><label for="stageModel${index}">모델</label><input id="stageModel${index}" maxlength="160" autocomplete="off" placeholder="CLI 기본 모델 사용">`;
+    row.innerHTML = `<div class="stage-heading"><span>${index + 1}</span><select aria-label="${index + 1}단계 CLI"></select><select aria-label="${index + 1}단계 역할"></select></div><label for="stageModel${index}">모델</label><select id="stageModel${index}" aria-label="${index + 1}단계 모델"></select>`;
     const [provider, role] = row.querySelectorAll("select");
     for (const [value, label] of Object.entries(PROVIDERS)) provider.add(new Option(label, value));
     for (const value of ROLES) role.add(new Option(value, value));
     if (!ROLES.includes(stage.role)) role.add(new Option(stage.role, stage.role));
     provider.value = stage.provider;
     role.value = stage.role;
-    row.querySelector("input").value = stage.model || "";
+    const model = row.querySelector(`#stageModel${index}`);
+    // Keep previously saved custom model IDs; CLI defaults remain the safe default.
+    for (const value of ["", ...(stage.provider === "claude" ? ["sonnet", "opus", "haiku"] : []), ...stageDrafts.filter(item => item.provider === stage.provider).map(item => item.model || ""), stage.model || ""].filter((v, i, all) => all.indexOf(v) === i)) {
+      model.add(new Option(value || "CLI 기본 모델", value));
+    }
+    model.add(new Option("모델 ID 직접 추가…", "__custom__"));
+    model.value = stage.model || "";
     provider.onchange = () => { stageDrafts[index].provider = provider.value; markSettingsDirty(); };
     role.onchange = () => { stageDrafts[index].role = role.value; markSettingsDirty(); };
-    row.querySelector("input").oninput = event => { stageDrafts[index].model = event.target.value; markSettingsDirty(); };
+    model.onchange = () => {
+      let value = model.value;
+      if (value === "__custom__") {
+        value = window.prompt("로그인한 CLI에서 사용할 모델 ID", stage.model || "");
+        if (value === null) { model.value = stage.model || ""; return; }
+      }
+      stageDrafts[index].model = String(value).trim().slice(0, 120);
+      markSettingsDirty(); renderStages();
+    };
     return row;
   }));
 }
@@ -602,7 +616,12 @@ function appendProgress(message, time) {
   lastProgressLine = line;
   progressLines.push(...line.split(/\r?\n/));
   if (progressLines.length > 5000) progressLines.splice(0, progressLines.length - 5000);
-  $("progressLog").textContent = progressLines.join("\n");
+  $("progressLog").replaceChildren(...progressLines.map(text => {
+    const row = document.createElement("span");
+    row.textContent = text + "\n";
+    if (/실패|오류|failed|error|exception/i.test(text)) row.className = "log-error";
+    return row;
+  }));
   $("progressLog").scrollTop = $("progressLog").scrollHeight;
 }
 

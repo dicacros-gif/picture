@@ -7,8 +7,9 @@ const { StringDecoder } = require('node:string_decoder');
 
 const ROLES = ['작성', '교차 검수', '팩트·최신 정보 보강', '문체 다듬기'];
 const PROVIDERS = ['chatgpt', 'claude', 'antigravity'];
-const PROMPT_POLICY_MARKER = '[맥 공통 글쓰기 규칙 · 2026-09-13 v2]';
+const PROMPT_POLICY_MARKER = '[맥 공통 글쓰기 규칙 · 2026-09-13 v3]';
 const PROMPT_POLICY_BLOCK = `${PROMPT_POLICY_MARKER}
+본문은 2~3문장씩 묶습니다. 묶음 안에서는 마침표 다음 한 번만 줄바꿈하며 빈 줄을 넣지 않습니다. 볼드·색상·형광 문장 뒤에도 다음 문장이 바로 이어집니다. 빈 줄은 묶음 사이에만 둡니다. 구체적인 검색 의도에 답하고 논리 오류와 상투어를 우선 수정합니다. 이미지 6장은 서로 다른 내용을 설명하도록 구성합니다.
 이 규칙은 앞에 저장된 이미지·제목 규칙과 충돌하면 우선합니다. 첫 제목은 후킹과 마지막 SEO 제목의 서로 다른 정보를 중복 없이 합쳐 실제 연관어 2개를 자연스럽게 넣고 공백 포함 45~68자, 최대 70자로 씁니다. 첫 구역은 검색 과정을 말하지 않고 의외의 사실과 끝까지 읽을 이유로 시작합니다. 상투적인 구역 연결어 없이 구체적인 내용으로 바로 이어가며 8개 소제목은 질문형·단정형·반전형·장면형을 고르게 사용합니다.
 생성 이미지는 자연광, 중간 강도의 고운 35mm 필름 그레인, 자연스러운 아웃포커싱·보케, 아주 약한 렌즈 왜곡·비네팅·색수차를 사용합니다. 한국인 인물은 몇 미터 떨어진 중거리·원경의 측면·비스듬한 각도·뒷모습으로만 두고 정면 응시·셀피·얼굴 클로즈업을 금지합니다. 첫 이미지는 얼굴 없는 1:1 실사 사진이며 자연스러운 한글 질문을 공백 포함 최대 28자로 쓰고 반드시 ?로 끝냅니다.
 앱은 첫 이미지와 Google 캡처의 질문을 굵고 읽기 쉬운 고딕체로 두세 줄 가운데 정렬합니다. 일반 문구는 흰색, 서로 다른 핵심 단어는 형광 녹색 #8CE88C~#95F095와 형광 빨간색으로 강조하고 짙은 그림자와 원사진이 보이는 반투명 검정 배경을 사용합니다. Google 이미지는 핵심 키워드를 영어로 검색해 이미지 탭 앞쪽 후보부터 확인하고 글자·로고·워터마크와 사용 조건을 통과한 캡처만 여백을 보수적으로 잘라 사용합니다. AI 생성 이미지는 파일·해상도·중복만 검사하고 CLI 시각 검수는 생략하며 Google 캡처만 시각 검수합니다.`;
@@ -17,6 +18,7 @@ function migratePrompt(text = '', bundledPrompt = '') {
   text = String(text || '').trim();
   if (!text) return String(bundledPrompt || '').trim();
   if (text.includes(PROMPT_POLICY_MARKER)) return text;
+  if (text.includes('[맥 공통 글쓰기 규칙 · 2026-09-13 v2]')) return `${text}\n\n${PROMPT_POLICY_BLOCK}`;
   // Add a final precedence block to 2.0.1 defaults. The old text may contain
   // user edits, so never replace the full preset just because legacy wording
   // is still present.
@@ -232,14 +234,14 @@ class BlogController {
     const saved = this.store.get();
     const snapshot = JSON.parse(JSON.stringify({ ...saved, blog: { ...saved.blog, ...(mode ? { mode } : {}) } }));
     this.timers.clearTimeout(this.timer); this.timer = null; this.nextRunAt = null; this.busy = true; this.stopping = false;
-    this.scheduleGeneration++; this.lastResult = null; this.lastError = null;
+    this.scheduleGeneration++; this.scheduledAt = this.now(); this.lastResult = null; this.lastError = null;
     this.progress({ status: 'running', message: automatic ? '자동 회차 시작 · 연관어와 최신 검색 의도를 확인합니다.' : `'${keyword}' 연관어와 사람들이 궁금해하는 내용을 확인합니다.`, stage: 'research' });
     this.running = this.run(snapshot, keyword, automatic).catch(error => {
       this.lastError = this.stopping ? null : safeLog(error.message);
       this.progress({ status: this.stopping ? 'stopped' : 'error', message: this.stopping ? '작업을 중지했습니다. 저장된 회차는 유지합니다.' : error.message });
     }).finally(() => {
       const stopped = this.stopping;
-      this.busy = false; this.stopping = false; this.schedule();
+      this.busy = false; this.stopping = false; this.schedule(false);
       this.progress({ status: stopped ? 'stopped' : this.status });
     });
     return this.state();

@@ -69,17 +69,17 @@ test('settings retain prompts, stages, models, layout and mode across restart', 
 });
 
 test('saved app prompt upgrades once while preserving user presets', t => {
-  const latest = '오늘 기본 지침\n\n[맥 공통 글쓰기 규칙 · 2026-09-13 v2]\n최신 이미지 규칙';
+  const latest = '오늘 기본 지침\n\n[맥 공통 글쓰기 규칙 · 2026-09-13 v3]\n최신 이미지 규칙';
   const legacyDefault = '사용자 앞부분\n아주 약한 미세 필름 그레인만\n첫 사진은 8자 안팎, 최대 12자\n위쪽 32%는 글자가 잘 읽히도록';
   const upgradedDefault = migratePrompt(legacyDefault, latest);
   assert.match(upgradedDefault, /^사용자 앞부분/);
-  assert.match(upgradedDefault, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v2\]/);
+  assert.match(upgradedDefault, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v3\]/);
   const custom = '내가 직접 저장한 짧은 글쓰기 지침';
   assert.equal(migratePrompt(custom, latest), custom);
 
   const marked = '직접 작성한 앞 지침\n\n[이미지 문구 최신 규칙 · 2026-09-13]\n빨강은 쓰지 않습니다.';
   const migrated = migratePrompt(marked, latest);
-  assert.match(migrated, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v2\]/);
+  assert.match(migrated, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v3\]/);
   assert.match(migrated, /형광 녹색/);
   assert.match(migrated, /형광 빨간색/);
   assert.match(migrated, /반투명 검정 배경/);
@@ -93,7 +93,7 @@ test('prompt migration is written to settings and remains after restart', t => {
     selectedPromptId: 'default' } }), 'utf8');
   const upgraded = first.get().blog.prompts[0].text;
   assert.match(upgraded, /^옛 규칙/);
-  assert.match(upgraded, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v2\]/);
+  assert.match(upgraded, /\[맥 공통 글쓰기 규칙 · 2026-09-13 v3\]/);
   const persisted = JSON.parse(fs.readFileSync(first.file, 'utf8'));
   assert.equal(persisted.blog.prompts[0].text, upgraded);
   assert.equal(new SettingsStore(dir, '다른 기본값').get().blog.prompts[0].text, upgraded);

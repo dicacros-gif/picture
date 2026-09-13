@@ -289,8 +289,8 @@ class MacEngineTests(unittest.TestCase):
         self.bot.capture_google_reference_candidates.side_effect = [[first], [first, second, third]]
         pending = {}
         result = self.run.google_candidates({'topic': '정기예금', 'keywords': ['정기예금 금리']}, config, pending)
-        self.assertEqual(result, [first, second, third])
-        self.assertEqual([c.args[2] for c in self.bot.capture_google_reference_candidates.call_args_list], [3, 2])
+        self.assertEqual(result, [first])
+        self.assertEqual([c.args[2] for c in self.bot.capture_google_reference_candidates.call_args_list], [2])
         self.assertTrue(read_json(self.run.pending_path)['google_search_complete'])
 
     def test_cancelled_before_start_makes_no_cli_or_browser_calls(self):
@@ -348,3 +348,61 @@ class MacEngineTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MacRelease21Tests(unittest.TestCase):
+    setUp = MacEngineTests.setUp
+    make_run = MacEngineTests.make_run
+    def test_google_and_writing_overlap(self):
+        started, writing = threading.Event(), threading.Event()
+        original = self.workflow._prepare
+        def search(*args):
+            started.set()
+            self.assertTrue(writing.wait(2), 'writer was blocked by Google')
+            return []
+        def prepare(*args, **kwargs):
+            self.assertTrue(started.wait(2))
+            writing.set()
+            self.assertEqual(kwargs['resolve_google_candidates'](), [])
+            self.assertTrue(kwargs['early_image_finish'])
+            self.assertTrue(kwargs['essential_review'])
+            return original(*args, **kwargs)
+        self.run.google_candidates = search
+        self.workflow.prepare.side_effect = prepare
+        self.assertEqual(self.run.run(payload())['status'], 'local')
+
+    def test_partial_failure_uses_private_save_and_consumes_only_with_receipt(self):
+        from datetime import datetime, timezone
+        def broken(*args, **kwargs):
+            folder = self.root / 'blog-runs/partial'
+            folder.mkdir(parents=True)
+            source = {'title': '정기예금 가입 조건', 'paragraphs': ['현재까지 완성한 원고입니다.']}
+            atomic_json_write(folder / 'request.json', {})
+            atomic_json_write(folder / 'manifest.json', {})
+            atomic_json_write(folder / 'stage-1.json', source)
+            (folder / 'stage-1.response.txt').write_text(json.dumps(source), encoding='utf-8')
+            kwargs['on_run_created'](folder)
+            raise WorkflowError('final review unavailable', folder)
+        self.workflow.prepare.side_effect = broken
+        self.bot.publish_naver_article.return_value = {
+            'status': 'draft_saved', 'saved': True, 'published': False,
+            'draft_confirmation_verified': True, 'article_key': 'b'*64,
+            'blog_id': 'exampleblog', 'paragraph_count': 1, 'image_count': 0,
+            'url': 'https://blog.naver.com/exampleblog/postwrite',
+            'saved_at': datetime.now(timezone.utc).isoformat()}
+        result = self.run.run(payload('publish'))
+        self.assertFalse(result['published'])
+        self.assertEqual(self.bot.publish_naver_article.call_args.kwargs,
+            {'publish': False, 'save_draft': True, 'allow_quality_draft': True})
+        self.assertFalse(self.run.pending_path.exists())
+        self.assertNotIn('정기예금', self.run.history.filter_keywords(['정기예금']))
+
+    def test_google_challenge_persists_cooldown(self):
+        from blog_google_budget import GoogleImageChallengeError
+        config = validate_settings(settings())
+        config['includeGoogle'] = True
+        self.bot.capture_google_reference_candidates.side_effect = GoogleImageChallengeError('captcha')
+        choice = {'topic': '정기예금', 'keywords': ['정기예금 금리']}
+        self.assertEqual(self.run.google_candidates(choice, config, {'created_at': 'first'}), [])
+        self.assertEqual(self.run.google_candidates(choice, config, {'created_at': 'second'}), [])
+        self.assertEqual(self.bot.capture_google_reference_candidates.call_count, 1)

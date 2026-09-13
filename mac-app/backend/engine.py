@@ -11,14 +11,19 @@ import re
 import signal
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'windows'))
 
 from blog_diagnostics import BlogDiagnostics
 from blog_preferences import atomic_json_write, blocked_term_hits, normalize_blocked_terms
-from blog_topic_history import TopicHistory, topic_key, _confirmed as confirmed_publication
+from blog_topic_history import TopicHistory, topic_key, confirmed_draft, _confirmed as confirmed_publication
+from blog_artifact_cleanup import ArtifactCleanup
+from mac_draft import recover_private_draft
 from blog_workflow import BlogWorkflow, WorkflowError, rank_topics
+from blog_deadline import CycleBudget
+from blog_google_budget import GoogleSearchBudget, GoogleImageChallengeError
 from mac_cli import MacBlogCliBridge, configure_mac_environment
 from mac_naver import MacNaverAutomation
 
@@ -100,6 +105,8 @@ class MacRun:
         self.bot = bot or MacNaverAutomation(self.data_dir, log, debug_port=9449)
         self.bot.stop_event = cancel
         self.workflow = workflow_type(self.bridge, self.run_root, log, cancel)
+        self.workflow_type = workflow_type
+        self.state_lock = threading.RLock()
 
     def check_cancelled(self):
         if self.cancel.is_set():
@@ -139,6 +146,11 @@ class MacRun:
         excluded = [item['topic'] for item in completed if isinstance(item, dict) and item.get('topic')] if payload.get('automatic') else []
         ranked = rank_topics(groups, related, exclude_topics=excluded, blocked_terms=blocked)
         ranked = [row for row in ranked if not self.history.is_duplicate(row['topic'], row['keywords'])]
+        if not ranked and not keyword:
+            from blog_topic_fallback import shared_snapshot, rank_fallback
+            ranked, _, _ = rank_fallback(shared_snapshot(self.cancel), self.history,
+                {'blocked_terms': blocked}, rank_topics, lambda value: False)
+            self.log('미사용 검색어가 부족해 RT 연관어·지속 검색 의도 후보를 사용합니다.')
         if not ranked:
             raise WorkflowError('이 키워드의 미사용 연관 검색어가 부족합니다. 다른 구체적인 키워드를 입력해 주세요.')
         first = config['stages'][0]
@@ -192,27 +204,41 @@ class MacRun:
         if not config.get('includeGoogle', True):
             return []
         candidates = []
+        search_budget = GoogleSearchBudget(self.data_dir)
+        reservation = search_budget.reserve(pending.get('created_at') or pending.get('run_dir') or choice['topic'])
+        if not reservation.allowed:
+            self.log(f'Google 선택 검색 생략 · {reservation.reason} · 생성 이미지로 계속합니다.')
+            return []
         try:
             stages = config['stages']
-            search = self.workflow.plan_google_image_search(choice['topic'], choice['keywords'],
+            planner = self.workflow_type(self.bridge, self.run_root, self.log, self.cancel)
+            planner.budget = getattr(self, 'budget', None)
+            search = planner.plan_google_image_search(choice['topic'], choice['keywords'],
                 [s['provider'] for s in stages], {}, stage_configs=stages)
             folder = self.data_dir / 'google-reference-candidates' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-            goal = max(1, min(10, int(config.get('googleReferenceCount', 4))))
+            goal = max(1, min(2, int(config.get('googleReferenceCount', 2))))
             seen = set()
             for index, query in enumerate(search.get('queries') or [search['query']]):
-                if index >= 3 or len(candidates) >= goal:
+                if index >= 1 or len(candidates) >= goal:
                     break
                 self.check_cancelled()
                 for item in self.bot.capture_google_reference_candidates(query, folder / f'query-{index+1}', goal-len(candidates),
-                        reuse_only=True, english_only=True):
+                        reuse_only=True, english_only=True, allow_attribution=True,
+                        thumbnail_limit=8, preview_limit=2):
                     key = item.get('capture_sha256') or item.get('image_url')
                     if key and key not in seen and len(candidates) < goal:
                         candidates.append(item); seen.add(key)
+        except GoogleImageChallengeError:
+            search_budget.record_challenge()
+            self.log('Google 보안 확인 감지 · 60분간 검색을 쉬고 생성 이미지로 계속합니다.')
         except Exception as exc:
             self.check_cancelled()
             self.log(f'Google 참고사진은 확보한 결과로 이어갑니다: {exc}')
-        pending.update(google_search_complete=True, google_candidates=candidates)
-        atomic_json_write(self.pending_path, pending)
+        finally:
+            search_budget.release(reservation)
+        with self.state_lock:
+            pending.update(google_search_complete=True, google_candidates=candidates)
+            atomic_json_write(self.pending_path, pending)
         return candidates
 
     def ready_article(self, pending):
@@ -247,6 +273,13 @@ class MacRun:
 
     def run(self, payload):
         self.check_cancelled()
+        budget = CycleBudget(3000)
+        self.budget = budget
+        cleanup = ArtifactCleanup(self.data_dir, self.log, history=self.history)
+        try:
+            cleanup.retry()
+        except Exception as exc:
+            self.log(f'이전 회차 정리 보류: {exc}')
         pending = read_json(self.pending_path)
         resuming = bool(pending)
         if pending:
@@ -263,9 +296,9 @@ class MacRun:
                        'phase': 'preparing', 'created_at': datetime.now(timezone.utc).isoformat()}
             atomic_json_write(self.pending_path, pending)
         self.check_cancelled()
-        article = self.ready_article(pending)
+        article = pending.get('prepared_article') if pending.get('quality_hold') else self.ready_article(pending)
         receipt = None
-        if article and config['mode'] == 'publish':
+        if article and config['mode'] == 'publish' and not pending.get('quality_hold'):
             # Read receipts before any model/browser request. A later account
             # expiry must not hide a publication that has already completed.
             receipt = self.bot.publication_receipt_for(config['blog_id'], self.publication_article(article))
@@ -284,22 +317,38 @@ class MacRun:
             path = contained_run(self.run_root, run_dir)
             if not all((path / name).is_file() for name in ('request.json', 'manifest.json')):
                 raise WorkflowError('회차 저장 파일을 확인하지 못했습니다.', path)
-            pending['run_dir'] = str(path)
-            atomic_json_write(self.pending_path, pending)
+            with self.state_lock:
+                pending['run_dir'] = str(path)
+                atomic_json_write(self.pending_path, pending)
         if article is None:
             if resuming:
                 self.preflight(config)
-            google = self.google_candidates(choice, config, pending)
             self.check_cancelled()
             stages = config['stages']
             brief = config['base_prompt'] + '\n확정된 검색 의도(새 주제로 바꾸지 않는다): ' + json.dumps({
                 'intent': choice.get('intent', ''), 'topic': choice['topic'], 'keywords': choice['keywords']}, ensure_ascii=False)
-            article = self.workflow.prepare(choice['topic'], choice['keywords'], brief,
-                [s['provider'] for s in stages], '단계별 교차 검수', models={}, stage_configs=stages,
-                google_candidates=google, resume_run_dir=pending.get('run_dir'), quality_checks=True,
-                quality_topic=choice.get('source_topic', choice['topic']), image_retry_limit=int(config.get('imageRetryLimit', 2)),
-                editorial_mode='natural', on_run_created=remember)
+            self.log('원고·Google 영어 검색 병렬 시작 · 생성 이미지 6장 우선 · 회차 예산 50분')
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix='mac-google') as pool:
+                google = pool.submit(self.google_candidates, choice, config, pending)
+                try:
+                    article = self.workflow.prepare(choice['topic'], choice['keywords'], brief,
+                        [s['provider'] for s in stages], '단계별 교차 검수', models={}, stage_configs=stages,
+                        resolve_google_candidates=google.result, resume_run_dir=pending.get('run_dir'), quality_checks=True,
+                        quality_topic=choice.get('source_topic', choice['topic']), image_retry_limit=int(config.get('imageRetryLimit', 2)),
+                        editorial_mode='natural', on_run_created=remember, budget=budget,
+                        early_image_finish=True, essential_review=True)
+                except Exception:
+                    self.check_cancelled()
+                    article = recover_private_draft(self.data_dir, pending.get('run_dir'), choice['topic'], choice['keywords'])
+                    if article is None or config['mode'] == 'local':
+                        raise
+                    pending['quality_hold'] = True
+                    self.log('완료된 원고를 복구했습니다. 품질 미달 글은 공개하지 않고 네이버 임시저장합니다.')
         pending.update(phase='ready', run_dir=article['run_dir'], prepared_article=article)
+        if config['mode'] != 'local':
+            run_path = contained_run(self.run_root, article['run_dir'])
+            article.setdefault('draft_artifact_sha256', {name: hashlib.sha256((run_path / name).read_bytes()).hexdigest()
+                for name in ('request.json', 'manifest.json', 'editorial.pending.json') if (run_path / name).is_file()})
         atomic_json_write(self.pending_path, pending)
         self.check_cancelled()
         if config['mode'] == 'local':
@@ -312,8 +361,10 @@ class MacRun:
                 self.check_cancelled()
                 pending['phase'] = 'delivery'
                 atomic_json_write(self.pending_path, pending)
-                result = self.bot.publish_naver_article(config['blog_id'], self.publication_article(article),
-                    publish=config['mode'] == 'publish', save_draft=config['mode'] == 'draft')
+                options = {'publish': config['mode'] == 'publish', 'save_draft': config['mode'] == 'draft'}
+                if pending.get('quality_hold'):
+                    options.update(publish=False, save_draft=True, allow_quality_draft=True)
+                result = self.bot.publish_naver_article(config['blog_id'], self.publication_article(article), **options)
                 pending['delivery_result'] = result
                 atomic_json_write(self.pending_path, pending)
             if result.get('status') == 'uncertain':
@@ -321,22 +372,48 @@ class MacRun:
                 atomic_json_write(self.pending_path, pending)
                 self.history.record_uncertain(choice['topic'], result, article['run_dir'])
                 raise WorkflowError('발행 제출 결과가 불확실합니다. 중복 발행하지 않고 기존 영수증을 유지합니다.', article['run_dir'])
-            if config['mode'] == 'publish':
+            if config['mode'] == 'publish' and not pending.get('quality_hold'):
                 if not confirmed_publication(result):
                     raise WorkflowError('발행 URL을 확인하지 못했습니다. 원고와 제출 기록을 보관합니다.', article['run_dir'])
                 self.history.record_publication(choice['topic'], result, article['run_dir'],
                     keywords=[choice.get('source_topic', ''), *choice['keywords']], title=article['title'])
                 result['consumedKeywords'] = list(dict.fromkeys([choice['topic'], choice.get('source_topic', ''), *choice['keywords']]))
+                article.update(publication=result, topic=choice['topic'])
+                try:
+                    atomic_json_write(contained_run(self.run_root, article['run_dir']) / 'manifest.json', article)
+                    cleanup.enqueue_publication(article)
+                except Exception as exc:
+                    self.log(f'발행 완료 · 로컬 정리는 보류: {exc}')
             elif result.get('saved') is not True:
                 raise WorkflowError('네이버 임시저장 완료를 확인하지 못했습니다. 원고는 로컬에 보관합니다.', article['run_dir'])
+            if pending.get('quality_hold') and not confirmed_draft(result):
+                raise WorkflowError('새 임시저장 완료 근거를 확인하지 못해 로컬 원고를 보존합니다.', article['run_dir'])
+            if confirmed_draft(result):
+                consumed = list(dict.fromkeys([choice['topic'], choice.get('source_topic', ''), *choice['keywords']]))
+                receipt = {key: result[key] for key in ('saved', 'published', 'status', 'draft_confirmation_verified',
+                    'article_key', 'blog_id', 'paragraph_count', 'image_count', 'url', 'saved_at') if key in result}
+                receipt['run_dir'] = article['run_dir']
+                atomic_json_write(self.data_dir / 'draft_receipts' / f"{result['article_key']}.json", receipt)
+                self.history.record_consumed_draft(choice['topic'], receipt, article['run_dir'], consumed, article['title'])
+                result['consumedKeywords'] = consumed
+                article.update(publication=receipt, topic=choice['topic'])
+                try:
+                    cleanup.enqueue_draft(article)
+                except Exception as exc:
+                    self.log(f'웹 임시저장 완료 · 로컬 정리는 보류: {exc}')
         result.update(title=article['title'], runDir=article['run_dir'],
             article={'title': article['title'], 'paragraphs': article['paragraphs']},
             message=result.get('message') or ('네이버 임시저장을 완료했습니다.' if config['mode'] == 'draft' else '발행을 완료했습니다.'))
-        atomic_json_write(self.data_dir / 'mac-last-result.json', result)
+        atomic_json_write(self.data_dir / 'mac-last-result.json',
+            {key: value for key, value in result.items() if key != 'article'} if confirmed_draft(result) else result)
         completed = read_json(self.data_dir / 'mac-completed-topics.json', [])
         completed.append({'topic': choice.get('source_topic', choice['topic']), 'title': article['title'], 'at': datetime.now(timezone.utc).isoformat()})
         atomic_json_write(self.data_dir / 'mac-completed-topics.json', completed[-500:])
         self.pending_path.unlink(missing_ok=True)
+        try:
+            cleanup.retry()
+        except Exception as exc:
+            self.log(f'로컬 정리는 다음 회차에 재시도합니다: {exc}')
         return result
 
 

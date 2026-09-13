@@ -2,6 +2,13 @@ name: Build Mac M1 App
 
 on:
   workflow_dispatch:
+    inputs:
+      signing_mode:
+        description: 'adhoc 실행 서명 또는 Apple Developer ID + 공증'
+        required: true
+        default: adhoc
+        type: choice
+        options: [adhoc, developer-id]
   push:
     paths:
       - 'mac-app/**'
@@ -16,7 +23,7 @@ permissions:
 jobs:
   build-mac:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -59,6 +66,14 @@ jobs:
         run: npm run build:mac
       - name: Sign, verify and run on M1
         working-directory: mac-app
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode || 'adhoc' }}
+          MAC_CERTIFICATE_BASE64: ${{ secrets.MAC_CERTIFICATE_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_SIGN_IDENTITY: ${{ secrets.MAC_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: bash scripts/sign-and-verify.sh
       - name: Create Mac installation package
         working-directory: mac-app
@@ -69,6 +84,7 @@ jobs:
           mkdir -p "$PACKAGE_DIR"
           ditto "dist/mac-arm64/Blog.app" "$PACKAGE_DIR/Blog.app"
           cp Install-Blog.command Install-Picture-Cleaner.command MAC-INSTALL.txt "$PACKAGE_DIR/"
+          cp dist/signing-verification.json "$PACKAGE_DIR/"
           chmod 755 "$PACKAGE_DIR/Install-Blog.command" "$PACKAGE_DIR/Install-Picture-Cleaner.command"
           ditto -c -k --sequesterRsrc --keepParent "$PACKAGE_DIR" "$ZIP_PATH"
           shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"
@@ -80,4 +96,6 @@ jobs:
             mac-app/dist/Blog-M1-*.zip
             mac-app/dist/Blog-M1-*.sha256
             mac-app/dist/Blog-M1-ui.png
+            mac-app/dist/signing-verification.json
+            mac-app/dist/notarization.json
           if-no-files-found: error
