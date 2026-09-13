@@ -192,7 +192,7 @@ class ReviewHoldScheduleTests(unittest.TestCase):
                 return self.stopped
 
         app.full_auto_stop = Stop()
-        def cycle(config):
+        def cycle(config, budget=None):
             cycles.append(config)
             self.assertTrue(app.full_auto_active)
             error = WorkflowReviewRequired('같은 원고 보완 대기', Path('held-run'))

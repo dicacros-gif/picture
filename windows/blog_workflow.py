@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from blog_quality import inspect_article, apply_patches, local_cleanup
 from blog_numeric_claims import numeric_claim_issues
 from blog_image_review import (evaluate_image_review, image_review_classification_schema,
                                image_review_classification_prompt)
+from blog_parallel_images import ImageGenerationBatch, CombinedCancelSignal, provider_lanes
 from blog_visual_style import IMAGE_POLICY, cover_headline, choose_visual_style, image_prompt as build_image_prompt
 
 
@@ -286,16 +288,19 @@ def rank_topics(groups: dict, related_by_topic: dict, exclude_topics=None, block
 
 
 def _save_json(path: Path, value: Any):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    for attempt in range(5):
-        try:
-            temporary.replace(path)
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(.05 * (attempt + 1))
+    temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(.05 * (attempt + 1))
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _parse_json(raw: str) -> dict:
@@ -661,15 +666,70 @@ def _duplicate(a: dict, b: dict) -> bool:
 class BlogWorkflow:
     rank_topics = staticmethod(rank_topics)
 
-    def __init__(self, bridge, work_dir: Path, log: Callable[[str], None], cancel_event=None):
+    def __init__(self, bridge, work_dir: Path, log: Callable[[str], None], cancel_event=None, *, budget=None):
         self.bridge = bridge
         self.work_dir = Path(work_dir)
         self.log = log
         self.cancel_event = cancel_event or threading.Event()
+        self.budget = budget
+        self._provider_lanes = provider_lanes(bridge)
+        self._background_images = None
 
     def _check_cancelled(self):
         if self.cancel_event.is_set():
             raise WorkflowError("사용자가 작업을 중지했습니다.")
+        if self.budget is not None:
+            self.budget.check()
+
+    def _check_budget(self, reserve_seconds=0):
+        self._check_cancelled()
+        if self.budget is not None:
+            self.budget.check(reserve_seconds=reserve_seconds)
+
+    def _request_signal(self, reserve_seconds, local_event=None):
+        signal = CombinedCancelSignal(self.cancel_event, local_event)
+        return self.budget.cancel_event(signal, reserve_seconds=reserve_seconds) if self.budget is not None else signal
+
+    def _request_timeout(self, default, reserve_seconds):
+        self._check_budget(reserve_seconds)
+        return self.budget.timeout(default, reserve_seconds=reserve_seconds) if self.budget is not None else default
+
+    def _run_text_with_images(self, provider, prompt, models, images, timeout, reserve_seconds):
+        """Pump image completions on the coordinator while a priority text call waits/runs."""
+        ticket = self._provider_lanes.priority(provider, images=bool(images))
+        local_stop = threading.Event()
+        signal = self._request_signal(reserve_seconds, local_stop)
+        def invoke():
+            with ticket.acquire(signal):
+                remaining = self._request_timeout(timeout, reserve_seconds)
+                return self.bridge.run_text(provider, prompt, model=models.get(provider, ""), images=images,
+                                            timeout=remaining, cancel_event=signal)
+        executor = None
+        try:
+            if self._background_images is None:
+                return invoke()
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="blog-writing")
+            future = executor.submit(invoke)
+            while True:
+                self._check_budget(reserve_seconds)
+                self._background_images.pump(exclude=(provider,), raise_errors=False)
+                try:
+                    return future.result(timeout=.05)
+                except FutureTimeout:
+                    if future.done():
+                        # A native child may itself raise TimeoutError; do not
+                        # mistake a completed failed call for an unfinished wait.
+                        return future.result()
+        except Exception:
+            local_stop.set()
+            self._check_budget(reserve_seconds)
+            raise
+        finally:
+            ticket.close()
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=False)
+            if self._background_images is not None:
+                self._background_images.pump(dispatch=False, raise_errors=False)
 
     def select_topic(self, ranked_candidates: list[dict], provider="chatgpt", model="", blocked_terms=None,
                      recent_publications=None) -> dict:
@@ -779,7 +839,7 @@ class BlogWorkflow:
             self._check_cancelled()
             try:
                 result = self._text_call(run_dir, f"query-{sequence}-{route['provider']}", route["provider"], prompt,
-                                         {**models, route["provider"]: route["model"]})
+                                         {**models, route["provider"]: route["model"]}, timeout=120, retry_transient=False)
                 queries = [normalized_query(result.get("query"))]
                 alternates = result.get("queries", [])
                 for alternate in alternates[:10] if isinstance(alternates, list) else []:
@@ -797,20 +857,23 @@ class BlogWorkflow:
                 return planned
             except Exception as exc:
                 self._check_cancelled()
+                if getattr(exc, 'retryable', None) is False:
+                    raise
                 attempts.append({**route, "error": str(exc)})
                 _save_json(run_dir / "search-plan-errors.json", attempts)
                 self.log(f"{route['provider']} 영어 사진 검색어 보완 필요 · 다음 설정 CLI를 확인합니다.")
         raise WorkflowError("설정된 CLI에서 유효한 영어 사진 검색어를 준비하지 못했습니다.", run_dir)
 
     def _text_call(self, run_dir: Path, name: str, provider: str, prompt: str, models: dict, images=None,
-                   *, timeout=600, retry_transient=True) -> dict:
+                   *, timeout=600, retry_transient=True, reserve_seconds=None) -> dict:
+        reserve_seconds = (300 if images else 600) if reserve_seconds is None else reserve_seconds
+        self._check_budget(reserve_seconds)
         self._check_cancelled()
         (run_dir / f"{name}.prompt.txt").write_text(prompt, encoding="utf-8")
         raw = ""
         for attempt in range(2 if retry_transient else 1):
             try:
-                raw = self.bridge.run_text(provider, prompt, model=models.get(provider, ""), images=images,
-                                           timeout=timeout, cancel_event=self.cancel_event)
+                raw = self._run_text_with_images(provider, prompt, models, images, timeout, reserve_seconds)
                 break
             except Exception as exc:
                 code = getattr(exc, "code", "")
@@ -1091,7 +1154,7 @@ class BlogWorkflow:
                                         "section_index": 0, "quote": "수정 본문에 실제 있는 수치와 단위를 포함한 원문"}]}}, ensure_ascii=False)
             + "\nEND_UNTRUSTED_FACT_REPAIR_JSON")
         response = self._text_call(run_dir, name, route["provider"], prompt,
-            {**models, route["provider"]: route.get("model", "")}, retry_transient=False)
+            {**models, route["provider"]: route.get("model", "")}, retry_transient=False, reserve_seconds=300)
         if on_response:
             on_response()
         result, details = _apply_fact_recovery_response(article, response, review, keywords)
@@ -1218,7 +1281,7 @@ class BlogWorkflow:
             retry_after = _fact_repair_retry_after(path, saved)
             if retry_after:
                 raise WorkflowReviewRequired("최근 1시간의 사실 부분 수정 2회를 사용했습니다. 다음 예약에서 같은 원고의 보완과 최종 검수를 이어갑니다.", path.parent, retry_after=retry_after)
-            self._check_cancelled()
+            self._check_budget(300)
             number = len(saved["repair_attempts"]) + 1
             attempt = {"number": number, "status": "started", "upstream_sha256": _json_hash(article),
                        "provider": route["provider"], "model": route.get("model", ""),
@@ -1328,6 +1391,8 @@ class BlogWorkflow:
                 record['remaining'] = inspect_article(article, keywords, topic, mode=editorial_mode)
             except Exception as exc:
                 self._check_cancelled()
+                if getattr(exc, 'retryable', None) is False:
+                    raise
                 record['error'] = str(exc)
                 self.log(f"부분 수정 {attempt}/2 보완 필요: {exc}")
             report['attempts'].append(record)
@@ -1589,8 +1654,9 @@ class BlogWorkflow:
         self.log("첫 사진 · 기존 원본의 한글 그림자 배치만 복구 · 추가 생성 없이 실제 파일 재검수")
         return updated
 
-    def _generate_candidate(self, run_dir, article, index, models, manifest, previous=None):
-        """One charged attempt. Save the counter before invoking the native CLI."""
+    def _reserve_image_generation(self, run_dir, article, index, models, manifest, previous=None, *, provisional=False):
+        """Coordinator only: record one attempt before handing detached work to a worker."""
+        self._check_budget(600)
         provider = "antigravity" if index % 2 == 0 else "chatgpt"
         output_dir = run_dir / f"image-{index + 1}-{provider}"
         output_dir.mkdir(exist_ok=True)
@@ -1600,10 +1666,13 @@ class BlogWorkflow:
                      "image_policy": IMAGE_POLICY, "generation_attempts": count,
                      "image_context_sha256": _image_context_hash(article, index),
                      "cover_headline": cover_headline(article["cover_headline"]) if index == 0 else ""}
+        if provisional:
+            candidate.update(provisional_generation=True, source_article_sha256=_json_hash(article),
+                             generation_context_sha256=candidate['image_context_sha256'])
         if previous:
             candidate["previous_attempts"] = [*previous.get("previous_attempts", []),
                 {key: previous.get(key) for key in ("generation_attempts", "sha256", "error", "reviews", "rejection_reason")}]
-        _set_image_candidate(manifest, index, candidate)
+        _set_image_candidate(manifest, index, copy.deepcopy(candidate))
         _save_json(run_dir / "manifest.json", manifest)
         prompt = build_image_prompt(article["image_prompts"][index], article["paragraphs"][index], index)
         if previous:
@@ -1613,10 +1682,23 @@ class BlogWorkflow:
         (output_dir / f"prompt-attempt-{count}.txt").write_text(prompt, encoding="utf-8")
         (output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
         self.log(f"이미지 {index + 1}/8 · {provider} CLI 생성 · {count}번째 시도")
+        return {'candidate': candidate, 'prompt': prompt, 'output_dir': str(output_dir),
+                'model': models.get(provider, '')}
+
+    def _render_image_generation(self, job, stop_event=None):
+        """Worker: create files and return a detached candidate; never write the manifest."""
+        candidate = copy.deepcopy(job['candidate'])
+        index, provider = candidate['paragraph_index'], candidate['provider']
+        output_dir = Path(job['output_dir'])
+        signal = self._request_signal(600, stop_event)
         try:
-            generated = self.bridge.generate_image(provider, prompt, output_dir, model=models.get(provider, ""),
-                                                   timeout=600, cancel_event=self.cancel_event)
-            self._check_cancelled()
+            if signal.is_set():
+                self._check_budget(600)
+                raise WorkflowError('선행 이미지 작업을 중단했습니다.')
+            generated = self.bridge.generate_image(provider, job['prompt'], output_dir, model=job['model'],
+                                                   timeout=self._request_timeout(600, 600), cancel_event=signal)
+            # Preserve a successfully returned file even if the dispatch budget
+            # expires during local fingerprint/export work. No new CLI is started.
             path = Path(generated["path"]).resolve()
             if not path.is_relative_to(output_dir.resolve()):
                 raise WorkflowError("CLI가 해당 생성 폴더 밖의 이미지 경로를 반환했습니다.")
@@ -1631,10 +1713,51 @@ class BlogWorkflow:
             if index == 0 and candidate["width"] != candidate["height"]:
                 raise WorkflowError("첫 썸네일을 1:1 비율로 만들지 못했습니다.")
         except Exception as exc:
-            self._check_cancelled()
+            self._check_budget(600)
             candidate["error"] = str(exc)
-        _save_json(run_dir / "manifest.json", manifest)
         return candidate
+
+    def _start_image_batch(self, run_dir, article, models, manifest, jobs, *, provisional=False):
+        if self._background_images is not None:
+            raise WorkflowError('기존 이미지 작업의 완료 기록을 먼저 회수해야 합니다.')
+        source_article, source_models = copy.deepcopy(article), dict(models)
+        def reserve(item):
+            return self._reserve_image_generation(run_dir, source_article, item['index'], source_models,
+                manifest, item.get('previous'), provisional=provisional)
+        def store(candidate):
+            _set_image_candidate(manifest, candidate['paragraph_index'], copy.deepcopy(candidate))
+            _save_json(run_dir / 'manifest.json', manifest)
+        self._background_images = ImageGenerationBatch(jobs, lanes=self._provider_lanes,
+            reserve=reserve, generate=self._render_image_generation, store=store,
+            check=lambda: self._check_budget(600))
+
+    def _finish_image_batch(self):
+        batch = self._background_images
+        if batch is None:
+            return
+        completed = False
+        try:
+            while True:
+                # Collect completed files/errors before checking whether a new
+                # generation still fits. Finished images may enter final review.
+                batch.pump(dispatch=False)
+                if not batch.pending:
+                    break
+                self._check_budget(600)
+                batch.pump()
+                if batch.pending:
+                    self.cancel_event.wait(.05)
+            completed = True
+        finally:
+            try:
+                batch.close(cancel=not completed)
+            finally:
+                self._background_images = None
+
+    def _generate_candidate(self, run_dir, article, index, models, manifest, previous=None):
+        self._start_image_batch(run_dir, article, models, manifest, [{'index': index, 'previous': previous}])
+        self._finish_image_batch()
+        return manifest['image_candidates'][index]
 
     def _audit_final_article(self, run_dir, article, provider, models, sequence):
         prompt = (
@@ -1658,7 +1781,7 @@ class BlogWorkflow:
             + "\nEND_UNTRUSTED_FINAL_ARTICLE_JSON"
         )
         self.log(f"최종 원고 {provider} CLI 집중 검수")
-        review = self._text_call(run_dir, f"final-review-{sequence}-{provider}", provider, prompt, models)
+        review = self._text_call(run_dir, f"final-review-{sequence}-{provider}", provider, prompt, models, reserve_seconds=300)
         return {"provider": provider, "review": review}
 
     def resume(self, run_dir: Path) -> dict:
@@ -1681,7 +1804,10 @@ class BlogWorkflow:
 
     def prepare(self, topic, keywords, base_prompt, steps, review_mode, models=None, google_candidates=None,
                 resume_run_dir=None, stage_configs=None, quality_checks=False, quality_topic=None, image_retry_limit=0,
-                editorial_mode="strict", revision_feedback="", on_run_created=None, final_review_feedback="") -> dict:
+                editorial_mode="strict", revision_feedback="", on_run_created=None, final_review_feedback="",
+                resolve_google_candidates=None, budget=None) -> dict:
+        if budget is not None:
+            self.budget = budget
         resumed_manifest = {}
         self._unavailable_text_routes = set()
         self._unavailable_vision_routes = set()
@@ -1743,6 +1869,8 @@ class BlogWorkflow:
                 raise WorkflowError("최종 검수 보완 사유는 4000자 이내 문자열이어야 합니다.")
             if on_run_created is not None and not callable(on_run_created):
                 raise WorkflowError("회차 생성 알림은 호출 가능한 함수여야 합니다.")
+            if resolve_google_candidates is not None and not callable(resolve_google_candidates):
+                raise WorkflowError("Google 후보 수집 완료 알림은 호출 가능한 함수여야 합니다.")
             topic = _normalize(topic)
             keywords = list(dict.fromkeys(_flatten_strings(keywords)))
             if not topic or not keywords:
@@ -1930,6 +2058,8 @@ class BlogWorkflow:
                         _validate_article(result, keywords, require_visual_style=True)
                 except Exception as stage_error:
                     self._check_cancelled()
+                    if getattr(stage_error, 'retryable', None) is False:
+                        raise
                     if not stage_configs:
                         raise
                     if _route_unavailable(stage_error):
@@ -1977,6 +2107,11 @@ class BlogWorkflow:
                 _save_json(checkpoint_path, {"version": 1, "requested_route": requested_route, "actual_route": actual_route,
                     "response_name": response_name, "request_sha256": request_hash,
                     "upstream_sha256": upstream_hash, "article_sha256": _json_hash(article)})
+                if (self.budget is not None and not resumed_manifest and self._background_images is None
+                        and not manifest['image_candidates'] and not (run_dir / 'provisional-images.json').exists()):
+                    self._start_image_batch(run_dir, article, models, manifest,
+                        [{'index': position} for position in range(8)], provisional=True)
+                    self.log('검증된 초고 저장 완료 · 다음 글 검수와 다른 제공자의 이미지 생성을 함께 진행합니다.')
             assert article is not None
             if quality_checks or editorial_mode == "natural" or manifest.get('fact_spacing_repairs'):
                 editorial_upstream = _json_hash(article)
@@ -2030,6 +2165,18 @@ class BlogWorkflow:
                         "article_sha256": _json_hash(article), "article": article, "effective_stages": effective_stages,
                         "editorial_policy_sha256": editorial_policy_hash,
                         "final_reviews": manifest["final_reviews"], "editorial_quality": manifest.get("editorial_quality", {})})
+            self._finish_image_batch()
+            for item in manifest['image_candidates']:
+                if (isinstance(item, dict) and item.get('provisional_generation') is True
+                        and item.get('path') and not item.get('error')):
+                    # Keep the generation source identity. This is only a new
+                    # review context, never approval for changed final paragraphs.
+                    final_context = _image_context_hash(article, item['paragraph_index'])
+                    if (item.get('provisional_final_context_sha256') != final_context
+                            or item.get('image_context_sha256') != final_context):
+                        item['image_context_sha256'] = final_context
+                        item['provisional_final_context_sha256'] = final_context
+                        item.update(approved=False, vision_reviewed=False, reviews=[], requires_final_semantic_review=True)
             reusable_images = {item["paragraph_index"]: item for item in manifest["image_candidates"]
                 if isinstance(item, dict) and type(item.get("paragraph_index")) is int
                 and item.get("image_context_sha256") == _image_context_hash(article, item["paragraph_index"])}
@@ -2065,7 +2212,7 @@ class BlogWorkflow:
                 str(index): max(int(manifest.get("image_generation_attempts", {}).get(str(index), 0)),
                                 int(reusable_images.get(index, {}).get("generation_attempts", 1 if index in reusable_images else 0)))
                 for index in range(8)}
-            generation_errors = []
+            generation_jobs = []
             for paragraph_index, image_prompt in enumerate(article["image_prompts"]):
                 self._check_cancelled()
                 provider = "antigravity" if paragraph_index % 2 == 0 else "chatgpt"
@@ -2096,10 +2243,21 @@ class BlogWorkflow:
                     candidate.update(approved=False, error=candidate.get("error") or "이미지 재생성 한도를 이미 사용했습니다.")
                     _set_image_candidate(manifest, paragraph_index, candidate)
                 else:
-                    candidate = self._generate_candidate(run_dir, article, paragraph_index, models, manifest, old_image)
-                if candidate.get("error"):
-                    generation_errors.append(candidate["error"])
+                    generation_jobs.append({'index': paragraph_index, 'previous': old_image})
                 _save_json(run_dir / "manifest.json", manifest)
+            if generation_jobs:
+                self._start_image_batch(run_dir, article, models, manifest, generation_jobs)
+                self._finish_image_batch()
+            if resolve_google_candidates is not None:
+                self._check_cancelled()
+                resolved = resolve_google_candidates()
+                if not isinstance(resolved, list) or any(not isinstance(item, dict) for item in resolved):
+                    raise WorkflowError('Google 수집 완료 후보는 이미지 정보 목록이어야 합니다.')
+                google_candidates = copy.deepcopy(resolved)
+                request = json.loads((run_dir / 'request.json').read_text(encoding='utf-8'))
+                request['google_candidates'] = google_candidates
+                _save_json(run_dir / 'request.json', request)
+            generation_errors = [item['error'] for item in manifest['image_candidates'] if item.get('error')]
             if generation_errors and not image_retry_limit and not google_candidates:
                 raise WorkflowError(f"8장 생성 중 {len(generation_errors)}장 실패했습니다. 실제 생성 파일·해상도를 확인하세요. "
                                     + generation_errors[0])
@@ -2230,6 +2388,8 @@ class BlogWorkflow:
                         candidate["rejection_reason"] = "선택 이미지와 중복됩니다."
                 except Exception as exc:
                     self._check_cancelled()
+                    if getattr(exc, 'retryable', None) is False:
+                        raise
                     candidate["approved"] = False
                     candidate["rejection_reason"] = str(exc)
             manifest["images"] = sorted(selected, key=lambda item: item["paragraph_index"])
@@ -2263,10 +2423,18 @@ class BlogWorkflow:
             self.log(f"8문단 원고와 이미지 {len(manifest['images']) + len(manifest['google_images'])}장의 준비·검수가 완료되었습니다.")
             return manifest
         except Exception as exc:
+            if self._background_images is not None:
+                try:
+                    self._background_images.close(cancel=True)
+                finally:
+                    self._background_images = None
             manifest.update({"status": "cancelled" if self.cancel_event.is_set() else "failed",
                              "ready_to_publish": False, "error": str(exc)})
             _save_json(run_dir / "manifest.json", manifest)
             (run_dir / "error.txt").write_text(str(exc), encoding="utf-8")
             if isinstance(exc, WorkflowReviewRequired):
                 raise WorkflowReviewRequired(f"{exc}\n검토 자료: {run_dir}", run_dir, retry_after=exc.retry_after) from exc
+            if getattr(exc, 'retryable', None) is False:
+                exc.run_dir = str(run_dir)
+                raise
             raise WorkflowError(f"{exc}\n검토 자료: {run_dir}", run_dir) from exc

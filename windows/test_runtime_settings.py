@@ -97,7 +97,7 @@ class RuntimeSettingsTests(unittest.TestCase):
                         return self.stopped
 
                 app.full_auto_stop = Stop()
-                def cycle(config):
+                def cycle(config, budget=None):
                     calls.append((clock[0], copy.deepcopy(config)))
                     if len(calls) == 1:
                         clock[0] = 30

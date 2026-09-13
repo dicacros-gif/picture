@@ -155,10 +155,13 @@ class PublishTests(unittest.TestCase):
         self.driver.current_url = "https://blog.naver.com/testblog/postwrite"
         self.opener = MagicMock()
         self.final = MagicMock()
+        self.publish_panel_open = False
+        self.opener.click.side_effect = lambda: setattr(self, "publish_panel_open", True)
         self.app._driver = MagicMock(return_value=self.driver)
         self.app._prepare_article_in_writer = MagicMock(return_value=[f"id-{i}" for i in range(6)])
         self.app._article_ready_to_publish = MagicMock(return_value=True)
-        self.app._find_publish_control = MagicMock(side_effect=lambda _driver, final=False: self.final if final else self.opener)
+        self.app._find_publish_control = MagicMock(side_effect=lambda _driver, final=False:
+            (self.final if self.publish_panel_open else None) if final else self.opener)
         self.app._published_article_url = MagicMock(return_value="https://blog.naver.com/testblog/123456789012")
         self.app.inspect_published_naver_article = MagicMock(return_value={"verified": True})
         self.wait = patch("naver_automation.WebDriverWait", ImmediateWait)

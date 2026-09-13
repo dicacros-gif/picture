@@ -24,6 +24,7 @@ from send2trash import send2trash
 from chatgpt_classic_automation import ChatGPTClassicAutomation
 from blog_controls import BlogWorkflowControls, next_cycle_tick, review_retry_after
 from blog_workflow import BlogWorkflow, WorkflowReviewRequired
+from blog_deadline import CycleBudget, CycleDeadlineExceeded
 from blog_preferences import (atomic_json_write, automation_config_snapshot, blocked_term_hits,
                               load_settings_json, save_settings_json)
 from blog_runtime import ApplicationAlreadyRunning, application_instance_lock, access_error_from_exception, wait_for_restart_parent
@@ -1783,9 +1784,15 @@ class PictureCleanerApp(BlogWorkflowControls):
                 config = automation_config_snapshot(getattr(self, "settings", {}), config)
                 review_required = False
                 review_resume_at = None
+                cycle_budget = CycleBudget(limit_seconds=50 * 60, clock=time.monotonic)
                 try:
-                    self._run_full_automation_cycle(config)
+                    self._run_full_automation_cycle(config, budget=cycle_budget)
                     self._last_review_hold_notice = None
+                except CycleDeadlineExceeded as exc:
+                    self._last_review_hold_notice = None
+                    message = f'회차 시간 예산 도달 · 완료한 원고·사진을 보존하고 다음 예약에 이어갑니다: {exc}'
+                    self._naver_log(message)
+                    self.events.put(('auto_error', message))
                 except WorkflowReviewRequired as exc:
                     review_required = True
                     review_resume_at = review_retry_after(getattr(exc, 'retry_after', None))
@@ -1829,7 +1836,12 @@ class PictureCleanerApp(BlogWorkflowControls):
                         break
                 if self.full_auto_stop.is_set():
                     break
-                self.naver_bot.reset_stop()
+                # A timed-out optional Google worker may still own the browser.
+                # Its composite stop signal must remain set until it exits;
+                # the next cycle's browser-owner guard handles this state.
+                google_job = getattr(self, '_google_search_job', None)
+                if google_job is None or not google_job.alive():
+                    self.naver_bot.reset_stop()
         finally:
             self.full_auto_active = False
             self.naver_task_active = False
@@ -1925,8 +1937,8 @@ class PictureCleanerApp(BlogWorkflowControls):
 
         return topic, related, related_by_topic.get(choice.get("source_topic", topic), {})
 
-    def _run_full_automation_cycle(self, config: dict):
-        self._cli_automation_cycle(config)
+    def _run_full_automation_cycle(self, config: dict, budget=None):
+        self._cli_automation_cycle(config, budget=budget)
 
     def _selected_phone_keywords(self) -> tuple[str, list[str]]:
         selected = normalize_keyword(self.seed.get() or self.topic.get())

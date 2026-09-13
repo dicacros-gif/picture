@@ -94,7 +94,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         self.assertEqual(len(denied), 1)
         self.assertEqual(result["final_reviews"][0]["provider"], "chatgpt")
         self.assertEqual(result["final_reviews"][0]["model"], "writer")
-        self.assertEqual([g["provider"] for g in self.bridge.generations], ["antigravity", "chatgpt"] * 4)
+        self.assertCountEqual([g["provider"] for g in self.bridge.generations], ["antigravity", "chatgpt"] * 4)
 
     def test_only_rejected_image_is_regenerated_and_visually_checked_again(self):
         seen = {}

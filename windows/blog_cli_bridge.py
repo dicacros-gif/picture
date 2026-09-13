@@ -77,6 +77,36 @@ def _flags() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
+def _bounded_child_drain(child):
+    """Never let a descendant retaining a pipe extend an owned request forever."""
+    try:
+        child.communicate(timeout=2)
+        return
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    # Windows communicate uses daemon reader threads. Closing their buffered
+    # pipes on this thread can wait on the reader's lock until an escaped
+    # descendant exits. Defer closes without killing any unrelated process.
+    def close_pipe(stream):
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+    for stream in (child.stdin, child.stdout, child.stderr):
+        if stream is not None:
+            threading.Thread(target=close_pipe, args=(stream,), daemon=True,
+                             name="blog-cli-pipe-close").start()
+    if child.poll() is None:
+        try:
+            child.kill()
+        except OSError:
+            pass
+    try:
+        child.wait(timeout=2)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
 def _run(command: list[str], cwd: Path, *, stdin: bytes = b"", timeout: float = 600,
          cancel_event=None) -> tuple[int, str, str]:
     """Bounded child process; cancellation only terminates the child we own."""
@@ -85,63 +115,56 @@ def _run(command: list[str], cwd: Path, *, stdin: bytes = b"", timeout: float = 
     if not command or Path(command[0]).suffix.lower() in {".cmd", ".bat", ".ps1"}:
         raise BlogCliError("unsafe_launcher", "네이티브 실행 파일 또는 Node.js CLI가 필요합니다.")
     mac_group = sys.platform == "darwin"
-    try:
-        child = subprocess.Popen(command, cwd=str(cwd), env=_child_environment(), shell=False,
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 creationflags=_flags(), **({"start_new_session": True} if mac_group else {}))
-    except OSError as exc:
-        raise BlogCliError("launch_failed", "CLI를 실행할 수 없습니다. 설치 경로를 확인하세요.") from exc
-    started, first = time.monotonic(), True
-    try:
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                raise BlogCliError("cancelled", "CLI 요청을 취소했습니다.")
-            if time.monotonic() - started >= timeout:
-                raise BlogCliError("timeout", f"CLI 응답 제한 시간 {int(timeout)}초를 초과했습니다.")
-            try:
-                output, error = child.communicate(input=stdin if first else None, timeout=0.2)
-                return child.returncode, output.decode("utf-8", errors="replace"), error.decode("utf-8", errors="replace")
-            except subprocess.TimeoutExpired:
-                first = False
-    finally:
-        if mac_group:
-            # npm launchers can exit while their native CLI descendants still
-            # hold our pipes open. Own a separate group and reap it even when
-            # the launcher has already exited. The Mac backend's SIGTERM
-            # handler sets cancel_event, reaching here within the 0.2s poll.
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except OSError:
-                if child.poll() is None:
-                    child.kill()
-            try:
-                child.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                # A detached external descendant may retain a pipe. Never
-                # turn cancellation or a bounded CLI timeout into an endless
-                # communicate() while waiting for that unrelated process.
-                for stream in (child.stdin, child.stdout, child.stderr):
-                    if stream is not None:
-                        stream.close()
-                if child.poll() is None:
-                    child.kill()
+    # Windows communicate writes PIPE stdin synchronously before its timeout
+    # checks. A CLI that never reads a large prompt can therefore block forever.
+    # A private seekable input file preserves the exact bytes and EOF while
+    # making child execution, not pipe capacity, the only thing we wait for.
+    with tempfile.TemporaryFile(mode="w+b") as prompt_input:
+        prompt_input.write(stdin)
+        prompt_input.seek(0)
+        try:
+            child = subprocess.Popen(command, cwd=str(cwd), env=_child_environment(), shell=False,
+                                     stdin=prompt_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     creationflags=_flags(), **({"start_new_session": True} if mac_group else {}))
+        except OSError as exc:
+            raise BlogCliError("launch_failed", "CLI를 실행할 수 없습니다. 설치 경로를 확인하세요.") from exc
+        started = time.monotonic()
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise BlogCliError("cancelled", "CLI 요청을 취소했습니다.")
+                remaining = timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise BlogCliError("timeout", f"CLI 응답 제한 시간 {int(timeout)}초를 초과했습니다.")
                 try:
-                    child.wait(timeout=2)
+                    output, error = child.communicate(timeout=min(.2, remaining))
+                    return child.returncode, output.decode("utf-8", errors="replace"), error.decode("utf-8", errors="replace")
                 except subprocess.TimeoutExpired:
                     pass
-        elif child.poll() is None:
-            if os.name == "nt":
+        finally:
+            if mac_group:
+                # This separate group belongs to this request, even if its
+                # launcher exited while native descendants still hold pipes.
                 try:
-                    subprocess.run(["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   shell=False, timeout=10, creationflags=_flags())
-                except (OSError, subprocess.TimeoutExpired):
+                    os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError:
                     pass
-            if child.poll() is None:
-                child.kill()
-            child.communicate()
+                except OSError:
+                    if child.poll() is None:
+                        child.kill()
+            elif child.poll() is None:
+                if os.name == "nt":
+                    try:
+                        subprocess.run(["taskkill.exe", "/PID", str(child.pid), "/T", "/F"],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       shell=False, timeout=2, creationflags=_flags())
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+                if child.poll() is None:
+                    child.kill()
+            # Always bounded, including an already-exited launcher. Never
+            # taskkill an exited PID, which Windows may already have reused.
+            _bounded_child_drain(child)
 
 
 def _npm_launcher(root: Path, package_name: str, command: str, node: str) -> list[str]:

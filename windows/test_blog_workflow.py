@@ -69,6 +69,7 @@ class FakeBridge:
         self.article_callback = None
         self.raw_response = None
         self.cancel_after_image = None
+        self.user_cancel_event = None
         self.image_callback = None
 
     def run_text(self, provider, prompt, model="", images=None, timeout=600, cancel_event=None):
@@ -109,7 +110,9 @@ class FakeBridge:
         if index != self.missing_image_index:
             make_image(path, 7 if self.duplicate_images else index + 21)
         if index == self.cancel_after_image and cancel_event:
-            cancel_event.set()
+            # Real user cancellation sets the shared application event. The
+            # per-request deadline/batch signal is intentionally read-only.
+            (self.user_cancel_event or cancel_event).set()
         return {"path": str(path), "provider": provider, "width": 800, "height": 800, "sha256": "not-trusted"}
 
 
@@ -120,6 +123,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.bridge = FakeBridge()
         self.cancel = threading.Event()
+        self.bridge.user_cancel_event = self.cancel
         self.workflow = BlogWorkflow(self.bridge, self.root / "runs", lambda _: None, self.cancel)
         def delivery(source, destination, target_long_side=2048, headline="", caption=""):
             with Image.open(source) as picture:

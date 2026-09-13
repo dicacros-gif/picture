@@ -125,6 +125,7 @@ class LateWriterRecoveryTests(unittest.TestCase):
                 state["visible"] = True
                 raise ElementClickInterceptedException("known recovery dim")
             self.assertFalse(state["visible"])
+            self.publish_panel_open = True
         self.opener.click.side_effect = opener_click
 
         result = self.app.publish_naver_article("testblog", self.article)

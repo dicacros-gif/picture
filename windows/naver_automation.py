@@ -4279,27 +4279,54 @@ class NaverAutomation:
             return prepared
         if self.stop_event.is_set():
             raise RuntimeError("사용자가 작업을 중지했습니다.")
-        opener = WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=False))
-        try:
-            opener.click()
-        except ElementClickInterceptedException:
-            # Only the settings opener may be retried. The final submission
-            # below always remains protected by its durable receipt.
-            self._handle_writer_recovery_prompt(driver)
-            if self.stop_event.is_set():
-                raise RuntimeError("사용자가 작업을 중지했습니다.")
-            if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
-                                                  bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
-                raise RuntimeError("안내창 처리 후 내용 검증에 실패하여 발행 설정을 다시 열지 않았습니다.")
+        if self._find_publish_control(driver, final=True) is not None:
+            self.log("이미 열린 발행 설정 창을 확인했습니다. 설정 열기 버튼을 다시 누르지 않고 본문을 검증합니다.")
+        else:
             opener = WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=False))
-            opener.click()
-        try:
-            WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=True))
-        except TimeoutException as exc:
-            raise RuntimeError(
-                "발행 설정 창에서 최종 발행 버튼을 고유하게 확인하지 못했습니다. "
-                "최종 버튼은 누르지 않았으며 입력된 글과 사진을 화면에 유지합니다."
-            ) from exc
+            try:
+                opener.click()
+            except ElementClickInterceptedException:
+                # Decline only the existing, recognized recovery dialog. An
+                # unknown/security overlay still stops here without any bypass.
+                self._handle_writer_recovery_prompt(driver)
+                if self.stop_event.is_set():
+                    raise RuntimeError("사용자가 작업을 중지했습니다.")
+                if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
+                                                      bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
+                    raise RuntimeError("안내창 처리 후 내용 검증에 실패하여 발행 설정을 다시 열지 않았습니다.")
+                if self._find_publish_control(driver, final=True) is None:
+                    opener = WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=False))
+                    opener.click()
+            try:
+                WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=True))
+            except TimeoutException:
+                # A native header click can fail to open its panel in an
+                # occluded Whale window. Retry only that same settings opener,
+                # once, after checking dialogs and the complete article again.
+                self._handle_writer_recovery_prompt(driver)
+                if self.stop_event.is_set():
+                    raise RuntimeError("사용자가 작업을 중지했습니다.")
+                if self._find_publish_control(driver, final=True) is None:
+                    if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
+                                                          bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
+                        raise RuntimeError("발행 설정 열기 재확인 중 내용 검증에 실패했습니다. 최종 버튼은 누르지 않았으며 입력된 글과 사진을 화면에 유지합니다.")
+                    current_opener = self._find_publish_control(driver, final=False)
+                    if current_opener is None or current_opener != opener:
+                        raise RuntimeError("처음 누른 발행 설정 열기 버튼을 동일하게 확인하지 못했습니다. 최종 버튼은 누르지 않았으며 입력된 글과 사진을 화면에 유지합니다.")
+                    # Recheck immediately before the fallback so a late panel
+                    # cannot be closed again by toggling its header button.
+                    if self._find_publish_control(driver, final=True) is None:
+                        if self.stop_event.is_set():
+                            raise RuntimeError("사용자가 작업을 중지했습니다.")
+                        self.log("발행 설정 열기 클릭 후 창이 나타나지 않았습니다. 검증한 같은 설정 버튼만 JavaScript로 1회 다시 엽니다.")
+                        driver.execute_script("arguments[0].click();", current_opener)
+                try:
+                    WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=True))
+                except TimeoutException as exc:
+                    raise RuntimeError(
+                        "같은 발행 설정 열기 버튼을 1회 보완한 뒤에도 최종 발행 버튼을 고유하게 확인하지 못했습니다. "
+                        "최종 버튼은 누르지 않았으며 입력된 글과 사진을 화면에 유지합니다."
+                    ) from exc
         # Recheck after the panel opens; user edits or upload failures must not slip through.
         if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
                                               bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):

@@ -151,6 +151,11 @@ class InterruptedPreparationTests(unittest.TestCase):
 
 
 class GoogleCandidateReuseTests(unittest.TestCase):
+    def setUp(self):
+        precheck = patch("blog_controls._GoogleSearchJob._precheck", side_effect=lambda planner, items, number: items)
+        precheck.start()
+        self.addCleanup(precheck.stop)
+
     def google_app(self, folder, workflow, count=3):
         app = ui_support.BlogUiTests.make_app(self, folder, {})
         app._preflight_cli_accounts = Mock()
@@ -161,6 +166,14 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             'queries': ['home electricity meter', 'household power socket', 'domestic solar panels', 'ignored fourth query']}
         config = {'steps': ['chatgpt'], 'models': {}, 'include_google': True, 'base_prompt': '지침',
                   'review_mode': '단계별 교차 검수', 'blog_id': 'owner', 'google_reference_count': count}
+        def prepare(topic, keywords, *args, **kwargs):
+            run = Path(kwargs.get('resume_run_dir', Path(folder) / 'blog-runs' / 'new'))
+            atomic_json_write(run / 'request.json', {'google_candidates': kwargs['google_candidates']})
+            atomic_json_write(run / 'manifest.json', {'status': 'preparing'})
+            kwargs['on_run_created'](str(run))
+            app.resolved_google = kwargs['resolve_google_candidates']()
+            return {'topic': topic, 'run_dir': str(run)}
+        workflow.return_value.prepare.side_effect = prepare
         return app, config
 
     def test_alternative_queries_keep_candidates_deduplicate_and_stop_at_goal(self):
@@ -173,10 +186,10 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             calls = app.naver_bot.capture_google_reference_candidates.call_args_list
             self.assertEqual(len(calls), 2)
-            self.assertEqual([call.kwargs['count'] for call in calls], [3, 3])
+            self.assertEqual([call.kwargs['count'] for call in calls], [8, 4])
             self.assertNotEqual(calls[0].args[1], calls[1].args[1])
             self.assertTrue(all(call.kwargs['reuse_only'] and call.kwargs['english_only'] for call in calls))
-            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], [first, second, third])
+            self.assertEqual(app.resolved_google, [first, second, third])
 
     def test_three_kept_photos_scan_past_duplicate_leading_result_to_reach_four(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
@@ -190,8 +203,8 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app.naver_bot.capture_google_reference_candidates.side_effect = capture
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             calls = app.naver_bot.capture_google_reference_candidates.call_args_list
-            self.assertEqual([call.kwargs['count'] for call in calls], [4, 4])
-            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], photos[:4])
+            self.assertEqual([call.kwargs['count'] for call in calls], [8, 4])
+            self.assertEqual(app.resolved_google, photos[:4])
 
     def test_search_failure_uses_remaining_queries_without_discarding_results(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
@@ -201,7 +214,7 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app.naver_bot.capture_google_reference_candidates.side_effect = [[one], RuntimeError('preview timeout'), [two]]
             app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             self.assertEqual(app.naver_bot.capture_google_reference_candidates.call_count, 3)
-            self.assertEqual(workflow.return_value.prepare.call_args.kwargs['google_candidates'], [one, two])
+            self.assertEqual(app.resolved_google, [one, two])
 
     def test_stop_in_google_capture_never_starts_more_searches_or_writing(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
@@ -213,7 +226,17 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             with self.assertRaisesRegex(WorkflowError, '중지'):
                 app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)
             app.naver_bot.capture_google_reference_candidates.assert_called_once()
-            workflow.return_value.prepare.assert_not_called()
+            workflow.return_value.prepare.assert_called_once()
+
+    @staticmethod
+    def google_app_prepare(app, workflow, run_dir):
+        def prepare(topic, keywords, *args, **kwargs):
+            atomic_json_write(run_dir / 'request.json', {'google_candidates': kwargs['google_candidates']})
+            atomic_json_write(run_dir / 'manifest.json', {'status': 'preparing'})
+            kwargs['on_run_created'](str(run_dir))
+            app.resolved_google = kwargs['resolve_google_candidates']()
+            return {'topic': topic, 'run_dir': str(run_dir)}
+        workflow.return_value.prepare.side_effect = prepare
 
     def test_resume_reuses_english_source_candidates_without_new_search(self):
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
@@ -228,7 +251,7 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             candidate = {'path': str(photo), 'english_source_verified': True, 'source_language': 'en',
                          'capture_sha256': hashlib.sha256(photo.read_bytes()).hexdigest()}
             atomic_json_write(run_dir / 'request.json', {'google_candidates': [candidate]})
-            workflow.return_value.prepare.return_value = {'topic': '전기요금', 'run_dir': str(run_dir)}
+            self.google_app_prepare(app, workflow, run_dir)
             config = {'steps': ['chatgpt'], 'models': {}, 'include_google': True, 'base_prompt': '지침',
                       'review_mode': '단계별 교차 검수', 'blog_id': 'owner', 'resume_run_dir': str(run_dir)}
             article = app._prepare_cli_worker('전기요금', ['전기요금 절약'], config)

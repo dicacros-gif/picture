@@ -17,6 +17,9 @@ class GoogleSearchResumeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        precheck = patch("blog_controls._GoogleSearchJob._precheck", side_effect=lambda planner, items, number: items)
+        precheck.start()
+        self.addCleanup(precheck.stop)
         self.run = self.root / "blog-runs" / "same-article"
         self.app = object.__new__(BlogWorkflowControls)
         self.app.cli_app_dir = self.root
@@ -27,6 +30,7 @@ class GoogleSearchResumeTests(unittest.TestCase):
         self.app._ensure_topic_allowed = Mock()
         self.app._preflight_cli_accounts = Mock()
         self.app.naver_bot = Mock()
+        self.app.naver_bot.stop_event = threading.Event()
         self.app.naver_bot.capture_google_reference_candidates.return_value = []
         self.config = {"steps": ["chatgpt"], "models": {}, "include_google": True,
                        "base_prompt": "사용자 지침", "review_mode": "단계별 교차 검수",
@@ -45,6 +49,8 @@ class GoogleSearchResumeTests(unittest.TestCase):
                                                 "google_candidates": kwargs["google_candidates"]})
         atomic_json_write(run / "manifest.json", {"status": "preparing"})
         kwargs["on_run_created"](str(run))
+        candidates = kwargs["resolve_google_candidates"]()
+        atomic_json_write(run / "request.json", {"topic": topic, "keywords": keywords, "google_candidates": candidates})
         if self.fail_article:
             raise WorkflowError("cover image rejected", run)
         return {"topic": topic, "run_dir": str(run)}
@@ -106,7 +112,7 @@ class GoogleSearchResumeTests(unittest.TestCase):
     def test_query_exception_does_not_cache_an_empty_failed_search(self):
         self.app.naver_bot.capture_google_reference_candidates.side_effect = [[], RuntimeError("navigation failed"), []]
         self.prepare_article()
-        self.assertFalse((self.run / "google-search-checkpoint.json").exists())
+        self.assertNotEqual(json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))["status"], "completed")
         self.app.naver_bot.capture_google_reference_candidates.side_effect = None
         self.reset_capture_calls()
         self.prepare_article(config=self.resume_config())
@@ -117,17 +123,17 @@ class GoogleSearchResumeTests(unittest.TestCase):
         self.workflow.plan_google_image_search.side_effect = RuntimeError("CLI failed")
         self.prepare_article()
         self.app.naver_bot.capture_google_reference_candidates.assert_not_called()
-        self.assertFalse((self.run / "google-search-checkpoint.json").exists())
+        self.assertNotEqual(json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))["status"], "completed")
 
-    def test_cancel_during_capture_never_saves_completed_search_or_starts_article(self):
+    def test_cancel_during_capture_never_saves_completed_search_or_returns_article(self):
         def cancel(*args, **kwargs):
             self.app.full_auto_stop.set()
             raise RuntimeError("cancelled")
         self.app.naver_bot.capture_google_reference_candidates.side_effect = cancel
         with self.assertRaisesRegex(WorkflowError, "중지"):
             self.prepare_article()
-        self.workflow.prepare.assert_not_called()
-        self.assertFalse((self.run / "google-search-checkpoint.json").exists())
+        self.workflow.prepare.assert_called_once()
+        self.assertNotEqual(json.loads((self.run / "google-search-checkpoint.json").read_text(encoding="utf-8"))["status"], "completed")
 
     def test_corrupt_receipt_retries_without_interrupting_preparation(self):
         self.prepare_article()
@@ -144,7 +150,7 @@ class GoogleSearchResumeTests(unittest.TestCase):
                      "capture_sha256": hashlib.sha256(image.read_bytes()).hexdigest()}
         self.app.naver_bot.capture_google_reference_candidates.return_value = [candidate]
         self.prepare_article()
-        self.assertFalse((self.run / "google-search-checkpoint.json").exists())
+        self.assertTrue((self.run / "google-search-checkpoint.json").exists())
         self.reset_capture_calls()
         self.prepare_article(config=self.resume_config())
         self.workflow.plan_google_image_search.assert_not_called()

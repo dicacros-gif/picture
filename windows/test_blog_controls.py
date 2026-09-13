@@ -379,7 +379,7 @@ class BrowserJobConcurrencyTests(unittest.TestCase):
         app.topic_history.record_publication.side_effect = TopicHistoryError("disk full")
         config = {"blog_id": "owner", "publish": True, "interval_seconds": 3600, "interval_hours": 1}
         article = {"topic": "사진 정리", "run_dir": "owned-run"}
-        app._run_full_automation_cycle = MagicMock(side_effect=lambda config: app._publish_cli_worker(article, config))
+        app._run_full_automation_cycle = MagicMock(side_effect=lambda config, **kwargs: app._publish_cli_worker(article, config))
         with patch.object(app_module, "next_cycle_tick") as next_tick:
             app._full_automation_loop(config)
             next_tick.assert_not_called()

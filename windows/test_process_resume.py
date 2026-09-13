@@ -159,13 +159,21 @@ class SettingsPersistenceTests(unittest.TestCase):
             instance = workflow.return_value
             instance.plan_google_image_search.return_value = {'query': 'Korean home appliance store',
                                                                'run_dir': str(Path(folder) / 'blog-runs' / 'query')}
-            instance.prepare.return_value = {'topic': '하이마트', 'run_dir': folder}
+            def prepare(topic, keywords, *args, **kwargs):
+                run = Path(folder) / 'blog-runs' / 'article'
+                from blog_preferences import atomic_json_write
+                atomic_json_write(run / 'request.json', {'google_candidates': []})
+                atomic_json_write(run / 'manifest.json', {'status': 'preparing'})
+                kwargs['on_run_created'](str(run))
+                kwargs['resolve_google_candidates']()
+                return {'topic': topic, 'run_dir': str(run)}
+            instance.prepare.side_effect = prepare
             config = {'steps': ['chatgpt'], 'models': {'chatgpt': 'saved-model'}, 'include_google': True,
                       'base_prompt': '사용자 지침', 'review_mode': 'final', 'blog_id': 'testblog', 'google_reference_count': 7}
             result = app._prepare_cli_worker('하이마트', ['하이마트 재고'], config)
             capture = app.naver_bot.capture_google_reference_candidates.call_args
             self.assertEqual(capture.args[0], 'Korean home appliance store')
-            self.assertEqual(capture.kwargs, {'count': 7, 'reuse_only': True, 'english_only': True, 'allow_attribution': True})
+            self.assertEqual(capture.kwargs, {'count': 8, 'reuse_only': True, 'english_only': True, 'allow_attribution': True})
             instance.plan_google_image_search.assert_called_once_with('하이마트', ['하이마트 재고'],
                 ['chatgpt'], {'chatgpt': 'saved-model'}, stage_configs=None)
             self.assertEqual(instance.prepare.call_args.args[0], '하이마트')
