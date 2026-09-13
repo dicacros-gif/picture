@@ -2739,16 +2739,25 @@ class PictureCleanerApp(BlogWorkflowControls):
                     consumed = event[2] if len(event) > 2 else [event[1]]
                     self._update_keyword_queue(consumed=consumed)
                     self._render_keyword_groups(self.realtime_groups)
-                    self.status.set(f"발행한 키워드 '{event[1]}' 제거 완료 · 다음 회차에는 다른 키워드를 선택합니다.")
+                    self.status.set(f"사용한 키워드 '{event[1]}' 제거 완료 · 다음 회차에는 다른 키워드를 선택합니다.")
                 elif kind == "cli_preparing":
                     self.cli_article = None
                     self.blog_result.delete("1.0", "end")
                     self.status.set(f"'{event[1]}' 글·이미지 준비 중")
                 elif kind == "cli_article":
-                    self.cli_article = event[1]
+                    self.cli_article = dict(event[1])
+                    if not isinstance(self.cli_article.get('text'), str):
+                        self.cli_article['text'] = '\n\n'.join(value for value in
+                            [self.cli_article.get('title', ''), *self.cli_article.get('paragraphs', [])]
+                            if isinstance(value, str) and value.strip())
                     self.blog_result.delete("1.0", "end")
-                    self.blog_result.insert("1.0", event[1]["text"])
-                    self.status.set("검수 완료 · 8문단과 이미지 준비됨 · 실행 자료 폴더에서 검수 기록 확인")
+                    self.blog_result.insert("1.0", self.cli_article['text'])
+                    if self.cli_article.get('publication', {}).get('saved'):
+                        self.status.set('네이버 임시저장 완료 · 작성한 본문 미리보기')
+                    elif self.cli_article.get('quality_hold'):
+                        self.status.set('임시저장할 작업 내용 · 작성된 본문 미리보기')
+                    else:
+                        self.status.set("검수 완료 · 8문단과 이미지 준비됨 · 실행 자료 폴더에서 검수 기록 확인")
                 elif kind == "cli_publication":
                     result = event[1]
                     self.status.set(("네이버 발행 완료: " + str(result.get("url", ""))) if result.get("published") else ("네이버 임시저장 완료" if result.get("saved") else ("네이버 글 입력 완료" if result.get("status") == "prepared" else str(result.get("message", "완료 확인 필요")))))
@@ -2774,8 +2783,13 @@ class PictureCleanerApp(BlogWorkflowControls):
                     self.topic.set(event[1])
         except queue.Empty:
             pass
-        self._maybe_launch_automation()
-        self.root.after(100, self._poll)
+        except Exception:
+            self._report_uncaught_exception('화면 이벤트 처리 실패', *sys.exc_info())
+        try:
+            self._maybe_launch_automation()
+        finally:
+            if not getattr(self, '_closing', False):
+                self.root.after(100, self._poll)
 
     def close(self):
         if getattr(self, "_closing", False):

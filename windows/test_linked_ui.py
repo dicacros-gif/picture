@@ -101,6 +101,34 @@ class LinkedUiTests(unittest.TestCase):
                 self.assertIn('30일', helper.text)
                 helper.hide()
 
+    def test_private_recovery_without_preview_text_keeps_publication_and_log_events_running(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = self.make_app(folder, {})
+            article = {'title': '작업 중인 제목', 'paragraphs': ['작성한 첫 구역.', '작성한 둘째 구역.'],
+                       'quality_hold': True, 'publication': {'saved': True}}
+            app.events.put(('account_event', 'primary', '웨일', ('cli_article', article)))
+            app.events.put(('account_event', 'primary', '웨일', ('cli_publication', {'saved': True})))
+            app.events.put(('account_log', 'primary', '웨일', '임시저장 후 작업 파일 정리 완료'))
+            app._poll()
+            self.assertIn('작성한 둘째 구역.', app.blog_result.get('1.0', 'end'))
+            self.assertIn('작업 중인 제목', app.cli_article['text'])
+            self.assertIn('작업 파일 정리 완료', app.progress_panel.account_texts['primary'].get('1.0', 'end'))
+            self.assertTrue(app.events.empty())
+
+    def test_bad_ui_event_is_reported_and_next_poll_is_scheduled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            app = self.make_app(folder, {})
+            app._report_uncaught_exception = Mock()
+            app._maybe_launch_automation = Mock()
+            app.root.after = Mock()
+            app.events.put(('cli_article', None))
+            app.events.put(('status', '다음 이벤트 정상 처리'))
+            app._poll()
+            app._report_uncaught_exception.assert_called_once()
+            app.root.after.assert_called_with(100, app._poll)
+            app._poll()
+            self.assertEqual(app.status.get(), '다음 이벤트 정상 처리')
+
     def test_selected_comment_accounts_run_concurrently_and_stop_all(self):
         barrier = threading.Barrier(2)
         one, two = Mock(), Mock()

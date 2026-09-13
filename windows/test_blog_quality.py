@@ -259,7 +259,7 @@ class EditorialTests(unittest.TestCase):
         self.assertTrue({'subheading_types', 'hook_ending', 'sentence_rhythm',
                          'definition_without_analogy', 'numeric_comparison', 'complex_word'} <= codes)
 
-    def test_layout_groups_normal_sentences_and_isolates_emphasis(self):
+    def test_layout_keeps_bold_sentence_inside_its_three_sentence_group(self):
         article = valid_article()
         body = '첫 문장입니다. 둘째 문장이지요. 중요한 문장입니다. 넷째 문장이에요. 다섯째 문장입니다.'
         article['paragraphs'][0] = '──────────────\n❝ 배터리 수명\n\n' + body
@@ -268,7 +268,7 @@ class EditorialTests(unittest.TestCase):
         article['hook_endings'] = [''] * 8
         result, changed = layout_article(article)
         self.assertEqual(changed, list(range(8)))
-        self.assertIn('첫 문장입니다.\n둘째 문장이지요.\n\n중요한 문장입니다.\n\n넷째 문장이에요.\n다섯째 문장입니다.',
+        self.assertIn('첫 문장입니다.\n둘째 문장이지요.\n중요한 문장입니다.\n\n넷째 문장이에요.\n다섯째 문장입니다.',
                       result['paragraphs'][0])
         again, changed_again = layout_article(result)
         self.assertEqual(again, result)

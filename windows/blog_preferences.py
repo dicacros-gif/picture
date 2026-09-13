@@ -51,7 +51,7 @@ _CANNED_TRANSITION_POLICY_BLOCK = """[상투적 연결 표현 금지 · 2026-09-
 _EDITORIAL_FLOW_POLICY_BLOCK = """[도입부·소제목·문장 리듬 규칙 · 2026-09-13]
 첫 구역 첫 문장은 의외의 사실, 둘째 문장은 글을 끝까지 읽고 얻을 구체적인 결과 약속이며 합계 90자 이내입니다. 제목 연관어를 이 두 문장에 자연스럽게 포함하고 검색어만 따로 한 줄로 쓰지 않습니다. 도입부 후보 3개를 완성 본문에 근거해 검토하고 금지어·길이·근거 구역 검사를 통과한 후보만 사용합니다.
 8개 소제목은 질문형·단정형·반전형·장면형을 각각 두 번씩, 같은 유형이 연속하지 않게 씁니다. 2~8구역은 앞 구역 요약 없이 내용으로 바로 시작합니다. 1~7구역 마지막에는 다음 소제목의 구체적인 궁금증을 남기고 8구역은 실행 가능한 정리로 닫습니다.
-처음 나오는 어려운 용어는 생활 비유를 먼저 쓰고 정의합니다. 문장은 보통 45자 안팎, 최대 60자로 쓰며 일반 문장은 2~3문장씩 묶고 굵은 문장·형광 문장·구역 끝 궁금증만 따로 띄웁니다. 수치는 같은 문장이나 바로 다음 문장에 비교 대상을 밝힙니다."""
+처음 나오는 어려운 용어는 생활 비유를 먼저 쓰고 정의합니다. 문장은 보통 45자 안팎, 최대 60자로 쓰며 2~3문장씩 묶고 각 문장 사이에는 줄바꿈 1회만 둡니다. 굵은 문장·색상·형광·구역 끝 궁금증도 같은 묶음 규칙을 따르고 강조 때문에 빈 줄을 추가하지 않습니다. 수치는 같은 문장이나 바로 다음 문장에 비교 대상을 밝힙니다."""
 
 _IMAGE_REALISM_POLICY_BLOCK = """[실사 이미지 질감 규칙 · 2026-09-13 v2]
 생성 이미지는 실제 카메라 사진처럼 눈에 보이는 중간 강도의 고운 35mm 필름 그레인, 자연광, 자연스러운 렌즈 보케와 아웃포커싱, 아주 약한 광학 왜곡·비네팅·색수차를 사용합니다. 디지털 노이즈나 과한 빈티지 손상은 피하고 피부·옷감·사물의 미세한 실제 질감을 유지합니다.
@@ -298,10 +298,15 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
         if typography_marker in default_prompt:
             text = _append_marked_policy(text, typography_marker,
                 typography_marker + default_prompt.split(typography_marker, 1)[1].split("\n\n[", 1)[0].rstrip())
-        linebreak_marker = "[문장 줄바꿈 최종 규칙 · 2026-09-13]"
+        linebreak_marker = "[문장 줄바꿈 최종 규칙 · 2026-09-13 v2]"
         if linebreak_marker in default_prompt:
-            text = _append_marked_policy(text, linebreak_marker,
-                linebreak_marker + default_prompt.split(linebreak_marker, 1)[1].rstrip())
+            linebreak_block = linebreak_marker + default_prompt.split(linebreak_marker, 1)[1].rstrip()
+            if (linebreak_marker not in text
+                    and ("[문장 줄바꿈 최종 규칙 · 2026-09-13]" in text
+                         or "[제목 통합 작성 규칙 · 2026-09-13 v2]" in text)):
+                # Retain user edits and prior policy text; the explicit final
+                # version overrides the old emphasis-spacing rule exactly once.
+                text = text.rstrip() + "\n\n" + linebreak_block
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)

@@ -1399,6 +1399,9 @@ class BlogWorkflowControls(UnattendedControls):
             for name in article.get('draft_source_files', []) if (run / name).is_file()}
         article['draft_artifact_sha256'] = {name: hashlib.sha256((run / name).read_bytes()).hexdigest()
             for name in ('request.json', 'manifest.json', 'editorial.pending.json') if (run / name).is_file()}
+        from blog_quality import layout_article
+        article, _ = layout_article(article)
+        article['text'] = article['title'].strip() + '\n\n' + '\n\n'.join(article['paragraphs'])
         return article
 
     @staticmethod

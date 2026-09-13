@@ -416,10 +416,8 @@ def local_cleanup(article, issues, *, mode='strict'):
 
 
 def layout_article(article):
-    """Group ordinary sentences in twos/threes while isolating emphasized and hook lines."""
+    """Keep 2–3 sentence groups; emphasis never introduces additional empty lines."""
     result = copy.deepcopy(article)
-    emphasized = set(article.get('bold_phrases', [])) | set(article.get('highlight_phrases', []))
-    emphasized |= {value for value in article.get('hook_endings', []) if isinstance(value, str) and value}
     changed = []
     for index, paragraph in enumerate(article.get('paragraphs', [])):
         lines = paragraph.splitlines()
@@ -432,20 +430,13 @@ def layout_article(article):
         footer = [line.strip() for line in lines[footer_index:] if line.strip()]
         body = ' '.join(line.strip() for line in lines[heading_index + 1:footer_index] if line.strip())
         body_items = sentences(body)
-        blocks, group = [], []
-        def flush():
-            if group:
-                blocks.append('\n'.join(group))
-                group.clear()
-        for sentence in body_items:
-            if sentence in emphasized:
-                flush()
-                blocks.append(sentence)
-            else:
-                group.append(sentence)
-                if len(group) == 3:
-                    flush()
-        flush()
+        blocks, position = [], 0
+        while position < len(body_items):
+            remaining = len(body_items) - position
+            # Avoid a decorative one-line final group when four sentences remain.
+            size = 2 if remaining == 4 else min(3, remaining)
+            blocks.append('\n'.join(body_items[position:position + size]))
+            position += size
         rebuilt = '\n'.join(prefix) + ('\n\n' + '\n\n'.join(blocks) if blocks else '')
         if footer:
             rebuilt += '\n\n' + '\n\n'.join(footer)

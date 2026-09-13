@@ -146,7 +146,10 @@ class QualityDraftAccountTests(unittest.TestCase):
         config = {**support.CONFIG, 'blog_id': 'secondary_blog'}
         with patch.object(worker, '_publish_cli_worker', return_value={**self.receipt(), 'paragraph_count': 2}) as save:
             self.assertTrue(worker._save_quality_hold_draft(config, pending, 'held topic', ['held key'], str(run), []))
-        self.assertEqual(save.call_args.args[0]['paragraphs'], article['paragraphs'])
+        saved = save.call_args.args[0]
+        self.assertEqual([p.split() for p in saved['paragraphs']], [p.split() for p in article['paragraphs']])
+        self.assertTrue(any('.\n' in p for p in saved['paragraphs']))
+        self.assertIn(saved['paragraphs'][0], saved['text'])
         self.assertFalse(run.exists())
 
     def test_generic_nonretryable_preparation_error_saves_complete_work(self):
@@ -230,7 +233,7 @@ class QualityDraftAccountTests(unittest.TestCase):
             path.write_text(json.dumps(newer), encoding='utf-8')
             os.utime(path, (2000, 2000))
         recovered = worker._quality_draft_from_run(str(run), 'held topic', ['held key'])
-        self.assertEqual(recovered['paragraphs'], newer['paragraphs'])
+        self.assertEqual([p.split() for p in recovered['paragraphs']], [p.split() for p in newer['paragraphs']])
         self.assertEqual(recovered['draft_source_files'][0], 'stage-2-antigravity.json')
         self.assertTrue(recovered['unapproved_private_recovery'])
 
