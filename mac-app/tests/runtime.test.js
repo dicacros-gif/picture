@@ -279,7 +279,7 @@ test('automation defaults off and enabled launch starts immediately once', async
   f.controller.setAutomation(true); assert.equal(f.calls.length, 1);
 });
 
-test('interval change reschedules from last completion and stale timer cannot start', async t => {
+test('interval change reschedules from last start and stale timer cannot start', async t => {
   const f = controllerFixture(t);
   f.controller.setAutomation(true); await f.controller.running;
   const first = f.controller.timer, completedAt = Date.UTC(2026, 8, 13);
@@ -337,4 +337,15 @@ test('automatic failure schedules next run without overlapping or changing setti
   assert.equal(f.controller.status, 'error'); assert.equal(f.controller.timer.delay, 6 * 3600000);
   assert.equal(f.calls.length, 1); assert.equal(f.controller.state().automationEnabled, true);
   f.controller.stop(); assert.equal(f.controller.timer, null);
+});
+
+
+test('a 40-minute article leaves 20 minutes until the next hourly start', async t => {
+  const f = controllerFixture(t);
+  f.setInvoke(async () => {
+    f.setNow(Date.UTC(2026, 8, 13) + 40 * 60000);
+    return { status: 'local', saved: true, published: false };
+  });
+  f.controller.setAutomation(true); await f.controller.running;
+  assert.equal(f.controller.timer.delay, 20 * 60000);
 });

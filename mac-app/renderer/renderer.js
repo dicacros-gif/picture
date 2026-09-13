@@ -573,12 +573,13 @@ function renderPrompts() {
   $("blogPromptDelete").disabled = blogPreferences.prompts.length < 2;
 }
 
+let cachedModelChoices = {};
 function renderStages() {
   const count = Number($("blogStageCount").value) || 1;
   $("blogStages").replaceChildren(...stageDrafts.slice(0, count).map((stage, index) => {
     const row = document.createElement("div");
     row.className = "stage-row";
-    row.innerHTML = `<div class="stage-heading"><span>${index + 1}</span><select aria-label="${index + 1}단계 CLI"></select><select aria-label="${index + 1}단계 역할"></select></div><label for="stageModel${index}">모델</label><select id="stageModel${index}" aria-label="${index + 1}단계 모델"></select>`;
+    row.innerHTML = `<div class="stage-heading"><span>${index + 1}</span><select aria-label="${index + 1}단계 CLI"></select><select aria-label="${index + 1}단계 역할"></select></div><label for="stageModel${index}">모델</label><select id="stageModel${index}" aria-label="${index + 1}단계 모델"></select><input class="custom-model" aria-label="직접 입력할 모델 ID" placeholder="로그인한 CLI의 모델 ID" maxlength="120" hidden>`;
     const [provider, role] = row.querySelectorAll("select");
     for (const [value, label] of Object.entries(PROVIDERS)) provider.add(new Option(label, value));
     for (const value of ROLES) role.add(new Option(value, value));
@@ -587,20 +588,23 @@ function renderStages() {
     role.value = stage.role;
     const model = row.querySelector(`#stageModel${index}`);
     // Keep previously saved custom model IDs; CLI defaults remain the safe default.
-    for (const value of ["", ...(stage.provider === "claude" ? ["sonnet", "opus", "haiku"] : []), ...stageDrafts.filter(item => item.provider === stage.provider).map(item => item.model || ""), stage.model || ""].filter((v, i, all) => all.indexOf(v) === i)) {
+    for (const value of ["", ...(cachedModelChoices[stage.provider] || (stage.provider === "claude" ? ["sonnet", "opus", "haiku"] : [])), ...stageDrafts.filter(item => item.provider === stage.provider).map(item => item.model || ""), stage.model || ""].filter((v, i, all) => all.indexOf(v) === i)) {
       model.add(new Option(value || "CLI 기본 모델", value));
     }
     model.add(new Option("모델 ID 직접 추가…", "__custom__"));
     model.value = stage.model || "";
-    provider.onchange = () => { stageDrafts[index].provider = provider.value; markSettingsDirty(); };
+    provider.onchange = () => { stageDrafts[index].provider = provider.value; markSettingsDirty(); renderStages(); };
     role.onchange = () => { stageDrafts[index].role = role.value; markSettingsDirty(); };
+    const custom = row.querySelector(".custom-model");
+    custom.onchange = () => {
+      stageDrafts[index].model = custom.value.trim().slice(0, 120);
+      markSettingsDirty(); renderStages();
+    };
     model.onchange = () => {
-      let value = model.value;
-      if (value === "__custom__") {
-        value = window.prompt("로그인한 CLI에서 사용할 모델 ID", stage.model || "");
-        if (value === null) { model.value = stage.model || ""; return; }
+      if (model.value === "__custom__") {
+        custom.hidden = false; custom.value = stage.model || ""; custom.focus(); return;
       }
-      stageDrafts[index].model = String(value).trim().slice(0, 120);
+      stageDrafts[index].model = model.value;
       markSettingsDirty(); renderStages();
     };
     return row;
@@ -693,6 +697,10 @@ function receiveBlogState(state = {}, { replayLogs = false } = {}) {
 
 function renderCliAccounts(response = {}) {
   const values = Array.isArray(response) ? response : (Array.isArray(response.accounts) ? response.accounts : []);
+  for (const record of values) {
+    if (Array.isArray(record.models)) cachedModelChoices[record.provider] = record.models.filter(value => typeof value === "string" && value.length <= 120);
+  }
+  renderStages();
   $("blogCliAccounts").replaceChildren(...Object.entries(PROVIDERS).map(([provider, label]) => {
     const record = values.find(item => item.provider === provider || item.name?.toLowerCase() === provider)
       || response.accounts?.[provider] || response[provider] || {};

@@ -20,6 +20,7 @@ from blog_diagnostics import BlogDiagnostics
 from blog_preferences import atomic_json_write, blocked_term_hits, normalize_blocked_terms
 from blog_topic_history import TopicHistory, topic_key, confirmed_draft, _confirmed as confirmed_publication
 from blog_artifact_cleanup import ArtifactCleanup
+from blog_account_history import AccountTopicHistory
 from mac_draft import recover_private_draft
 from blog_workflow import BlogWorkflow, WorkflowError, rank_topics
 from blog_deadline import CycleBudget
@@ -47,12 +48,20 @@ def contained_run(root, value):
 
 def public_accounts(records):
     output = []
+    cached_models = []
+    try:
+        cache = read_json(Path.home() / '.codex' / 'models_cache.json', {})
+        cached_models = [item['slug'] for item in cache.get('models', []) if isinstance(item, dict)
+            and isinstance(item.get('slug'), str) and item['slug'] != 'codex-auto-review']
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
     for provider, record in records.items():
         status = ('missing' if not record.get('installed') else 'ready' if record.get('auth_available')
                   else 'auth_required' if record.get('auth_status') == 'authentication_required'
                   else 'not_checked')
         output.append({'provider': provider, 'status': status, 'message': record.get('message', ''),
-                       'installed': record.get('installed', False), 'imageAvailable': record.get('image_available', False)})
+                       'installed': record.get('installed', False), 'imageAvailable': record.get('image_available', False),
+                       'models': cached_models if provider == 'chatgpt' else ['sonnet', 'opus', 'haiku'] if provider == 'claude' else []})
     return {'accounts': output}
 
 
@@ -100,7 +109,7 @@ class MacRun:
         self.data_dir, self.log, self.cancel = Path(data_dir), log, cancel
         self.run_root = self.data_dir / 'blog-runs'
         self.pending_path = self.data_dir / 'mac-active-run.json'
-        self.history = TopicHistory(self.data_dir / 'blog-topic-history.json')
+        self.history = AccountTopicHistory(self.data_dir / 'blog-topic-history.json', 'mac-primary')
         self.bridge = bridge or MacBlogCliBridge(self.data_dir, log, cancel)
         self.bot = bot or MacNaverAutomation(self.data_dir, log, debug_port=9449)
         self.bot.stop_event = cancel
@@ -143,7 +152,17 @@ class MacRun:
             raise WorkflowError('스포츠·사망 주제는 작성 대상에서 제외됩니다.')
         groups = self.history.filter_groups(groups, include_pending=True)
         completed = read_json(self.data_dir / 'mac-completed-topics.json', [])
-        excluded = [item['topic'] for item in completed if isinstance(item, dict) and item.get('topic')] if payload.get('automatic') else []
+        excluded = []
+        if payload.get('automatic'):
+            for item in completed:
+                if not isinstance(item, dict) or not item.get('topic'):
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(item['at']).astimezone(timezone.utc)
+                    if (datetime.now(timezone.utc) - stamp).total_seconds() < 30 * 86400:
+                        excluded.append(item['topic'])
+                except (KeyError, ValueError, TypeError):
+                    excluded.append(item['topic'])
         ranked = rank_topics(groups, related, exclude_topics=excluded, blocked_terms=blocked)
         ranked = [row for row in ranked if not self.history.is_duplicate(row['topic'], row['keywords'])]
         if not ranked and not keyword:
@@ -275,6 +294,7 @@ class MacRun:
         self.check_cancelled()
         budget = CycleBudget(3000)
         self.budget = budget
+        self.workflow.budget = budget
         cleanup = ArtifactCleanup(self.data_dir, self.log, history=self.history)
         try:
             cleanup.retry()
@@ -404,6 +424,8 @@ class MacRun:
         result.update(title=article['title'], runDir=article['run_dir'],
             article={'title': article['title'], 'paragraphs': article['paragraphs']},
             message=result.get('message') or ('네이버 임시저장을 완료했습니다.' if config['mode'] == 'draft' else '발행을 완료했습니다.'))
+        if pending.get('quality_hold'):
+            result['message'] = '완성하지 못한 원고를 네이버 임시저장했습니다. 다음 회차는 새 주제로 진행합니다.'
         atomic_json_write(self.data_dir / 'mac-last-result.json',
             {key: value for key, value in result.items() if key != 'article'} if confirmed_draft(result) else result)
         completed = read_json(self.data_dir / 'mac-completed-topics.json', [])

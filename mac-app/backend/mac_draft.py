@@ -98,4 +98,3 @@ def recover_private_draft(app_dir, run_dir, topic, keywords):
     article, _ = layout_article(article)
     article['text'] = article['title'].strip() + '\n\n' + '\n\n'.join(article['paragraphs'])
     return article
-

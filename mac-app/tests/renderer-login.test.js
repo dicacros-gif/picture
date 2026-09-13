@@ -26,6 +26,7 @@ function rendererFixture(loginCli) {
   const source = fs.readFileSync(path.join(root, 'renderer', 'renderer.js'), 'utf8');
   const render = source.slice(source.indexOf('function renderCliAccounts('), source.indexOf('async function checkCliAccounts('));
   const context = {
+    cachedModelChoices: {}, renderStages: () => {},
     PROVIDERS: { chatgpt: 'ChatGPT', claude: 'Claude', antigravity: 'Antigravity' }, cliLoggingIn: loggingIn,
     document: { createElement: tag => ({ tag, dataset: {}, children: [], append(...children) { this.children.push(...children); } }) },
     $: () => accounts, window: { picture: { loginCli } },
