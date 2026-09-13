@@ -6,6 +6,7 @@ import re
 from difflib import SequenceMatcher
 
 from blog_numeric_claims import numeric_claim_issues, _numeric_value
+from blog_title import title_quality_issues
 
 FORBIDDEN = ("질문", "소제목", "예를 들어", "예컨대", "또한", "결론적으로", "오늘은 알아보겠습니다")
 ATTRIBUTION = re.compile(r"(?:Antigravity|안티그래비티|ChatGPT|Claude|클로드|챗GPT|CLI|AI)(?:가|에서|로|를 통해|는)?\s*(?:직접\s*)?(?:확인|검증|검수|작성|생성)", re.I)
@@ -43,6 +44,7 @@ def inspect_article(article, keywords, topic, *, mode='strict'):
     title = article.get('title', '') or ''
     if not any(k in title for k in keywords):
         add('title_keyword', -1, title, '제목에 실제 연관 검색어 한 개를 자연스럽게 포함')
+    issues.extend(title_quality_issues(article, keywords))
     bridges = article.get('bridge_sentences', [])
     keys = article.get('subheading_keywords', [])
     actual_keywords = list(dict.fromkeys(keyword for keyword in keywords if isinstance(keyword, str) and keyword.strip()))
@@ -137,9 +139,22 @@ def apply_patches(article, response, issues):
         if not isinstance(old, str) or not old or not isinstance(new, str) or result['paragraphs'][index].count(old) != 1:
             raise ValueError('수정할 원문은 해당 구역에 정확히 한 번 있어야 합니다.')
         result['paragraphs'][index] = result['paragraphs'][index].replace(old, new, 1)
-    if 'title' in response and any(i['code'] == 'title_keyword' for i in issues):
-        if isinstance(response['title'], str):
-            result['title'] = response['title']
+    title_codes = {'title_keyword', 'title_synthesis'}
+    if 'title' in response and any(i['code'] in title_codes for i in issues):
+        title = response['title']
+        if (not isinstance(title, str) or not 8 <= len(title.strip()) <= 70
+                or '\n' in title or '\r' in title or '?' not in title
+                or any(mark in title for mark in (',', '#', '*', '<', '>'))):
+            raise ValueError('제목 부분 수정은 물음표를 포함한 한 줄의 8~70자 제목이어야 합니다.')
+        tail = next((line.strip() for line in reversed(article['paragraphs'][-1].splitlines()) if line.strip()), '')
+        known_numbers = set(re.findall(r'\d+(?:[.,]\d+)*', article.get('title', '') + ' ' + tail))
+        if set(re.findall(r'\d+(?:[.,]\d+)*', title)) - known_numbers:
+            raise ValueError('제목 보완에서 첫 제목과 마지막 SEO 제목에 없던 수치를 추가할 수 없습니다.')
+        result['title'] = title.strip()
+    if issues and all(issue['code'] in title_codes for issue in issues):
+        # Title-only feedback must never rewrite body/fact/image metadata.
+        # The workflow independently audits the changed title before publishing.
+        return result
     for field in ('bridge_sentences', 'subheading_keywords', 'bold_terms', 'bold_phrases', 'highlight_phrases'):
         if field in response and isinstance(response[field], list) and all(isinstance(s, str) for s in response[field]):
             result[field] = response[field]

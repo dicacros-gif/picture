@@ -284,7 +284,7 @@ class GoogleCandidateReuseTests(unittest.TestCase):
             app._cleanup_stale_artifacts()
             for directory in (run, source, auxiliary):
                 self.assertTrue(directory.exists())
-            self.assertFalse(expired.exists())
+            self.assertTrue(expired.exists())  # Age alone does not prove this run was published.
 
 
 class EarlyResumeReceiptTests(unittest.TestCase):

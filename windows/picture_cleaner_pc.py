@@ -1774,9 +1774,16 @@ class PictureCleanerApp(BlogWorkflowControls):
         self._cancel_automatic_resume()
         self.full_auto_stop.set()
         self.naver_bot.stop()
+        for bot in getattr(self, '_account_bots', {}).values():
+            bot.stop()
+        for bot in getattr(self, '_account_login_bots', {}).values():
+            bot.stop()
         self.status.set("전체 자동화 중지를 요청했습니다.")
 
     def _full_automation_loop(self, config: dict):
+        if getattr(self, 'settings', {}).get('writer_accounts'):
+            from blog_accounts_runtime import run_accounts
+            return run_accounts(self, config)
         next_tick = time.monotonic()
         access_problem = None
         try:
@@ -2429,6 +2436,30 @@ class PictureCleanerApp(BlogWorkflowControls):
             while True:
                 event = self.events.get_nowait()
                 kind = event[0]
+                if kind == 'account_log':
+                    _, account, label, message = event
+                    safe = redact_diagnostic(message)
+                    self.progress_panel.append(f"[{datetime.now():%H:%M:%S}] {safe}", account=account)
+                    self.status.set(f'{label} · {safe}')
+                    if getattr(self, 'diagnostics', None) is not None:
+                        self.diagnostics.write(f'[{label}] {safe}')
+                    continue
+                if kind == 'account_event':
+                    _, account, label, inner = event
+                    if account != 'primary':
+                        if inner[0] == 'cli_article':
+                            self.account_articles = getattr(self, 'account_articles', {})
+                            self.account_articles[account] = inner[1]
+                        elif inner[0] == 'cli_topic_consumed':
+                            self._update_keyword_queue(consumed=inner[2] if len(inner) > 2 else [inner[1]])
+                        elif inner[0] == 'cli_publication':
+                            result = inner[1]
+                            message = ('발행 완료 · ' + str(result.get('url', ''))) if result.get('published') else str(result.get('message', result.get('status', '')))
+                            self.progress_panel.append(f"[{datetime.now():%H:%M:%S}] {message}", account=account)
+                        elif inner[0] in ('status', 'auto_error', 'error'):
+                            self.progress_panel.append(f"[{datetime.now():%H:%M:%S}] {inner[1]}", account=account)
+                        continue
+                    event, kind = inner, inner[0]
                 if self._handle_runtime_event(event):
                     continue
                 if kind == "status":
@@ -2662,6 +2693,10 @@ class PictureCleanerApp(BlogWorkflowControls):
         self._cancel_automatic_resume()
         self.full_auto_stop.set()
         self.naver_bot.stop()
+        for bot in getattr(self, '_account_bots', {}).values():
+            bot.stop()
+        for bot in getattr(self, '_account_login_bots', {}).values():
+            bot.stop()
         try:
             if hasattr(self, "cli_preferences"):
                 current = next(p for p in self.cli_preferences["prompts"] if p["id"] == self.cli_active_prompt)
@@ -2686,6 +2721,8 @@ class PictureCleanerApp(BlogWorkflowControls):
             return
         try:
             self.naver_bot.close()
+            for bot in getattr(self, '_account_login_bots', {}).values():
+                bot.close()
         except Exception:
             self._report_uncaught_exception("브라우저 종료 예외", *sys.exc_info())
         finally:

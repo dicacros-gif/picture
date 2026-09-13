@@ -175,7 +175,7 @@ class ParallelWorkflowTests(unittest.TestCase):
             if provider == 'claude' and not kwargs.get('images'):
                 self.assertTrue(cover_saved.wait(3))
                 result = json.loads(original(provider, prompt, **kwargs))
-                result['cover_headline'] = '배터리 왜 짧지'
+                result['cover_headline'] = '배터리 왜 짧지?'
                 return json.dumps(result, ensure_ascii=False)
             return original(provider, prompt, **kwargs)
         self.bridge.run_text = change_cover
@@ -292,7 +292,7 @@ class ParallelWorkflowTests(unittest.TestCase):
         self.bridge.run_text = fail
         with self.assertRaises(CycleDeadlineExceeded):
             self.workflow._text_call(self.root, 'bounded', 'chatgpt', 'valid prompt', {})
-        self.assertEqual(calls, [600])
+        self.assertEqual(calls, [300])
         self.assertFalse(self.cancel.is_set())
 
     def test_final_audit_can_use_five_minute_reserve_when_normal_writing_cannot(self):

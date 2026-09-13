@@ -195,7 +195,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         def run(provider, prompt, **kwargs):
             if prompt.startswith("GOOGLE_IMAGE_CAPTIONS"):
                 caption_calls.append((provider, kwargs.get("model")))
-                return json.dumps({"google_captions": [f"관리 기준{i}" for i in range(8)]})
+                return json.dumps({"google_captions": [f"기준 {i} 뭘까?" for i in range(8)]})
             return original(provider, prompt, **kwargs)
         self.bridge.run_text = run
         result = self.prepare(steps=["chatgpt"], stage_configs=[{"provider": "chatgpt", "model": "my-model", "role": "작성"}],

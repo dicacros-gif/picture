@@ -36,8 +36,8 @@ def valid_article():
         "paragraphs": sections,
         "image_prompts": [f"문단 {index + 1}의 내용을 표현하는 이름 없는 노트북과 깔끔한 작업 공간, 자연광, 글자 없는 독창적인 사진" for index in range(8)],
         "highlight_phrases": [important], "bold_phrases": [important],
-        "cover_headline": "배터리 수명비밀",
-        "google_captions": [f"관리 기준{index}" for index in range(8)],
+        "cover_headline": "배터리 수명 왜 짧을까?",
+        "google_captions": [f"기준 {index} 뭘까?" for index in range(8)],
         "sources": [{"title": "Manufacturer battery guidance", "url": "https://support.example.com/battery",
                      "verified": True, "is_primary": True, "supports": ["기기별 지원 기능과 사용 조건이 다를 수 있다."]}],
         "review": {"approved": True, "facts_verified": True, "sources_verified": True,
@@ -366,7 +366,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertEqual(len(self.bridge.calls),2)
 
     def test_long_or_non_korean_cover_hook_is_repairable_format_error(self):
-        for value in ('x', '열세글자이상으로너무긴후킹문구입니다'):
+        for value in ('x', '가' * 29 + '?'):
             with self.subTest(value=value):
                 self.bridge.calls.clear()
                 self.bridge.article['cover_headline'] = value

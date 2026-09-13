@@ -87,13 +87,13 @@ class BlogUiTests(unittest.TestCase):
             self.assertFalse(hasattr(restored, "api_key"))
 
     def test_default_migration_preserves_user_presets_with_colliding_name_and_id(self):
-        prompts = [{"id": "mine", "name": "사용자 기본 프롬프트 · 1:1 한글 썸네일", "text": "사용자 직접 작성한 문장"},
-                   {"id": "user-default-20260912-thumbnail-v3", "name": "직접 저장한 옵션", "text": "보존할 두 번째 내용"}]
+        prompts = [{"id": "mine", "name": "사용자 기본 프롬프트 · 연관어 확장 제목", "text": "사용자 직접 작성한 문장"},
+                   {"id": "user-default-20260913-title-synthesis-v1", "name": "직접 저장한 옵션", "text": "보존할 두 번째 내용"}]
         with tempfile.TemporaryDirectory() as directory:
             app = self.make_app(directory, {"cli_workflow": {"prompts": prompts}})
             saved = app.cli_preferences["prompts"]
             self.assertEqual(saved[1:], prompts)
-            self.assertEqual(saved[0]["name"], "사용자 기본 프롬프트 · 1:1 한글 썸네일 (2)")
+            self.assertEqual(saved[0]["name"], "사용자 기본 프롬프트 · 연관어 확장 제목 (2)")
             self.assertNotEqual(saved[0]["id"], prompts[1]["id"])
             app._save_cli_selection()
             settings = json.loads((Path(directory) / "settings.json").read_text(encoding="utf-8"))

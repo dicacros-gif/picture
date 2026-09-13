@@ -11,8 +11,19 @@ class ProgressPanel:
         self.notebook = ttk.Notebook(self.split)
         self.split.add(self.notebook, weight=1)
         self.frame = ttk.Frame(self.split)
-        self.text = ScrolledText(self.frame, height=5, wrap="word", font=("맑은 고딕", 9), state="disabled")
-        self.text.pack(fill="both", expand=True)
+        self.account_split = ttk.Panedwindow(self.frame, orient='horizontal')
+        self.account_split.pack(fill='both', expand=True)
+        self.account_frames, self.account_labels, self.account_texts = {}, {}, {}
+        for identifier in ('primary', 'secondary'):
+            box = ttk.Frame(self.account_split)
+            label = ttk.Label(box, text='계정 1' if identifier == 'primary' else '계정 2')
+            label.pack(anchor='w')
+            text = ScrolledText(box, height=5, wrap='word', font=('맑은 고딕', 9), state='disabled')
+            text.pack(fill='both', expand=True)
+            self.account_frames[identifier], self.account_labels[identifier], self.account_texts[identifier] = box, label, text
+        self.account_split.add(self.account_frames['primary'], weight=1)
+        self.text = self.account_texts['primary']
+        self.secondary_visible = False
         self.split.add(self.frame, weight=0)
         self.bar = ttk.Frame(parent)
         self.bar.pack(fill="x")
@@ -89,11 +100,25 @@ class ProgressPanel:
         if save:
             self._persist()
 
-    def append(self, message):
-        self.text.configure(state="normal")
-        self.text.insert("end", message + "\n")
-        lines = int(self.text.index("end-1c").split(".")[0])
+    def set_accounts(self, accounts):
+        from blog_accounts_ui import BROWSER_LABELS
+        secondary = any(row.get('id') == 'secondary' and row.get('enabled') for row in accounts)
+        if secondary != self.secondary_visible:
+            if secondary:
+                self.account_split.add(self.account_frames['secondary'], weight=1)
+            else:
+                self.account_split.forget(self.account_frames['secondary'])
+            self.secondary_visible = secondary
+        for row in accounts:
+            if row.get('id') in self.account_labels:
+                self.account_labels[row['id']].configure(text=f"{BROWSER_LABELS.get(row.get('browser'), '브라우저')} · {row.get('blog_id') or '블로그 ID 미입력'}")
+
+    def append(self, message, account='primary'):
+        target = self.account_texts.get(account, self.text)
+        target.configure(state="normal")
+        target.insert("end", message + "\n")
+        lines = int(target.index("end-1c").split(".")[0])
         if lines > 5000:
-            self.text.delete("1.0", f"{lines - 5000 + 1}.0")
-        self.text.see("end")
-        self.text.configure(state="disabled")
+            target.delete("1.0", f"{lines - 5000 + 1}.0")
+        target.see("end")
+        target.configure(state="disabled")

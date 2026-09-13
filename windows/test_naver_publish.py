@@ -246,7 +246,7 @@ class PublishTests(unittest.TestCase):
                         {"caption_text": "ABC"}):
             invalid = copy.deepcopy(self.article)
             invalid["images"][-1].update(changes)
-            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "상단 별도"):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "가운데 한글"):
                 self.app._validate_publish_article(invalid)
         for changes in ({"caption_exact": False}, {"caption_legible": False}, {"no_other_text": False},
                         {"detected_text": "다른 문구"}, {"text_free": True}):
@@ -269,6 +269,37 @@ class PublishTests(unittest.TestCase):
                                    **{flag: True for flag in ("cover_text_exact", "cover_text_legible", "no_other_text",
                                        "square_1_to_1", "no_human_face", "bold_gothic", "text_shadow_visible", "approved_text_color")})
         self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 10)
+
+    def test_center_question_caption_requires_new_colors_and_actual_text_review(self):
+        from image_delivery import CAPTION_RENDER_VERSION
+        self._append_google_images(1, captions=True)
+        item = self.article["images"][-1]
+        item.update(caption_text="재고는 언제 확인할까?", caption_placement="center",
+                    caption_layout="center_overlay", caption_band_height=0,
+                    caption_render_version=CAPTION_RENDER_VERSION,
+                    caption_text_colors=["#FFFFFF", "#8CE88C"], caption_panel_color="#000000")
+        item["reviews"][0]["detected_text"] = item["caption_text"]
+        self.assertEqual(len(self.app._validate_publish_article(self.article)[2]), 7)
+        for changes in ({"caption_text_colors": ["#EF3340", "#8CE88C"]},
+                        {"caption_placement": "top"}, {"caption_text": "재고 확인 방법"},
+                        {"caption_render_version": "unknown"}, {"original_text_free": False}):
+            invalid = copy.deepcopy(self.article)
+            invalid["images"][-1].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.app._validate_publish_article(invalid)
+
+    def test_new_cover_palette_is_white_green_while_old_approval_stays_readable(self):
+        from image_delivery import COVER_RENDER_VERSION
+        self.test_generated_cover_policy_allows_only_separately_verified_reference_captions()
+        cover = self.article["images"][0]
+        cover["cover_text_color"] = "#EF3340"
+        self.app._validate_publish_article(self.article)
+        cover.update(cover_render_version=COVER_RENDER_VERSION,
+                     cover_text_color="#8CE88C", cover_text_colors=["#FFFFFF", "#8CE88C"])
+        self.app._validate_publish_article(self.article)
+        cover["cover_text_colors"] = ["#EF3340", "#8CE88C"]
+        with self.assertRaisesRegex(ValueError, "흰색과 형광 녹색"):
+            self.app._validate_publish_article(self.article)
 
     def test_published_page_inspects_sixteen_images_in_repeated_section_positions(self):
         self._append_google_images(10)

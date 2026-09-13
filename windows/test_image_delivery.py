@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, ImageColor, PngImagePlugin
-from image_delivery import COVER_RENDER_VERSION, _draw_cover, clean_export
+from PIL import Image, ImageColor, ImageChops, ImageDraw, PngImagePlugin
+from image_delivery import COVER_RENDER_VERSION, OVERLAY_TEXT_COLORS, _draw_cover, clean_export
 
 
 class ImageDeliveryTests(unittest.TestCase):
@@ -50,7 +50,8 @@ class ImageDeliveryTests(unittest.TestCase):
             clean_export(source,plain)
             result=clean_export(source,cover,headline='기부의 기준')
             self.assertTrue(result['cover_text_applied'])
-            self.assertIn(result['cover_text_color'], {'#8CE88C', '#EF3340'})
+            self.assertEqual(result['cover_text_color'], '#8CE88C')
+            self.assertEqual(result['cover_text_colors'], ['#FFFFFF', '#8CE88C'])
             self.assertEqual(result['cover_aspect_ratio'], '1:1')
             self.assertNotEqual(plain.read_bytes(),cover.read_bytes())
             self.assertEqual(original,source.read_bytes())
@@ -85,17 +86,17 @@ class ImageDeliveryTests(unittest.TestCase):
                     self.assertTrue(title_y)
                     self.assertTrue(shadow_y)
                     self.assertGreaterEqual(max(shadow_y) - max(title_y), 7)
-                    self.assertEqual(rendered.crop((0, 0, 768, 240)).tobytes(),
-                                     original.crop((0, 0, 768, 240)).tobytes())
-                    self.assertEqual(rendered.crop((0, 530, 768, 768)).tobytes(),
-                                     original.crop((0, 530, 768, 768)).tobytes())
+                    self.assertEqual(rendered.crop((0, 0, 768, 180)).tobytes(),
+                                     original.crop((0, 0, 768, 180)).tobytes())
+                    self.assertEqual(rendered.crop((0, 590, 768, 768)).tobytes(),
+                                     original.crop((0, 590, 768, 768)).tobytes())
 
     def test_cover_text_is_centered_on_translucent_black_panel(self):
         original = Image.new('RGB', (512, 512), (100, 180, 240))
         rendered, color = _draw_cover(original, '왜 다를까?')
         foreground = ImageColor.getrgb(color)
         points = [(x, y) for y in range(512) for x in range(512)
-                  if rendered.getpixel((x, y)) == foreground]
+                  if rendered.getpixel((x, y)) in {ImageColor.getrgb(value) for value in OVERLAY_TEXT_COLORS}]
         self.assertTrue(points)
         left, right = min(x for x, _ in points), max(x for x, _ in points)
         top, bottom = min(y for _, y in points), max(y for _, y in points)
@@ -114,7 +115,7 @@ class ImageDeliveryTests(unittest.TestCase):
             cover = clean_export(source, Path(directory) / 'cover.jpg', headline='물가지표의 밤')
             plain = clean_export(source, Path(directory) / 'plain.jpg')
             self.assertEqual(cover['cover_render_version'], COVER_RENDER_VERSION)
-            self.assertEqual(COVER_RENDER_VERSION, 'center-black-panel-v3')
+            self.assertEqual(COVER_RENDER_VERSION, 'center-question-overlay-v4')
             self.assertEqual(cover['cover_text_alignment'], 'center')
             self.assertEqual(cover['cover_panel_color'], '#000000')
             self.assertAlmostEqual(cover['cover_panel_opacity'], 140 / 255)
@@ -175,9 +176,53 @@ class ImageDeliveryTests(unittest.TestCase):
     def test_cover_rejects_long_or_multiline_caption(self):
         with tempfile.TemporaryDirectory() as directory:
             source=Path(directory)/'source.png';Image.new('RGB',(1024,1024),'white').save(source)
-            for headline in ('열세글자이상으로너무긴후킹문구입니다','두 줄\n문구'):
+            for headline in ('가' * 29, '두 줄\n문구'):
                 with self.subTest(headline=headline), self.assertRaises(ValueError):
                     clean_export(source,Path(directory)/(str(len(headline))+'.jpg'),headline=headline)
+
+    def test_long_question_wraps_whole_words_into_two_or_three_centered_lines(self):
+        question = '필라델피아 반도체 지금 사도 되나?'
+        with tempfile.TemporaryDirectory() as directory:
+            source, target = Path(directory)/'source.png', Path(directory)/'cover.jpg'
+            Image.new('RGB', (1024, 1024), (70, 100, 125)).save(source)
+            result = clean_export(source, target, headline=question, target_long_side=1024)
+            self.assertIn(len(result['cover_text_lines']), (2, 3))
+            self.assertEqual(' '.join(result['cover_text_lines']), question)
+            self.assertTrue(result['cover_text_lines'][-1].endswith('?'))
+            self.assertIn(len(result['cover_emphasis_words']), (1, 2))
+            self.assertTrue(all(word in question for word in result['cover_emphasis_words']))
+            self.assertEqual(result['cover_text_alignment'], 'center')
+            self.assertGreater(result['cover_blur_radius'], 0)
+            self.assertLessEqual(result['cover_blur_radius'], 3)
+
+    def test_renderer_uses_real_white_and_green_pixels_without_red_selection(self):
+        original = Image.new('RGB', (640, 640), (65, 85, 105))
+        rendered, color = _draw_cover(original, '물가 내려도 주가 오를까?')
+        colors = {value for _, value in rendered.getcolors(maxcolors=640 * 640)}
+        self.assertEqual(color, '#8CE88C')
+        self.assertIn((255, 255, 255), colors)
+        self.assertIn((140, 232, 140), colors)
+        self.assertNotIn((239, 51, 64), colors)
+
+    def test_mild_blur_changes_background_detail_without_mutating_input(self):
+        original = Image.new('RGB', (512, 512), (80, 100, 120))
+        draw = ImageDraw.Draw(original)
+        for x in range(0, 512, 4):
+            draw.line((x, 0, x, 512), fill=(150, 170, 190))
+        before = original.tobytes()
+        rendered, _ = _draw_cover(original, '예약 언제 해야 할까?')
+        self.assertEqual(original.tobytes(), before)
+        self.assertIsNotNone(ImageChops.difference(original.crop((0, 0, 512, 50)),
+                                                  rendered.crop((0, 0, 512, 50))).getbbox())
+
+    def test_twenty_eight_character_headline_and_legacy_short_text_remain_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)/'source.png'
+            Image.new('RGB', (512, 512), (65, 85, 105)).save(source)
+            for headline in ('가' * 27 + '?', '기부의 기준'):
+                result = clean_export(source, Path(directory)/'cover.jpg', headline=headline, target_long_side=512)
+                self.assertEqual(result['cover_headline'], headline)
+                self.assertLessEqual(len(result['cover_text_lines']), 3)
 
 
 if __name__ == "__main__":

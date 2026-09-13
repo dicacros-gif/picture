@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Callable
 from blog_visual_style import (IMAGE_POLICY, BODY_TEXT_COLOR, line_style_runs, cover_headline,
                                quote_parts, choose_visual_style, supplement_bold_phrases)
+from image_delivery import COVER_RENDER_VERSION, CAPTION_RENDER_VERSION, OVERLAY_TEXT_COLORS
 
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
@@ -3423,13 +3424,24 @@ class NaverAutomation:
                 raise ValueError("모든 발행 이미지에는 통과한 CLI 시각 검수 기록이 필요합니다.")
             if item.get("provider") == "google" and (item.get("caption_text") or item.get("caption_applied")):
                 caption = item.get("caption_text")
-                if (not isinstance(caption, str) or not 1 <= len(caption) <= 10
+                legacy_band = (isinstance(caption, str) and len(caption) <= 10
+                               and item.get("caption_placement") == "top"
+                               and item.get("caption_layout") == "separate_band"
+                               and type(item.get("caption_band_height")) is int
+                               and item["caption_band_height"] > 0)
+                center_overlay = (item.get("caption_render_version") == CAPTION_RENDER_VERSION
+                                  and item.get("caption_placement") == "center"
+                                  and item.get("caption_layout") == "center_overlay"
+                                  and item.get("caption_band_height") == 0
+                                  and item.get("caption_text_colors") == list(OVERLAY_TEXT_COLORS)
+                                  and item.get("caption_panel_color") == "#000000"
+                                  and isinstance(caption, str) and caption.endswith("?"))
+                if (not isinstance(caption, str) or not 1 <= len(caption) <= 28
                         or not re.search(r"[가-힣]", caption) or re.search(r"https?://|www\.|[\r\n]", caption, re.I)
                         or item.get("caption_applied") is not True or item.get("original_text_free") is not True
-                        or item.get("caption_placement") != "top" or item.get("caption_layout") != "separate_band"
-                        or type(item.get("caption_band_height")) is not int or item["caption_band_height"] <= 0
+                        or not (legacy_band or center_overlay)
                         or item.get("cover_headline") or item.get("cover_text_applied")):
-                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 상단 별도 영역의 10자 이내 한글 캡션이 필요합니다.")
+                    raise ValueError("Google 참고 이미지에는 원본 글자 없음 검수와 흰색·형광 녹색의 가운데 한글 질문 문구가 필요합니다.")
                 for review in reviews:
                     if (any(review.get(flag) is not True for flag in ("caption_exact", "caption_legible", "no_other_text"))
                             or review.get("text_free") is not False
@@ -3448,6 +3460,10 @@ class NaverAutomation:
                     or checked[0].get("cover_aspect_ratio") != "1:1" or checked[0].get("width") != checked[0].get("height")
                     or checked[0].get("cover_text_color") not in {"#8CE88C", "#EF3340"}):
                 raise ValueError("첫 생성 사진의 한글 후킹 문구를 확인하지 못했습니다.")
+            if checked[0].get("cover_render_version") == COVER_RENDER_VERSION:
+                if (checked[0].get("cover_text_color") != "#8CE88C"
+                        or checked[0].get("cover_text_colors") != list(OVERLAY_TEXT_COLORS)):
+                    raise ValueError("새 표지의 문구는 흰색과 형광 녹색으로 표시해야 합니다.")
             for index, item in enumerate(checked):
                 if item.get("provider") != "google" and item.get("image_policy") != IMAGE_POLICY:
                     raise ValueError("새 이미지 생성 규칙과 다른 사진이 포함되어 있습니다.")

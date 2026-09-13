@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import BooleanVar, StringVar, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -22,6 +22,7 @@ from blog_workflow import (BlogWorkflow, REVIEW_MODES, WorkflowError, WorkflowRe
                            _related_to_topic, _text_review_schema_valid)
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
 from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
+from blog_artifact_cleanup import ArtifactCleanup, CleanupError
 
 
 def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
@@ -348,15 +349,26 @@ class BlogWorkflowControls(UnattendedControls):
     def _browser_task_busy(self):
         job = getattr(self, "_google_search_job", None)
         return bool(job is not None and job.alive()) or any(getattr(self, name, False) for name in
-                   ("naver_task_active", "full_auto_active", "realtime_task_active", "cli_login_active"))
+                   ("naver_task_active", "full_auto_active", "realtime_task_active", "cli_login_active", "account_login_active"))
 
     def _discard_topic_review(self, value):
-        if not value:
+        if not value or not Path(value).name.startswith("topic-review-"):
             return
-        path = Path(value).resolve()
-        root = (self.cli_app_dir / "blog-runs").resolve()
-        if root in path.parents and path.name.startswith("topic-review-") and path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
+        try:
+            cleanup = self._artifact_cleanup_manager()
+            cleanup.enqueue_discarded_plan(str(value))
+            cleanup.retry()
+        except (CleanupError, TopicHistoryError, OSError, ValueError, TypeError) as exc:
+            self._naver_log(f"주제 검토 자료 정리 보류 · 자료를 보존합니다: {exc}")
+
+    def _artifact_cleanup_manager(self):
+        return ArtifactCleanup(self.cli_app_dir, self._naver_log, getattr(self, "topic_history", None))
+
+    def _retry_artifact_cleanup(self):
+        try:
+            self._artifact_cleanup_manager().retry()
+        except (CleanupError, TopicHistoryError, OSError, ValueError, TypeError) as exc:
+            self._naver_log(f"산출물 정리 대기열 확인 필요 · 발행 작업을 계속하고 자료를 보존합니다: {exc}")
 
     def _init_cli_controls(self, config_path, app_dir, default_prompt):
         self.cli_config_path, self.cli_app_dir = Path(config_path), Path(app_dir)
@@ -365,16 +377,16 @@ class BlogWorkflowControls(UnattendedControls):
         )
         pref = self.cli_preferences
         self._init_unattended_controls(pref)
-        if pref.get("default_revision") != "user-20260912-thumbnail-v3":
+        if pref.get("default_revision") != "user-20260913-title-synthesis-v1":
             if self.settings.get("cli_workflow"):
-                supplied = {"id": "user-default-20260912-thumbnail-v3", "name": "사용자 기본 프롬프트 · 1:1 한글 썸네일", "text": default_prompt.strip()}
+                supplied = {"id": "user-default-20260913-title-synthesis-v1", "name": "사용자 기본 프롬프트 · 연관어 확장 제목", "text": default_prompt.strip()}
                 for field in ("id", "name"):
                     original, suffix = supplied[field], 2
                     while any(p[field] == supplied[field] for p in pref["prompts"]):
                         supplied[field] = f"{original} ({suffix})"
                         suffix += 1
                 pref["prompts"] = [supplied, *pref["prompts"]]
-            pref["default_revision"] = "user-20260912-thumbnail-v3"
+            pref["default_revision"] = "user-20260913-title-synthesis-v1"
         self.cli_active_prompt = pref["selected_prompt_id"]
         selected = next(p for p in pref["prompts"] if p["id"] == self.cli_active_prompt)
         self.cli_preset_choice = StringVar(value=selected["name"])
@@ -396,47 +408,19 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_article = None
         self.cli_runtime_selectors = []
         self.cli_bridge = BlogCliBridge(self.cli_app_dir, self._naver_log, self.full_auto_stop)
-        self.topic_history = TopicHistory(self.cli_app_dir / "published-topic-history.json")
+        from blog_account_history import AccountTopicHistory
+        self.topic_history = AccountTopicHistory(self.cli_app_dir / "published-topic-history.json", 'primary')
         self.topic_history.import_legacy(self.auto_history)
         self.keyword_db = self.topic_history.filter_keywords(self.keyword_db)
         self._cleanup_stale_artifacts()
 
     def _cleanup_stale_artifacts(self):
-        cutoff = datetime.now().timestamp() - timedelta(days=7).total_seconds()
-        protected = set()
-        pending_path = self.cli_app_dir / "pending-blog-topic.json"
-        if pending_path.exists():
-            try:
-                pending = json.loads(pending_path.read_text(encoding="utf-8"))
-                prepared = pending.get("prepared_article", {})
-                protected = {Path(p).resolve() for p in (pending.get("resume_run_dir"), pending.get("run_dir"),
-                    pending.get("choice", {}).get("selection_run_dir"), *prepared.get("auxiliary_dirs", [])) if p}
-                for run_dir in tuple(protected):
-                    request_path = run_dir / "request.json"
-                    if (self.cli_app_dir.resolve() in run_dir.parents and request_path.is_file()):
-                        request = json.loads(request_path.read_text(encoding="utf-8"))
-                        protected.update(Path(item["path"]).resolve().parent
-                            for item in request.get("google_candidates", []) if isinstance(item, dict) and item.get("path"))
-                        sidecar = run_dir / "google-search-checkpoint.json"
-                        if sidecar.is_file():
-                            search = json.loads(sidecar.read_text(encoding="utf-8"))
-                            protected.update(Path(item["path"]).resolve().parent
-                                for item in search.get("candidates", []) if isinstance(item, dict) and item.get("path"))
-                            protected.update(Path(value).resolve() for value in search.get("auxiliary_dirs", []) if value)
-            except (ValueError, OSError, TypeError, AttributeError):
-                return  # Preserve work if its pending receipt cannot be read.
-        for parent_name in ("blog-runs", "google-reference-candidates"):
-            parent = self.cli_app_dir / parent_name
-            if not parent.is_dir():
-                continue
-            for path in parent.iterdir():
-                try:
-                    resolved = path.resolve()
-                    if (parent.resolve() in resolved.parents and not any(resolved == kept or resolved in kept.parents for kept in protected) and path.is_dir()
-                            and path.stat().st_mtime < cutoff):
-                        shutil.rmtree(path)
-                except OSError as exc:
-                    self._naver_log(f"7일 경과 산출물 정리 실패 · {path}: {exc}")
+        try:
+            cleanup = self._artifact_cleanup_manager()
+            cleanup.collect_orphan_plans()
+            cleanup.retry()
+        except (CleanupError, TopicHistoryError, OSError, ValueError, TypeError) as exc:
+            self._naver_log(f"오래된 검색 계획 정리 보류 · 실패·미발행 자료는 보존합니다: {exc}")
 
     def _cli_blog_ui(self):
         self.blog_tab.columnconfigure(0, weight=1)
@@ -523,6 +507,8 @@ class BlogWorkflowControls(UnattendedControls):
             selector.pack(side="left", padx=3)
             selector.bind("<<ComboboxSelected>>", self._save_cli_selection)
         ttk.Label(policy_row, text="장 · 설정 변경은 다음 새 글부터", style="Sub.TLabel").pack(side="left", padx=5)
+        from blog_accounts_ui import WriterAccountsControls
+        self.writer_accounts_ui = WriterAccountsControls(self, settings)
         ttk.Label(self.blog_tab, text="검색 의도 → 제목·8구역 → CLI 교차 검수 → 생성 이미지 + 한글 설명을 넣은 Google 캡처", style="Sub.TLabel").grid(row=1, column=0, sticky="w", pady=7)
         panes = ttk.Panedwindow(self.blog_tab, orient="horizontal")
         panes.grid(row=2, column=0, sticky="nsew")
@@ -557,7 +543,6 @@ class BlogWorkflowControls(UnattendedControls):
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(actions, text="실행 자료 폴더", command=self.open_cli_artifacts).pack(side="left")
         ttk.Button(actions, text="결과 복사", command=lambda: self.copy_widget(self.blog_result)).pack(side="left", padx=6)
-        ttk.Button(actions, text="웨일 네이버 로그인", command=self.open_naver_login).pack(side="left")
         self._sync_cli_step_boxes()
 
     def _sync_cli_step_boxes(self):
@@ -626,6 +611,8 @@ class BlogWorkflowControls(UnattendedControls):
     def _persist_cli_preferences(self):
         if hasattr(self, "_general_settings_snapshot"):
             self.settings.update(self._general_settings_snapshot())
+        if hasattr(self, 'writer_accounts_ui'):
+            self.settings['writer_accounts'] = self.writer_accounts_ui.snapshot()
         self.settings["cli_workflow"] = copy.deepcopy(self.cli_preferences)
         self.settings["auto_interval_hours"] = self.auto_interval_hours.get()
         self.settings["blog_id"] = self.blog_id.get().strip()
@@ -683,7 +670,11 @@ class BlogWorkflowControls(UnattendedControls):
             raise ValueError("프롬프트를 저장한 뒤 실행하세요.")
         pref = copy.deepcopy(self.cli_preferences)
         selected = next(p for p in pref["prompts"] if p["id"] == pref["selected_prompt_id"])
+        from blog_accounts_ui import normalized_writer_accounts, validate_writer_accounts
+        accounts = self.writer_accounts_ui.snapshot() if hasattr(self, 'writer_accounts_ui') else normalized_writer_accounts(self.settings, self.blog_id.get())
+        validate_writer_accounts(accounts)
         return {"steps": pref["order"][:pref["step_count"]], "review_mode": pref["review_mode"],
+                "writer_accounts": accounts, "early_image_finish": True,
                 "quality_checks": True,
                 "image_retry_limit": pref.get("image_retry_limit", 2),
                 "google_reference_count": pref.get("google_reference_count", 4),
@@ -783,6 +774,7 @@ class BlogWorkflowControls(UnattendedControls):
         resume_options["resolve_google_candidates"] = job.resolve
         if budget is not None:
             resume_options["budget"] = budget
+        resume_options['early_image_finish'] = config.get('early_image_finish', True)
         brief = config["base_prompt"]
         if config.get("selection_intent") or config.get("selection_question"):
             brief += "\n확정된 검색 의도(주제를 바꾸지 말고 이 궁금증에 답한다): " + json.dumps({
@@ -1001,11 +993,11 @@ class BlogWorkflowControls(UnattendedControls):
                 if newly_recorded or confirmed_publication(result):
                     consumed = [article["topic"], *consumed_keywords]
                     from keyword_database import update_database
-                    database_path = self.cli_app_dir / "keywords.json"
+                    database_path = getattr(self, 'keyword_database_path', self.cli_app_dir / "keywords.json")
                     update_database(database_path, consumed=consumed)
                     self.events.put(("cli_topic_consumed", article["topic"], consumed))
                     self._naver_log(f"발행 확인 · '{article['topic']}' 키워드를 후보 목록에서 제외했습니다.")
-                    if result.get("content_verified", True) is True:
+                    if result.get("content_verified") is True:
                         self._cleanup_published_artifacts(article)
                     else:
                         self._naver_log("게시 URL은 확인했습니다. 게시된 본문·사진을 확인할 자료를 보존하고 재발행하지 않습니다.")
@@ -1025,21 +1017,13 @@ class BlogWorkflowControls(UnattendedControls):
         return result
 
     def _cleanup_published_artifacts(self, article):
-        """Delete only per-run artifacts below app-owned roots after a confirmed receipt was recorded."""
-        root = self.cli_app_dir.resolve()
-        allowed = [(root / "blog-runs").resolve(), (root / "google-reference-candidates").resolve()]
-        for raw in [article.get("run_dir", ""), *article.get("auxiliary_dirs", [])]:
-            if not raw:
-                continue
-            path = Path(raw).resolve()
-            if path == root or not any(path != parent and parent in path.parents for parent in allowed):
-                self._naver_log(f"산출물 정리 경로 차단: {path}")
-                continue
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path)
-            except OSError as exc:
-                self._naver_log(f"발행 산출물 정리 실패 · {path}: {exc}")
+        """Keep cleanup failures independent of the already confirmed publication."""
+        try:
+            cleanup = self._artifact_cleanup_manager()
+            cleanup.enqueue_publication(article)
+            cleanup.retry()
+        except (CleanupError, TopicHistoryError, OSError, ValueError, TypeError) as exc:
+            self._naver_log(f"발행 산출물 정리 보류 · 게시글은 발행됐으며 자료를 보존합니다: {exc}")
 
     def publish_cli_article(self):
         if not self.cli_article:
@@ -1090,6 +1074,7 @@ class BlogWorkflowControls(UnattendedControls):
 
     def _cli_automation_cycle(self, config, budget=None):
         self._ensure_google_browser_idle()
+        self._retry_artifact_cleanup()
         pending_path = self.cli_app_dir / "pending-blog-topic.json"
         pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
         if isinstance(pending.get("config"), dict):
@@ -1189,13 +1174,19 @@ class BlogWorkflowControls(UnattendedControls):
             fallback = ranked[0]
             choice = {**fallback, "source_topic": fallback["topic"], "intent": "연관 검색어 기반 최고 점수 후보",
                       "selection_run_dir": ""}
-            self._naver_log(f"CLI 선정 거절 2회 · 스포츠·사망이 아닌 최고 점수 후보 '{fallback['topic']}'로 진행합니다.")
+            self._naver_log(f"CLI 선정에서 확정 후보를 받지 못해 스포츠·사망이 아닌 최고 점수 후보 '{fallback['topic']}'로 진행합니다.")
         self._ensure_topic_allowed(choice["topic"], choice["keywords"], config)
         pending = {"choice": choice, "groups": groups, "related": related_by_topic, "config": copy.deepcopy(config), "phase": "preparing"}
         self._save_pending_topic(pending)
         return self._complete_selected_topic(config, groups, related_by_topic, choice, pending, budget=budget)
 
     def _save_pending_topic(self, pending):
+        reserve = getattr(getattr(self, 'topic_history', None), 'reserve', None)
+        choice = pending.get('choice')
+        if (callable(reserve) and isinstance(choice, dict) and pending.get('phase') == 'preparing'
+                and not pending.get('confirmed_receipt') and not pending.get('completion_result')):
+            reserve(choice['topic'], [choice.get('source_topic', choice['topic']), *choice.get('keywords', [])],
+                    run_dir=pending.get('resume_run_dir') or pending.get('run_dir', ''))
         path = self.cli_app_dir / "pending-blog-topic.json"
         atomic_json_write(path, pending)
 
@@ -1345,6 +1336,9 @@ class BlogWorkflowControls(UnattendedControls):
         history = self.cli_app_dir / "automation-history.json"
         atomic_json_write(history, self.auto_history)
         (self.cli_app_dir / "pending-blog-topic.json").unlink(missing_ok=True)
+        release = getattr(getattr(self, 'topic_history', None), 'release', None)
+        if callable(release):
+            release()
         self._naver_log(f"'{topic}' 회차 완료 · {config.get('completion_label', '자동 발행')}")
 
     def _write_cycle_attempts(self, attempts):
