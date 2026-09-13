@@ -69,6 +69,19 @@ class RuntimeSettingsTests(unittest.TestCase):
                 self.assertEqual(result["image_retry_limit"], 2)
                 self.assertEqual(result["editorial_mode"], "natural")
 
+    def test_marked_title_policy_is_upgraded_in_saved_prompt(self):
+        old = ("직접 작성한 앞 지침\n\n[제목 통합 작성 규칙 · 2026-09-13]\n"
+               "40~65자를 권장하고 짧아도 허용합니다.\n\n"
+               "[이미지 문구 최신 규칙 · 2026-09-13]\n이미지 지침")
+        result = normalize_preferences({"prompts": [{"id": "saved", "name": "저장값", "text": old}],
+                                        "selected_prompt_id": "saved"}, "기본")
+        text = result["prompts"][0]["text"]
+        self.assertIn("[제목 통합 작성 규칙 · 2026-09-13 v2]", text)
+        self.assertIn("45~68자", text)
+        self.assertNotIn("40~65자를 권장", text)
+        self.assertIn("직접 작성한 앞 지침", text)
+        self.assertIn("[이미지 문구 최신 규칙 · 2026-09-13]", text)
+
     def test_next_cycle_uses_new_settings_and_recalculates_changed_wait(self):
         for first_hours, changed_hours in ((6, 1), (1, 6)):
             with self.subTest(first_hours=first_hours, changed_hours=changed_hours):

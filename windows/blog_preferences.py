@@ -31,6 +31,23 @@ DEATH_BLOCKED_TERMS = [
 ]
 DEFAULT_BLOCKED_TERMS = SPORTS_BLOCKED_TERMS + DEATH_BLOCKED_TERMS
 
+_TITLE_POLICY_BLOCK_V2 = """[제목 통합 작성 규칙 · 2026-09-13 v2]
+첫 제목은 첫줄 후킹과 마지막 SEO 제목의 핵심 정보를 실제로 한 제목에 합쳐 작성합니다. 두 제목 중 하나만 고르거나 짧은 검색어 꼬리만 붙이지 않습니다. 독자가 궁금해하는 점과 본문에서 답하는 서로 다른 정보 두 가지 이상을 담고 공백 포함 45~68자로 쓰되 70자를 넘지 않습니다. 입력된 실제 연관 검색어 중 중요한 2개를 자연스럽게 포함합니다.
+같은 연도·주제어·설명은 한 번만 남깁니다. 겹치는 주변 표현은 실제 연관어 안의 자연스러운 유사 표현으로 연결하되 의미가 달라지는 억지 동의어와 본문에 없는 사실은 만들지 않습니다. 물음표는 유지하고 쉼표·콜론·세미콜론은 쓰지 않습니다. 마지막 SEO 제목은 같은 검색 의도를 다른 정리·판단 관점으로 표현하고 반드시 뜻과 의미로 끝냅니다."""
+
+
+def _migrate_title_policy_prompt(text: str) -> str:
+    """Upgrade only the app-inserted, explicitly marked title policy block."""
+    if not isinstance(text, str) or "[제목 통합 작성 규칙 · 2026-09-13]" not in text:
+        return text
+    return re.sub(
+        r"\[제목 통합 작성 규칙 · 2026-09-13\]\s*.*?(?=\n+\[이미지 문구 최신 규칙 · 2026-09-13\])",
+        _TITLE_POLICY_BLOCK_V2 + "\n",
+        text,
+        count=1,
+        flags=re.S,
+    )
+
 
 def atomic_json_write(path: str | Path, value) -> None:
     """Commit a complete JSON file; concurrent writers never share a temp name."""
@@ -193,7 +210,7 @@ def normalize_preferences(value: dict | None, default_prompt: str, legacy_prompt
             continue
         identifier = str(preset.get("id", "")).strip()
         name = str(preset.get("name", "")).strip()
-        text = str(preset.get("text", "")).strip()
+        text = _migrate_title_policy_prompt(str(preset.get("text", "")).strip())
         if identifier and name and text and identifier not in ids and name not in names:
             presets.append({"id": identifier, "name": name, "text": text})
             ids.add(identifier)

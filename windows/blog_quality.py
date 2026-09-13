@@ -142,10 +142,10 @@ def apply_patches(article, response, issues):
     title_codes = {'title_keyword', 'title_synthesis'}
     if 'title' in response and any(i['code'] in title_codes for i in issues):
         title = response['title']
-        if (not isinstance(title, str) or not 8 <= len(title.strip()) <= 70
+        if (not isinstance(title, str) or not 45 <= len(title.strip()) <= 70
                 or '\n' in title or '\r' in title or '?' not in title
                 or any(mark in title for mark in (',', '#', '*', '<', '>'))):
-            raise ValueError('제목 부분 수정은 물음표를 포함한 한 줄의 8~70자 제목이어야 합니다.')
+            raise ValueError('제목 부분 수정은 첫 제목과 마지막 SEO 제목을 합친 물음표 포함 한 줄의 45~70자 제목이어야 합니다.')
         tail = next((line.strip() for line in reversed(article['paragraphs'][-1].splitlines()) if line.strip()), '')
         known_numbers = set(re.findall(r'\d+(?:[.,]\d+)*', article.get('title', '') + ' ' + tail))
         if set(re.findall(r'\d+(?:[.,]\d+)*', title)) - known_numbers:

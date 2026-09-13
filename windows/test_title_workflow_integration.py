@@ -11,7 +11,7 @@ from test_blog_workflow import valid_article
 
 
 KEYWORDS = ['공휴일 2026', '대체공휴일']
-NEW_TITLE = '2026년 언제 쉴까? 대체공휴일 적용 기준과 쉬는 날 뜻과 의미'
+NEW_TITLE = '2026년 언제 쉴까? 공휴일 일정과 대체공휴일 적용 기준 쉬는 날 확인법 뜻과 의미'
 
 
 def article_fixture():
@@ -79,7 +79,7 @@ class TitleWorkflowTests(unittest.TestCase):
 
     def test_writer_prompt_has_long_informative_title_and_no_short_title_conflict(self):
         prompt = BlogWorkflow._article_prompt('공휴일', KEYWORDS, '기존 사용자 지침')
-        self.assertIn('40~65', prompt)
+        self.assertIn('45~68', prompt)
         self.assertIn('마지막 SEO 제목', prompt)
         self.assertIn('연관 검색어', prompt)
         self.assertNotIn('제목과 첫 후킹 문구는 짧고', prompt)

@@ -11,17 +11,19 @@ import re
 import unicodedata
 
 
-TITLE_POLICY_VERSION = 'intent-synthesis-v1'
+TITLE_POLICY_VERSION = 'intent-synthesis-v2'
 
 TITLE_GUIDANCE = (
-    '첫 제목은 첫줄의 궁금증을 여는 후킹과 마지막 SEO 제목의 핵심 정보를 한데 묶어 작성한다. '
+    '첫 제목은 첫줄의 궁금증을 여는 후킹과 마지막 SEO 제목의 핵심 정보를 실제로 한 제목에 합쳐 작성한다. '
+    '두 제목 중 하나만 고르거나 첫 제목 뒤에 짧은 검색어 꼬리만 붙이지 않는다. '
     '독자가 무엇을 알고 싶어 하는지와 이 글에서 실제로 답하는 대상·조건·차이·확인 방법 중 '
-    '중요한 내용을 함께 드러낸다. 40~65자를 권장하고 기존 상한 70자를 넘기지 않는다. '
-    '정보가 충분하면 40자 미만도 허용하며 글자 수를 채우려고 상투어나 근거 없는 내용을 덧붙이지 않는다. '
-    '입력에 실제 존재하는 연관 검색어 중 중요한 1~2개를 자연스럽게 포함한다. '
+    '서로 다른 핵심 정보 두 가지 이상을 함께 드러낸다. 공백 포함 45~68자로 쓰고 상한 70자를 넘기지 않는다. '
+    '글자 수를 채우려고 상투어나 근거 없는 내용을 덧붙이지 않는다. '
+    '입력에 실제 존재하는 연관 검색어 중 중요한 2개를 자연스럽게 포함한다. '
     '물음표 뒤에 짧은 키워드만 늘어놓지 말고 앞의 궁금증에 연결되는 구체적인 설명을 붙이거나 '
     '그 정보를 물음표 앞 문장에 함께 담는다. 쉼표·콜론·세미콜론은 사용하지 않는다. '
-    '한 제목 안에서 같은 연도·주제어·설명을 앞뒤로 반복하지 않는다. '
+    '한 제목 안에서 같은 연도·주제어·설명을 앞뒤로 반복하지 않는다. 같은 말이 겹치면 한 번만 남기고 '
+    '실제 연관어 안의 자연스러운 유사 표현으로 연결하되 의미가 달라지는 억지 동의어는 만들지 않는다. '
     '숫자·날짜·금액은 원고에서 확인된 정보만 사용하고 제목을 강하게 만들려고 새 사실을 만들지 않는다. '
     '마지막 SEO 제목도 동일한 핵심 주제를 유지하되 본문을 읽은 뒤 이해할 정리·판단 관점으로 '
     '첫 제목과 내용 구성 및 어조를 구별하고 반드시 뜻과 의미로 끝낸다. '
@@ -110,12 +112,21 @@ def title_quality_issues(article, keywords):
     def add(detail):
         issues.append({'code': 'title_synthesis', 'index': -1, 'text': article['title'], 'detail': detail})
 
+    paragraphs = article.get('paragraphs')
+    footer = ''
+    if isinstance(paragraphs, list) and paragraphs and isinstance(paragraphs[-1], str):
+        lines = [line.strip() for line in paragraphs[-1].splitlines() if line.strip()]
+        footer = lines[-1] if lines and lines[-1].endswith('뜻과 의미') else ''
+
     front, separator, tail = title.partition('?')
     tail = tail.strip()
-    if len(title) < 30 and separator and _short_nominal_tail(tail):
+    if footer and len(title) < 45:
+        add('첫 제목이 마지막 SEO 제목의 핵심 정보를 충분히 합치지 못했습니다. 첫줄의 궁금증과 마지막 제목의 '
+            '서로 다른 정보 두 가지 이상을 한 문장으로 엮어 공백 포함 45~68자로 작성하세요. 같은 주제어는 '
+            '한 번만 남기고 실제 연관어의 자연스러운 유사 표현을 쓰며 새로운 사실은 만들지 마세요.')
+    elif len(title) < 30 and separator and _short_nominal_tail(tail):
         add('물음표 뒤가 짧은 명사 나열이라 글에서 답할 내용이 충분히 드러나지 않을 수 있습니다. '
-            '마지막 SEO 제목과 본문의 실제 핵심 정보를 합쳐 대상·조건·차이·확인 방법을 구체화하세요. '
-            '40~65자는 권장이며 짧다는 이유만으로 분량을 늘리거나 발행을 막지 마세요.')
+            '마지막 SEO 제목과 본문의 실제 핵심 정보를 합쳐 대상·조건·차이·확인 방법을 구체화하세요.')
 
     repeated_years = [year for year, count in Counter(_YEARS.findall(title)).items() if count >= 2]
     if repeated_years:
@@ -137,10 +148,7 @@ def title_quality_issues(article, keywords):
         add('실제 연관 검색어가 세 개 이상 구분 기호로 나열되어 있습니다. '
             '주요 연관어 1~2개를 자연스러운 제목으로 엮고 나머지는 본문에서 설명하세요.')
 
-    paragraphs = article.get('paragraphs')
     if isinstance(paragraphs, list) and paragraphs and isinstance(paragraphs[-1], str):
-        lines = [line.strip() for line in paragraphs[-1].splitlines() if line.strip()]
-        footer = lines[-1] if lines and lines[-1].endswith('뜻과 의미') else ''
         footer_terms = set(_terms(footer.removesuffix('뜻과 의미')))
         title_terms = set(_terms(title))
         common = any(left in right or right in left for left in title_terms for right in footer_terms)

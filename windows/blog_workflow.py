@@ -904,7 +904,7 @@ class BlogWorkflow:
     @staticmethod
     def _article_prompt(topic, keywords, base_prompt, previous=None, stage=1, editorial_mode="strict"):
         schema = {
-            "title": "첫 훅과 마지막 SEO 제목의 핵심 설명을 합쳐 중복을 줄인 구체적인 첫 제목. 연관 검색어 1~2개와 읽을 이유를 담아 40~65자 권장, 물음표 포함, 최대 70자",
+            "title": "첫 훅과 마지막 SEO 제목을 실제로 합쳐 중복을 줄인 구체적인 첫 제목. 서로 다른 연관 검색어 2개와 읽을 이유를 담아 45~68자, 물음표 포함, 최대 70자",
             "title_intent": {"question": "독자가 해결하려는 구체적인 질문", "related_keywords": ["입력에 실제 존재하는 연관어"]},
             "bridge_sentences": ["해당 구역 본문에 실제 포함된 도입·연결·마무리 문장"] * 8,
             "subheading_keywords": ["해당 ❝ 소제목에 실제 포함된 서로 다른 입력 연관 검색어"] * 8,
@@ -1379,7 +1379,7 @@ class BlogWorkflow:
             for issue in issues:
                 self.log(f"원고 검사 [{issue['code']}] {issue['index'] + 1}구역 · {issue['detail']}")
             title_repair = any(issue['code'] in {'title_keyword', 'title_synthesis'} for issue in issues)
-            title_fields = ({'title': '첫 훅과 마지막 SEO 제목의 핵심을 합쳐 반복을 줄인 40~65자 권장 첫 제목. 물음표와 실제 연관어 포함, 최대 70자'}
+            title_fields = ({'title': '첫 훅과 마지막 SEO 제목을 실제로 합쳐 중복어를 줄인 45~68자 첫 제목. 물음표와 서로 다른 실제 연관어 2개 포함, 최대 70자'}
                             if title_repair else {})
             repair_schema = {**title_fields, 'paragraph_patches': [{'index': 0, 'old': '정확한 기존 문장', 'new': '수정 문장'}],
                 'bridge_sentences': ['실제 본문의 연결 문장 8개'],
