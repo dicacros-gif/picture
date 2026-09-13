@@ -83,11 +83,36 @@ class PublishPanelOpenTests(unittest.TestCase):
 
     def test_fallback_is_not_repeated_when_settings_still_do_not_open(self):
         self.failed_native_opener()
-        with self.assertRaisesRegex(RuntimeError, '1회 보완한 뒤에도'):
+        with self.assertRaisesRegex(RuntimeError, '1회 보완하고 추가 대기한 뒤에도'):
             self.app.publish_naver_article('testblog', self.article)
         self.opener.click.assert_called_once()
         self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
         self.assert_not_submitted()
+
+    def test_panel_that_opens_during_final_grace_period_is_published_without_another_toggle(self):
+        self.failed_native_opener()
+
+        class LatePanelWait:
+            def __init__(inner, driver, timeout, *_args, **_kwargs):
+                inner.driver = driver
+                inner.timeout = timeout
+
+            def until(inner, callback):
+                if inner.timeout == 60:
+                    self.publish_panel_open = True
+                result = callback(inner.driver)
+                if not result:
+                    from selenium.common.exceptions import TimeoutException
+                    raise TimeoutException('simulated wait')
+                return result
+
+        with unittest.mock.patch('naver_automation.WebDriverWait', LatePanelWait):
+            result = self.app.publish_naver_article('testblog', self.article)
+
+        self.assertTrue(result['published'])
+        self.opener.click.assert_called_once()
+        self.driver.execute_script.assert_called_once_with('arguments[0].click();', self.opener)
+        self.final.click.assert_called_once()
 
     def test_replaced_or_missing_header_is_not_clicked_with_javascript(self):
         for replacement in (None, MagicMock()):

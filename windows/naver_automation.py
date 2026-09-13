@@ -4359,10 +4359,22 @@ class NaverAutomation:
                 try:
                     WebDriverWait(driver, 15).until(lambda d: self._find_publish_control(d, final=True))
                 except TimeoutException as exc:
-                    raise RuntimeError(
-                        "같은 발행 설정 열기 버튼을 1회 보완한 뒤에도 최종 발행 버튼을 고유하게 확인하지 못했습니다. "
-                        "최종 버튼은 누르지 않았으며 입력된 글과 사진을 화면에 유지합니다."
-                    ) from exc
+                    # A live Whale run showed the verified panel appearing
+                    # shortly after both 15-second checks had expired. Do not
+                    # click the opener again because it would toggle that late
+                    # panel closed. Give the already requested panel one final,
+                    # read-only grace period instead.
+                    self.log("발행 설정 창 응답이 늦어 추가 클릭 없이 최대 60초 더 기다립니다.")
+                    try:
+                        WebDriverWait(driver, 60).until(
+                            lambda d: self._find_publish_control(d, final=True)
+                        )
+                    except TimeoutException as late_exc:
+                        raise RuntimeError(
+                            "같은 발행 설정 열기 버튼을 1회 보완하고 추가 대기한 뒤에도 "
+                            "최종 발행 버튼을 고유하게 확인하지 못했습니다. 최종 버튼은 누르지 않았으며 "
+                            "입력된 글과 사진을 화면에 유지합니다."
+                        ) from late_exc
         # Recheck after the panel opens; user edits or upload failures must not slip through.
         if not self._article_ready_to_publish(driver, title, paragraphs, image_ids, positions,
                                               bold_terms=bold_terms, bold_style=bold_style, visual_style=visual_style):
