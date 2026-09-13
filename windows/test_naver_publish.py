@@ -202,7 +202,7 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(self.app.publish_naver_article("testblog", self.article)["reused_receipt"])
         self.final.click.assert_called_once()
 
-    def test_sixteen_images_upload_in_one_batch_and_preserve_order_in_each_section(self):
+    def test_sixteen_images_use_one_document_placement_pass_and_preserve_order(self):
         self._append_google_images(10)
         title, paragraphs, images = self.app._validate_publish_article(self.article)
         state = {"data": document(paragraphs), "uploaded": 0}
@@ -230,6 +230,23 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(NaverAutomation._verify_article_document(state["data"], paragraphs,
                          [ids[1], ids[0], *ids[2:]], positions))
         self.assertEqual(positions[:3], [0, 0, 0])
+
+    def test_upload_sends_one_path_per_input_even_when_input_claims_multiple(self):
+        paths = [item["path"] for item in self.article["images"][:3]]
+        uploads = [MagicMock() for _path in paths]
+        state = {"count": 0}
+        for upload in uploads:
+            upload.get_attribute.return_value = "multiple"
+            upload.send_keys.side_effect = lambda _path: state.update(count=state["count"] + 1)
+        self.app._image_component_count = MagicMock(side_effect=lambda _driver: state["count"])
+        self.app._find_image_inputs = MagicMock(side_effect=[[upload] for upload in uploads])
+
+        NaverAutomation._upload_blog_images(self.app, self.driver, paths)
+
+        self.assertEqual(state["count"], 3)
+        for upload, path in zip(uploads, paths):
+            upload.send_keys.assert_called_once_with(str(Path(path).resolve()))
+            upload.get_attribute.assert_not_called()
 
     def test_seventeenth_image_and_eleventh_google_reference_are_rejected(self):
         self._append_google_images(11)

@@ -2831,26 +2831,27 @@ class NaverAutomation:
                     "네이버 사진 첨부 도구를 찾지 못했습니다. 글은 임시저장하지 않고 화면에 둡니다."
                 ) from exc
 
-        upload = inputs[-1]
-        multiple = upload.get_attribute("multiple") is not None
-        if multiple:
-            upload.send_keys("\n".join(existing))
-        else:
-            for index, path in enumerate(existing):
-                if index:
-                    inputs = self._find_image_inputs(driver)
-                    if not inputs:
-                        self._open_photo_tool(driver)
-                        inputs = WebDriverWait(driver, 8).until(
-                            lambda d: self._find_image_inputs(d, allow_empty=True)
-                        )
-                    upload = inputs[-1]
-                upload.send_keys(path)
-                WebDriverWait(driver, 45).until(
-                    lambda d, expected=before_images + index + 1: (
-                        self._image_component_count(d) >= expected
+        # Naver's current SmartEditor file input advertises ``multiple`` but
+        # its React upload handler ignored a newline-joined Selenium payload in
+        # a live 6-image run (0 components after 90 seconds). Send each file to
+        # a freshly queried input and wait only for that component. The caller
+        # still reads and rearranges the complete document once after all
+        # uploads, which removes the expensive per-image document rebuild.
+        for index, path in enumerate(existing):
+            if index:
+                inputs = self._find_image_inputs(driver)
+                if not inputs:
+                    self._open_photo_tool(driver)
+                    inputs = WebDriverWait(driver, 8).until(
+                        lambda d: self._find_image_inputs(d, allow_empty=True)
                     )
+            upload = inputs[-1]
+            upload.send_keys(path)
+            WebDriverWait(driver, 45).until(
+                lambda d, expected=before_images + index + 1: (
+                    self._image_component_count(d) >= expected
                 )
+            )
 
         expected_count = before_images + len(existing)
         try:
