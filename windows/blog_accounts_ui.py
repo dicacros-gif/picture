@@ -66,8 +66,6 @@ class WriterAccountsControls:
             entry.grid(row=index, column=4, padx=5)
             identifier.trace_add('write', lambda *_: self.schedule_save())
             ttk.Button(self.frame, text='이 계정 로그인', command=lambda i=index: self.open_login(i)).grid(row=index, column=5, padx=5)
-        ttk.Label(self.frame, text='검색어는 공통 수집 · 추가 계정은 글쓰기만 · 변경한 계정은 다음 시작에 적용',
-                  style='Sub.TLabel').grid(row=2, column=0, columnspan=6, sticky='w')
         self._save_job = None
         self.save(persist=False)
 
@@ -85,7 +83,10 @@ class WriterAccountsControls:
         self._save_job = None
         self.app.settings['writer_accounts'] = self.snapshot()
         if hasattr(self.app, 'progress_panel'):
-            self.app.progress_panel.set_accounts(self.app.settings['writer_accounts'])
+            shown = copy.deepcopy(self.app.settings['writer_accounts'])
+            for row in shown:
+                row['enabled'] |= self.app.settings.get('comment_accounts', {}).get(row['id'], False)
+            self.app.progress_panel.set_accounts(shown)
         if persist and hasattr(self.app, 'cli_preferences'):
             self.app._persist_cli_preferences()
 
@@ -122,3 +123,69 @@ class WriterAccountsControls:
             finally:
                 self.app.account_login_active = False
         threading.Thread(target=login, daemon=True, name=f"blog-login-{row['id']}").start()
+
+
+class CommentAccountsControls:
+    """Comment selection is separate; identity variables are shared with tab 3."""
+    def __init__(self, app, parent):
+        self.app, self.rows = app, []
+        self.frame = ttk.Frame(parent)
+        self.frame.grid(row=0, column=0, columnspan=5, sticky='ew', pady=(0, 12))
+        saved = app.settings.get('comment_accounts', {})
+        legacy = app.settings.get('comment_browser', '웨일')
+        for index, (account_id, _enabled, browser, identifier) in enumerate(app.writer_accounts_ui.rows):
+            enabled = BooleanVar(value=saved.get(account_id, (index == 1) == (legacy == '에지')))
+            self.rows.append((account_id, enabled, browser, identifier))
+            ttk.Label(self.frame, text=f'계정 {index + 1}').grid(row=index, column=0, padx=4)
+            ttk.Checkbutton(self.frame, text='사용', variable=enabled, command=self.save).grid(row=index, column=1)
+            box = ttk.Combobox(self.frame, textvariable=browser, state='readonly', width=7,
+                              values=list(BROWSER_LABELS.values()) if index == 0 else ['에지', '크롬'])
+            box.grid(row=index, column=2, padx=5)
+            box.bind('<<ComboboxSelected>>', lambda _e: self.app.writer_accounts_ui.save())
+            ttk.Label(self.frame, text='블로그 ID').grid(row=index, column=3)
+            ttk.Entry(self.frame, textvariable=identifier, width=22).grid(row=index, column=4, padx=5)
+            ttk.Button(self.frame, text='이 계정 로그인',
+                       command=lambda i=index: app.writer_accounts_ui.open_login(i)).grid(row=index, column=5, padx=5)
+
+    def save(self):
+        self.app.settings['comment_accounts'] = {key: enabled.get() for key, enabled, _, _ in self.rows}
+        self.app.writer_accounts_ui.save()
+        if hasattr(self.app, 'progress_panel'):
+            accounts = self.app.writer_accounts_ui.snapshot()
+            for row in accounts:
+                row['enabled'] |= self.app.settings['comment_accounts'].get(row['id'], False)
+            self.app.progress_panel.set_accounts(accounts)
+
+    def snapshot(self):
+        reverse = {label: key for key, label in BROWSER_LABELS.items()}
+        return [{'id': key, 'enabled': enabled.get(), 'browser': reverse[browser.get()],
+                 'blog_id': identifier.get().strip()} for key, enabled, browser, identifier in self.rows]
+
+
+class CommentTaskGroup:
+    """Stop all selected profiles while a single UI task owns the browser work."""
+    def __init__(self, targets):
+        self.targets, self.stop_event = targets, threading.Event()
+
+    def reset_stop(self):
+        self.stop_event.clear()
+        for bot, _ in self.targets:
+            bot.reset_stop()
+
+    def stop(self):
+        self.stop_event.set()
+        for bot, _ in self.targets:
+            bot.stop()
+
+    def run(self, method, args, log):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def invoke(bot, blog_id):
+            if not self.stop_event.is_set():
+                return getattr(bot, method)(blog_id, *args)
+        with ThreadPoolExecutor(max_workers=len(self.targets), thread_name_prefix='blog-comments') as pool:
+            futures = {pool.submit(invoke, bot, blog_id): blog_id for bot, blog_id in self.targets}
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    log(f"{futures[future]} 댓글 작업 실패: {exc}")

@@ -161,80 +161,62 @@ class WorkflowRoleRecoveryTests(unittest.TestCase):
         return [{"provider": "chatgpt", "model": "writer", "role": "작성"},
                 {"provider": "antigravity", "model": "facts", "role": "팩트·최신 정보 보강"}]
 
-    def test_fact_recovery_cannot_rewrite_approved_copy(self):
+    def test_fact_recovery_ignores_full_rewrite_and_keeps_approved_copy(self):
         original = self.bridge.run_text
+        baseline = copy.deepcopy(self.bridge.article)
         def run(provider, prompt, **kwargs):
-            if provider == "antigravity" and not kwargs.get("images"):
-                raise BlogCliError("permission_required", "command denied")
-            response = original(provider, prompt, **kwargs)
-            if "동일 주제 복구 단계" in prompt:
-                result = json.loads(response)
-                result["paragraphs"][0] = result["paragraphs"][0].replace("눈에 보이는 숫자 하나로", "표시된 숫자만으로")
-                return json.dumps(result)
-            return response
+            if prompt.startswith('FACT_'):
+                if provider == 'antigravity':
+                    raise BlogCliError('permission_required', 'command denied')
+                return json.dumps({'checks': [], 'additions': [], 'title': '변경 금지',
+                                   'paragraphs': ['다시 쓴 문단'] * 8})
+            return original(provider, prompt, **kwargs)
         self.bridge.run_text = run
-        failed = self.assert_blocked("기존 제목·문단", steps=["chatgpt", "antigravity"], stage_configs=self.routes())
-        self.assertFalse(self.bridge.generations)
-        self.assertFalse(Path(failed["run_dir"], "stage-2-antigravity.checkpoint.json").exists())
-        self.assertTrue(Path(failed["run_dir"], "stage-1-chatgpt.checkpoint.json").is_file())
+        result = self.prepare(steps=['chatgpt', 'antigravity'], stage_configs=self.routes())
+        self.assertTrue(result['ready_to_publish'])
+        self.assertEqual(result['title'], baseline['title'])
+        self.assertEqual(result['paragraphs'], baseline['paragraphs'])
 
     def test_fact_recovery_accepts_verified_addition_and_keeps_footer(self):
+        from datetime import date
         original = self.bridge.run_text
-        _, corrected = RoleInvariantTests().fact_added_before_footer()
+        baseline = copy.deepcopy(self.bridge.article)
+        text = '지원 여부는 해당 제품의 공식 안내에서 직접 확인할 수 있습니다.'
+        source = baseline['sources'][0]
         def run(provider, prompt, **kwargs):
-            if provider == "antigravity" and not kwargs.get("images"):
-                raise BlogCliError("permission_required", "command denied")
-            if "동일 주제 복구 단계" in prompt:
-                self.assertIn("fact_additions", prompt)
-                return json.dumps(corrected)
+            if prompt.startswith('FACT_'):
+                if provider == 'antigravity':
+                    raise BlogCliError('permission_required', 'command denied')
+                if prompt.startswith('FACT_SENTENCE'):
+                    return json.dumps({'checks': []})
+                return json.dumps({'additions': [{'index': 7, 'text': text,
+                    'changed_on': date.today().isoformat(), 'source_urls': [source['url']]}],
+                    'sources': [source]})
             return original(provider, prompt, **kwargs)
         self.bridge.run_text = run
-        result = self.prepare(steps=["chatgpt", "antigravity"], stage_configs=self.routes())
-        self.assertTrue(result["ready_to_publish"])
-        self.assertEqual(result["paragraphs"][7], corrected["paragraphs"][7])
+        result = self.prepare(steps=['chatgpt', 'antigravity'], stage_configs=self.routes())
+        self.assertTrue(result['ready_to_publish'])
+        self.assertIn(text, result['paragraphs'][7])
+        self.assertLess(result['paragraphs'][7].index(text), result['paragraphs'][7].index('#'))
+        self.assertEqual(result['paragraphs'][:7], baseline['paragraphs'][:7])
 
-    def test_rejected_fact_cache_and_format_retry_use_approved_upstream_as_ledger_base(self):
+    def test_fact_failures_continue_original_and_cached_optional_result_is_reused(self):
         original = self.bridge.run_text
-        previous, corrected = RoleInvariantTests().fact_added_before_footer()
-        rejected = copy.deepcopy(corrected)
-        secondary = copy.deepcopy(rejected["sources"][0])
-        secondary.update(url="https://secondary.example/reposted-guidance", is_primary=False)
-        rejected["sources"].append(secondary)
-        resumed = False
-        prompts = []
-
+        fact_calls = []
         def run(provider, prompt, **kwargs):
-            if kwargs.get("images") or prompt.startswith("FINAL_ARTICLE_REVIEW"):
-                return original(provider, prompt, **kwargs)
-            if provider == "antigravity" or "동일 주제 복구 단계" in prompt:
-                if not resumed:
-                    return json.dumps(rejected)
-                prompts.append(prompt)
-                response = copy.deepcopy(corrected)
-                if len(prompts) == 1:
-                    response["image_prompts"] = response["image_prompts"][:7]
-                return json.dumps(response)
+            if prompt.startswith('FACT_'):
+                fact_calls.append((provider, prompt))
+                return json.dumps({'title': '무시할 응답', 'paragraphs': ['변경'] * 8})
             return original(provider, prompt, **kwargs)
-
         self.bridge.run_text = run
-        failed = self.assert_blocked("sources[1]", steps=["chatgpt", "antigravity"], stage_configs=self.routes())
-        self.assertFalse(self.bridge.generations)
-        resumed = True
-        result = self.workflow.resume(failed["run_dir"])
-        self.assertTrue(result["ready_to_publish"])
-        self.assertEqual(len(prompts), 2)
-        self.assertIn("이전 응답의 구조 오류", prompts[1])
-        for prompt in prompts:
-            data = json.loads(prompt.split("BEGIN_UNTRUSTED_RESEARCH_DATA_JSON\n", 1)[1].split(
-                "\nEND_UNTRUSTED_RESEARCH_DATA_JSON", 1)[0])
-            self.assertEqual(data["previous_draft"], previous)
-            rejected_data = json.loads(prompt.split("BEGIN_UNTRUSTED_REJECTED_STAGE_JSON\n", 1)[1].split(
-                "\nEND_UNTRUSTED_REJECTED_STAGE_JSON", 1)[0])
-            self.assertIn("sources[1]", rejected_data["previous_error"])
-            self.assertEqual(rejected_data["fact_additions"], corrected["fact_additions"])
-            self.assertNotIn("paragraphs", rejected_data)
-        self.assertEqual(result["paragraphs"], corrected["paragraphs"])
-        self.assertEqual(result["paragraphs"][7].count(corrected["fact_additions"][0]["text"]), 1)
+        result = self.prepare(steps=['chatgpt', 'antigravity'], stage_configs=self.routes())
+        self.assertTrue(result['ready_to_publish'])
+        self.assertEqual(result['paragraphs'], self.bridge.article['paragraphs'])
+        self.assertEqual(len(fact_calls), 2)
+        self.assertEqual(len(self.latest_manifest()['fact_enrichment'][0]['failed']), 1)
+        with self.assertRaisesRegex(WorkflowError, '이미 준비 완료'):
+            self.workflow.resume(result['run_dir'])
+        self.assertEqual(len(fact_calls), 2)
 
     def test_rejected_style_cache_preserves_approved_numeric_baseline(self):
         original = self.bridge.run_text

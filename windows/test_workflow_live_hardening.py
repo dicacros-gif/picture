@@ -196,7 +196,7 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
                 self.assertFalse(_canonical_fact_spacing('팩트·최신 정보 보강', before, after))
                 self.assertEqual(after, untouched)
 
-    def test_fact_blank_line_repair_is_audited_and_raw_checkpoint_is_resumable(self):
+    def test_optional_fact_full_rewrite_is_ignored_and_checkpoint_is_resumable(self):
         _, response, _ = self.fact_response_with_extra_blank_line()
         original = self.bridge.run_text
         calls = []
@@ -213,10 +213,11 @@ class LiveWorkflowHardeningTests(unittest.TestCase):
             failed = self.assert_blocked('첫 사진', image_retry_limit=2, **options)
             with self.assertRaises(WorkflowError):
                 self.workflow.resume(failed['run_dir'])
-        self.assertEqual(sum(prompt.startswith('FINAL_ARTICLE_REVIEW') for prompt in calls), 1)
+        self.assertEqual(sum(prompt.startswith('FINAL_ARTICLE_REVIEW') for prompt in calls), 0)
         self.assertFalse(any('이전 응답의 구조 오류' in prompt for prompt in calls))
         self.assertEqual(len(self.bridge.generations), 10)
-        self.assertEqual(failed['fact_spacing_repairs'][0]['change'], 'extra_blank_lines_only')
+        self.assertNotIn('fact_spacing_repairs', failed)
+        self.assertEqual(failed['fact_enrichment'][0]['applied'], 0)
 
 
 if __name__ == '__main__':

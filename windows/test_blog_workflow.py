@@ -97,6 +97,10 @@ class FakeBridge:
             return json.dumps(result, ensure_ascii=False)
         if self.raw_response is not None:
             return self.raw_response
+        if prompt.startswith('FACT_SENTENCE_CHECK'):
+            return json.dumps({'checks': []})
+        if prompt.startswith('FACT_RECENT_ADDITIONS'):
+            return json.dumps({'additions': []})
         if prompt.startswith("FINAL_ARTICLE_REVIEW"):
             return json.dumps(valid_article()["review"])
         result = copy.deepcopy(self.article)
@@ -179,7 +183,7 @@ class BlogWorkflowTests(unittest.TestCase):
         self.assertTrue(article['ready_to_publish'])
         self.assertEqual(article['topic'], TOPIC)
         calls = [call for call in self.bridge.calls if not call['images']]
-        self.assertIn('동일 주제 복구 단계', calls[-1]['prompt'])
+        self.assertTrue(calls[-1]['prompt'].startswith('FACT_RECENT_ADDITIONS'))
 
     def latest_manifest(self):
         manifests = list((self.root / "runs").glob("*/manifest.json"))

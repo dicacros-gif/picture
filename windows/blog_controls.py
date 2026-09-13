@@ -22,8 +22,9 @@ from blog_preferences import (PROVIDER_LABELS, DEFAULT_BLOCKED_TERMS, DEFAULT_CA
 from blog_workflow import (BlogWorkflow, REVIEW_MODES, WorkflowError, WorkflowReviewRequired,
                            _json_hash, _related_to_topic, _text_review_schema_valid)
 from blog_runtime import UnattendedControls, account_problem, access_error_from_exception
-from blog_topic_history import TopicHistory, TopicHistoryError, _confirmed as confirmed_publication
+from blog_topic_history import TopicHistory, TopicHistoryError, topic_key, _confirmed as confirmed_publication
 from blog_artifact_cleanup import ArtifactCleanup, CleanupError
+from blog_ui_helpers import HoverHelp, model_choices
 
 
 def next_cycle_tick(previous_tick: float, now: float, interval: float) -> float:
@@ -458,10 +459,13 @@ class BlogWorkflowControls(UnattendedControls):
             role.grid(row=row, column=column + 2, padx=4)
             role.bind("<<ComboboxSelected>>", self._save_cli_selection)
             self.cli_role_boxes.append(role)
-            model = ttk.Entry(sequence, textvariable=self.cli_stage_models[index], width=16)
+            provider_key = next(key for key, label in PROVIDER_LABELS.items() if label == variable.get())
+            model = ttk.Combobox(sequence, textvariable=self.cli_stage_models[index], width=21,
+                                 values=model_choices(provider_key, self.cli_preferences), state='normal')
             model.grid(row=row, column=column + 3)
             model.bind("<KeyRelease>", self._schedule_prompt_save)
             model.bind("<FocusOut>", self._save_cli_selection)
+            model.bind("<<ComboboxSelected>>", self._save_cli_selection)
             self.cli_stage_model_boxes.append(model)
         ttk.Label(sequence, text="단계별 모델: 비우면 CLI 기본 모델 사용").grid(row=0, column=2, columnspan=6, sticky="w")
         count.bind("<<ComboboxSelected>>", self._save_cli_selection)
@@ -485,12 +489,18 @@ class BlogWorkflowControls(UnattendedControls):
         self.cli_blocked_terms.bind("<KeyRelease>", self._schedule_prompt_save)
         ttk.Button(blocked, text="차단어 저장", command=self._save_cli_selection).pack(side="left", padx=5)
         ttk.Button(blocked, text="기본값 복원", command=self._restore_blocked_terms).pack(side="left")
-        ttk.Label(blocked, text=" 연관어 중복").pack(side="left")
+        duplicate_keyword_label = ttk.Label(blocked, text=" 연관어 중복")
+        duplicate_keyword_label.pack(side="left")
         duplicate_keywords = ttk.Entry(blocked, textvariable=self.cli_duplicate_keywords, width=5)
         duplicate_keywords.pack(side="left")
-        ttk.Label(blocked, text=" 제목 유사도").pack(side="left")
+        duplicate_title_label = ttk.Label(blocked, text=" 제목 유사도")
+        duplicate_title_label.pack(side="left")
         duplicate_titles = ttk.Entry(blocked, textvariable=self.cli_duplicate_titles, width=5)
         duplicate_titles.pack(side="left")
+        for widget in (duplicate_keyword_label, duplicate_keywords):
+            HoverHelp(widget, '최근 30일 글과 연관 검색어가 겹치는 비율입니다.\n0.4는 40% 이상 겹치면 중복으로 판단합니다.\n값을 낮추면 더 엄격하게, 높이면 더 넓게 주제를 허용합니다. 입력 범위: 0.1~1.')
+        for widget in (duplicate_title_label, duplicate_titles):
+            HoverHelp(widget, '최근 30일 제목의 핵심 단어 집합을 비교합니다.\n0.5는 자카드 유사도 50% 이상이면 중복으로 판단합니다.\n낮을수록 비슷한 제목을 더 많이 차단합니다. 입력 범위: 0.1~1.')
         duplicate_keywords.bind("<FocusOut>", self._save_cli_selection)
         duplicate_titles.bind("<FocusOut>", self._save_cli_selection)
         canned = ttk.Frame(settings)
@@ -558,6 +568,8 @@ class BlogWorkflowControls(UnattendedControls):
         for index, box in enumerate(getattr(self, "cli_role_boxes", [])):
             box.configure(state="readonly" if index < count else "disabled")
         for index, box in enumerate(getattr(self, "cli_stage_model_boxes", [])):
+            provider = next(key for key, label in PROVIDER_LABELS.items() if label == self.cli_order[index].get())
+            box.configure(values=model_choices(provider, self.cli_preferences))
             box.configure(state="normal" if index < count else "disabled")
 
     def _prompt_modified(self, _event=None):
@@ -774,6 +786,7 @@ class BlogWorkflowControls(UnattendedControls):
         job = _GoogleSearchJob(self, topic, keywords, config, budget)
         resume_options = {"resume_run_dir": config["resume_run_dir"]} if config.get("resume_run_dir") else {}
         resume_options["quality_checks"] = True
+        resume_options['essential_review'] = config.get('essential_review', True)
         resume_options["quality_topic"] = config.get("quality_topic", topic)
         resume_options["image_retry_limit"] = config.get("image_retry_limit", 2)
         resume_options["editorial_mode"] = config.get("editorial_mode", "natural")
@@ -1097,6 +1110,12 @@ class BlogWorkflowControls(UnattendedControls):
         pending = json.loads(pending_path.read_text(encoding="utf-8")) if pending_path.exists() else {}
         if isinstance(pending.get("config"), dict):
             config = copy.deepcopy(pending["config"])
+        if pending.get('phase') == 'quality_draft':
+            choice = pending['choice']
+            if self._save_quality_hold_draft(config, pending, choice['topic'], choice['keywords'],
+                    pending['resume_run_dir'], pending.get('draft_attempts', [])):
+                return
+            raise WorkflowError('품질 보류 원고의 네이버 임시저장 완료를 확인하지 못했습니다.', pending['resume_run_dir'])
         if pending.get("publication_started") or pending.get("phase") in {"publishing", "submitted_uncertain"}:
             was_uncertain = pending.get("phase") == "submitted_uncertain"
             prepared = pending.get("prepared_article")
@@ -1155,6 +1174,8 @@ class BlogWorkflowControls(UnattendedControls):
         if budget is not None:
             budget.check(reserve_seconds=600)
         ranked, related_by_topic = self._rank_longtail_topics(groups, config=config)
+        held_keys = self._recent_quality_draft_keys()
+        ranked = [item for item in ranked if topic_key(item['topic']) not in held_keys]
         if budget is not None:
             budget.check(reserve_seconds=600)
         if config.get("quality_checks"):
@@ -1282,14 +1303,19 @@ class BlogWorkflowControls(UnattendedControls):
         article["source_topic"] = pending.get("choice", {}).get("source_topic", topic)
         draft_config = {**config, "publish": False, "save_draft": True,
                         "completion_label": "품질 미달 임시저장"}
+        pending.update(phase='quality_draft', resume_run_dir=article['run_dir'], draft_attempts=attempts)
+        self._save_pending_topic(pending)
         self._naver_log("품질 기준을 통과하지 못해 공개 발행하지 않고 승인된 이전 원고를 네이버 임시저장합니다.")
         # Once quality is rejected, finish the reversible draft save even when
         # the 50-minute generation budget is almost exhausted. Browser save has
         # its own bounded waits and must not be interrupted halfway through.
-        result = self._publish_cli_worker(
-            article, draft_config, allow_quality_draft=True)
+        result = pending.get('quality_draft_result')
+        if not isinstance(result, dict) or result.get('saved') is not True:
+            result = self._publish_cli_worker(article, draft_config, allow_quality_draft=True)
         if not result.get("saved"):
             return False
+        pending['quality_draft_result'] = result
+        self._save_pending_topic(pending)
         record = {"topic": topic, "keywords": list(keywords), "providers": config["steps"],
                   "source_topic": article.get("source_topic", topic), "title": article.get("title", ""),
                   "saved_at": datetime.now().isoformat(timespec="seconds"), "draft_only": True,
@@ -1304,6 +1330,23 @@ class BlogWorkflowControls(UnattendedControls):
             release()
         self._naver_log(f"'{topic}' 품질 보류 원고 임시저장 완료 · 다음 예약 회차는 새 주제를 선정합니다.")
         return True
+
+    def _recent_quality_draft_keys(self):
+        """Do not immediately reselect privately held topics as fresh articles."""
+        blocked = set()
+        now = datetime.now().astimezone()
+        for item in getattr(self, 'auto_history', []):
+            if not item.get('quality_hold') or not item.get('publication', {}).get('saved'):
+                continue
+            try:
+                stamp = datetime.fromisoformat(item['saved_at']).astimezone()
+                if not 0 <= (now - stamp).total_seconds() < 24 * 3600:
+                    continue
+            except (ValueError, KeyError, TypeError):
+                continue
+            blocked.update(topic_key(value) for value in
+                           [item.get('topic', ''), item.get('source_topic', ''), *item.get('keywords', [])])
+        return blocked
 
     def _complete_selected_topic(self, config, groups, related_by_topic, choice, pending, budget=None):
         attempts, article = [], None
@@ -1325,12 +1368,12 @@ class BlogWorkflowControls(UnattendedControls):
         if isinstance(pending.get("prepared_article"), dict):
             article = copy.deepcopy(pending["prepared_article"])
             self._naver_log(f"'{topic}' · 승인된 준비 원고와 이미지를 다시 사용합니다.")
-        for index in ([] if article is not None else range(1, 4)):
+        for index in ([] if article is not None else range(1, 2)):
             if self.full_auto_stop.is_set():
                 raise WorkflowError("사용자가 작업을 중지했습니다.")
             topic = choice["topic"]
             article = None
-            self._naver_log(f"확정 주제 '{topic}' · 준비 시도 {index}/3")
+            self._naver_log(f"확정 주제 '{topic}' · 준비 시도 {index}/1")
             try:
                 current = choice
                 topic, keywords = current["topic"], current["keywords"]

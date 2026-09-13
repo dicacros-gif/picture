@@ -105,7 +105,7 @@ class ReviewHoldControlsTests(unittest.TestCase):
                 self.app._prepare_cli_worker.side_effect = WorkflowError('원래 검증기에서 거절', self.run)
                 with self.assertRaises(WorkflowError):
                     self.app._cli_automation_cycle(self.config)
-                self.assertEqual(self.app._prepare_cli_worker.call_count, 3)
+                self.assertEqual(self.app._prepare_cli_worker.call_count, 1)
                 self.app._publish_cli_worker.assert_not_called()
                 pending = json.loads(self.path.read_text(encoding='utf-8'))
                 self.assertNotIn('review_hold', pending)

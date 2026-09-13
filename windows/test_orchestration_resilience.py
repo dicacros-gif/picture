@@ -77,6 +77,9 @@ class InterruptedPreparationTests(unittest.TestCase):
                 'search_intent_satisfied': True, 'natural_korean': True, 'issues': []}}]})
             app._prepare_cli_worker.side_effect = [WorkflowError('사실 확인 거절', run_dir),
                 {'topic': 'A', 'run_dir': str(run_dir)}]
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config)
+            app._publish_cli_worker.assert_not_called()
             app._cli_automation_cycle(config)
             self.assertIn('facts_verified', app._prepare_cli_worker.call_args.args[2]['revision_feedback'])
             self.assertEqual(app._prepare_cli_worker.call_count, 2)
@@ -103,6 +106,9 @@ class InterruptedPreparationTests(unittest.TestCase):
                     'issues': ['확인되지 않은 금액 ' * 600]}}]})
             app._prepare_cli_worker.side_effect = [WorkflowError('최종 사실 거절', run_dir),
                 {'topic': 'A', 'run_dir': str(run_dir)}]
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config)
+            app._publish_cli_worker.assert_not_called()
             app._cli_automation_cycle(config)
             second = app._prepare_cli_worker.call_args.args[2]
             self.assertEqual(second['resume_run_dir'], str(run_dir))
@@ -124,6 +130,9 @@ class InterruptedPreparationTests(unittest.TestCase):
                 'context': {'sequence': 'editorial'}, 'status': 'rejected'})
             app._prepare_cli_worker.side_effect = [WorkflowError('최종 사실 거절', run_dir),
                 {'topic': 'A', 'run_dir': str(run_dir)}]
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config)
+            app._publish_cli_worker.assert_not_called()
             app._cli_automation_cycle(config)
             second = app._prepare_cli_worker.call_args.args[2]
             self.assertEqual(second['revision_feedback'], '이전에 저장된 작성 지침')
@@ -142,6 +151,9 @@ class InterruptedPreparationTests(unittest.TestCase):
                 'context': {'sequence': 'editorial'}, 'status': 'awaiting_audit'})
             app._prepare_cli_worker.side_effect = [WorkflowError('검수 JSON 형식 오류', run_dir),
                 {'topic': 'A', 'run_dir': str(run_dir)}]
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config)
+            app._publish_cli_worker.assert_not_called()
             app._cli_automation_cycle(config)
             second = app._prepare_cli_worker.call_args.args[2]
             self.assertEqual(second['resume_run_dir'], str(run_dir))

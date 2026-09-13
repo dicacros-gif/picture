@@ -232,7 +232,7 @@ class GoogleParallelTests(unittest.TestCase):
 
 
 class CycleBudgetPropagationTests(unittest.TestCase):
-    def test_all_three_preparation_attempts_share_one_budget_without_persisting_it(self):
+    def test_single_preparation_attempt_receives_budget_without_persisting_it(self):
         from test_process_resume import ProcessResumeTests
         with tempfile.TemporaryDirectory() as folder, patch('blog_controls.BlogWorkflow') as workflow:
             app, config = ProcessResumeTests.cycle(self, folder)
@@ -240,11 +240,12 @@ class CycleBudgetPropagationTests(unittest.TestCase):
             budget = CycleBudget()
             app._prepare_cli_worker.side_effect = [WorkflowError('one'), WorkflowError('two'),
                 {'topic': 'A', 'run_dir': str(Path(folder) / 'blog-runs' / 'ready')}]
-            app._cli_automation_cycle(config, budget=budget)
-            self.assertEqual(app._prepare_cli_worker.call_count, 3)
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config, budget=budget)
+            self.assertEqual(app._prepare_cli_worker.call_count, 1)
             self.assertTrue(all(call.kwargs['budget'] is budget for call in app._prepare_cli_worker.call_args_list))
             self.assertTrue(all('budget' not in call.args[2] for call in app._prepare_cli_worker.call_args_list))
-            self.assertNotIn('budget', (Path(folder) / 'automation-history.json').read_text(encoding='utf-8'))
+            self.assertNotIn('budget', (Path(folder) / 'pending-blog-topic.json').read_text(encoding='utf-8'))
 
     def test_deadline_exception_never_consumes_three_immediate_retries(self):
         from test_process_resume import ProcessResumeTests

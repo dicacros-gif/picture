@@ -180,7 +180,7 @@ class AccountWorker(BlogWorkflowControls):
         # Bind it explicitly; never proxy arbitrary app/Tk attributes to a worker.
         return self.runtime.rank_topics(self, groups, config=config)
 
-    def _publish_cli_worker(self, article, config, budget=None):
+    def _publish_cli_worker(self, article, config, budget=None, *, allow_quality_draft=False):
         if budget is not None and config.get('publish'):
             prior = self._pending_publication_receipt(article, config)
             if prior is not None:
@@ -195,7 +195,8 @@ class AccountWorker(BlogWorkflowControls):
                 try:
                     if self.full_auto_stop.is_set():
                         raise RuntimeError('발행 대기 중 계정 자동화가 중지되었습니다.')
-                    return super()._publish_cli_worker(article, config, budget=budget)
+                    options = {'allow_quality_draft': True} if allow_quality_draft else {}
+                    return super()._publish_cli_worker(article, config, budget=budget, **options)
                 finally:
                     self.runtime.publish_lock.release()
         raise RuntimeError('발행 대기 중 계정 자동화가 중지되었습니다.')

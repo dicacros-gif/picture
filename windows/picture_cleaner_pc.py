@@ -883,7 +883,7 @@ class PictureCleanerApp(BlogWorkflowControls):
             "border": "#465568" if dark else "#b8c8d8",
             "tab": "#273548" if dark else "#dce6f1",
             "tab_selected": "#1f2937" if dark else "#ffffff",
-            "entry": "#182231" if dark else "#ffffff",
+            "entry": "#243b53" if dark else "#ffffff",
             "primary": "#2388d1" if dark else "#1769aa",
             "green": "#20a875" if dark else "#16835d",
             "danger": "#d9534f" if dark else "#c43d3d",
@@ -939,13 +939,14 @@ class PictureCleanerApp(BlogWorkflowControls):
         )
         style.configure(
             "TButton",
-            background=colors["tab"],
+            background="#34536f" if dark else colors["tab"],
             foreground=colors["text"],
             font=("맑은 고딕", 10, "bold"),
         )
         style.map(
             "TButton",
-            background=[("disabled", colors["panel_alt"]), ("active", colors["panel_alt"]), ("pressed", colors["border"])],
+            background=[("disabled", colors["panel_alt"]), ("pressed", "#1d6592" if dark else colors["border"]),
+                        ("active", "#466f92" if dark else colors["panel_alt"])],
             foreground=[("disabled", "#d3dbe5" if dark else "#667788")],
         )
         style.configure(
@@ -1016,7 +1017,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         style.configure(
             "TCombobox",
             fieldbackground=colors["entry"],
-            background=colors["entry"],
+            background="#34536f" if dark else colors["entry"],
             foreground=colors["text"],
             arrowcolor=colors["text"],
             font=("맑은 고딕", 10, "bold"),
@@ -1027,7 +1028,8 @@ class PictureCleanerApp(BlogWorkflowControls):
                 ("readonly", colors["entry"]),
                 ("focus", colors["entry"]),
             ],
-            background=[("readonly", colors["entry"])],
+            background=[("disabled", colors["panel_alt"]), ("active", "#466f92" if dark else colors["selection"]),
+                        ("readonly", "#34536f" if dark else colors["entry"])],
             foreground=[
                 ("readonly", colors["text"]),
                 ("focus", colors["text"]),
@@ -1044,6 +1046,19 @@ class PictureCleanerApp(BlogWorkflowControls):
         self.root.option_add(
             "*TCombobox*Listbox.selectForeground", colors["text"]
         )
+        # Already-created Tk popdowns keep their old option colors on a theme toggle.
+        def refresh_popdowns(parent):
+            for widget in parent.winfo_children():
+                if isinstance(widget, ttk.Combobox):
+                    pop = self.root.tk.call('ttk::combobox::PopdownWindow', str(widget))
+                    self.root.tk.call(str(pop) + '.f.l', 'configure', '-background', colors['entry'],
+                                      '-foreground', colors['text'], '-selectbackground', colors['selection'],
+                                      '-selectforeground', colors['text'])
+                refresh_popdowns(widget)
+        refresh_popdowns(self.root)
+        if hasattr(self, 'progress_panel'):
+            for text in self.progress_panel.account_texts.values():
+                text.tag_configure('failure', foreground='#ff646c' if dark else '#ba1526')
         for name in ("keyword_canvas",):
             widget = getattr(self, name, None)
             if widget:
@@ -1489,23 +1504,17 @@ class PictureCleanerApp(BlogWorkflowControls):
             style="Panel.TLabelframe",
         )
         form.pack(fill="x")
-        browser_block = ttk.Frame(form)
-        browser_block.grid(row=0, column=0, sticky="w", padx=(0, 14))
-        ttk.Label(browser_block, text="자동화 브라우저").pack(anchor="w")
-        browser_box = ttk.Combobox(browser_block, textvariable=self.comment_browser,
-                                   values=["웨일", "에지"], state="readonly", width=8)
-        browser_box.pack(anchor="w", pady=(3, 0))
-        browser_box.bind("<<ComboboxSelected>>", lambda _event: self._schedule_general_settings_save())
+        from blog_accounts_ui import CommentAccountsControls
+        self.comment_accounts_ui = CommentAccountsControls(self, form)
         labels = [
-            ("웨일 블로그 ID", self.blog_id, 18),
             ("최근 글 일수", self.comment_days, 8),
             ("답글 간격(초)", self.comment_interval, 8),
             ("이웃 댓글 간격(초)", self.neighbor_interval, 8),
             ("이웃 최대 글 수(최대 200)", self.neighbor_max, 10),
         ]
-        for col, (label, variable, width) in enumerate(labels, 1):
+        for col, (label, variable, width) in enumerate(labels):
             block = ttk.Frame(form)
-            block.grid(row=0, column=col, sticky="w", padx=(0, 14))
+            block.grid(row=1, column=col, sticky="w", padx=(0, 14))
             ttk.Label(block, text=label).pack(anchor="w")
             ttk.Entry(block, textvariable=variable, width=width).pack(anchor="w", pady=(3, 0))
         ttk.Label(
@@ -1520,7 +1529,7 @@ class PictureCleanerApp(BlogWorkflowControls):
         ).pack(anchor="w")
         ttk.Label(
             self.comment_tab,
-            text="에지는 3번 탭의 계정 2에 저장한 에지 블로그 ID와 전용 로그인 프로필을 사용합니다.",
+            text="브라우저와 블로그 ID는 3번 탭과 연동됩니다. 사용 체크는 댓글 작업 계정을 선택합니다.",
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(3, 0))
         actions = ttk.Frame(self.comment_tab)
@@ -1796,6 +1805,8 @@ class PictureCleanerApp(BlogWorkflowControls):
     def stop_full_automation(self):
         self._cancel_automatic_resume()
         self.full_auto_stop.set()
+        if getattr(self, "_active_comment_group", None) is not None:
+            self._active_comment_group.stop()
         self.naver_bot.stop()
         for bot in getattr(self, '_account_bots', {}).values():
             bot.stop()
@@ -2058,71 +2069,64 @@ class PictureCleanerApp(BlogWorkflowControls):
         except Exception:
             raise ValueError(f"{label}은(는) {minimum} 이상의 숫자로 입력하세요.")
 
-    def _comment_automation_target(self):
+    def _comment_automation_target(self, account=None):
         """Return the selected owned browser and its verified blog identity."""
-        selected = self.comment_browser.get().strip()
-        if selected == "웨일":
-            blog_id = self.blog_id.get().strip()
-            if not blog_id:
-                raise ValueError("웨일 블로그 ID를 입력하세요.")
-            return self.naver_bot, blog_id
-        from blog_accounts_ui import normalized_writer_accounts, writer_data_dir
-        account = next((row for row in normalized_writer_accounts(self.settings, self.blog_id.get())
-                        if row["id"] == "secondary" and row["browser"] == "edge"), None)
-        if account is None or not account.get("blog_id"):
-            raise ValueError("3번 탭 계정 2에서 에지와 블로그 ID를 저장한 뒤 로그인하세요.")
+        from blog_accounts_ui import normalized_writer_accounts, writer_data_dir, BROWSER_LABELS
+        if account is None:  # Legacy callers and saved browser preference.
+            selected = self.comment_browser.get().strip()
+            if selected == "웨일":
+                account = {'id': 'primary', 'browser': 'whale', 'blog_id': self.blog_id.get().strip()}
+            else:
+                account = next((row for row in normalized_writer_accounts(self.settings, self.blog_id.get())
+                                if row['id'] == 'secondary' and row['browser'] == 'edge'), None)
+        if account is None or not account.get('blog_id'):
+            raise ValueError("계정 1 또는 계정 2의 블로그 ID를 입력한 뒤 로그인하세요.")
+        if account['id'] == 'primary' and account['browser'] == 'whale':
+            return self.naver_bot, account['blog_id']
         cache = getattr(self, "_account_login_bots", {})
         self._account_login_bots = cache
         key = (account["id"], account["browser"], account["blog_id"])
         bot = cache.get(key)
         if bot is None:
             from blog_browser import create_blog_browser
-            label = f"에지 · {account['blog_id']}"
-            logger = lambda message: self.events.put(("account_log", "secondary", label, str(message)))
+            label = f"{BROWSER_LABELS[account['browser']]} · {account['blog_id']}"
+            logger = lambda message: self.events.put(("account_log", account["id"], label, str(message)))
             bot = cache[key] = create_blog_browser(
                 writer_data_dir(self.cli_app_dir, account), logger,
-                browser="edge", blog_id=account["blog_id"])
+                browser=account["browser"], blog_id=account["blog_id"])
         return bot, account["blog_id"]
+
+    def _start_comment_accounts(self, label, method, args):
+        from blog_accounts_ui import CommentTaskGroup, validate_writer_accounts
+        if self._browser_task_busy():
+            raise ValueError("브라우저 자동화 작업을 완료하거나 중지한 뒤 댓글 작업을 실행하세요.")
+        accounts = validate_writer_accounts(self.comment_accounts_ui.snapshot())
+        selected = [row for row in accounts if row['enabled']]
+        if not selected:
+            raise ValueError("댓글 작업을 할 계정의 사용을 체크하세요.")
+        targets = [self._comment_automation_target(row) for row in selected]
+        group = CommentTaskGroup(targets)
+        self._active_comment_group = group
+        self.comment_accounts_ui.save()
+        self._start_naver_task(label, group.run, method, args, self._naver_log, bot=group)
 
     def start_own_comments(self):
         try:
             days = self._positive_int(self.comment_days.get(), "최근 글 일수", 1)
             interval = self._positive_int(self.comment_interval.get(), "답글 간격", 0)
-            bot, blog_id = self._comment_automation_target()
+            self._start_comment_accounts("내 글 답글·하트", "run_own_posts", (days, interval, True))
         except ValueError as exc:
             messagebox.showinfo(APP_NAME, str(exc))
-            return
-        self.status.set(f"최근 {days}일 미응답 댓글·하트 작업을 바로 시작합니다.")
-        self._start_naver_task(
-            "내 글 답글·하트",
-            bot.run_own_posts,
-            blog_id,
-            days,
-            interval,
-            True,
-            bot=bot,
-        )
 
     def start_neighbor_comments(self):
         try:
             interval = self._positive_int(self.neighbor_interval.get(), "이웃 댓글 간격", 10)
             maximum = self._positive_int(self.neighbor_max.get(), "이웃 최대 글 수", 1)
-            bot, blog_id = self._comment_automation_target()
+            if maximum > 200:
+                raise ValueError("한 번에 처리할 이웃 새글은 최대 200개입니다.")
+            self._start_comment_accounts("이웃 새글 댓글", "run_neighbor_posts", (interval, maximum))
         except ValueError as exc:
             messagebox.showinfo(APP_NAME, str(exc))
-            return
-        if maximum > 200:
-            messagebox.showinfo(APP_NAME, "한 번에 처리할 이웃 새글은 최대 200개입니다.")
-            return
-        self.status.set(f"이웃 새글 {maximum}개, {interval}초 간격 작업을 바로 시작합니다.")
-        self._start_naver_task(
-            "이웃 새글 댓글",
-            bot.run_neighbor_posts,
-            blog_id,
-            interval,
-            maximum,
-            bot=bot,
-        )
 
     def choose_folder(self):
         selected = filedialog.askdirectory(initialdir=self.folder.get())

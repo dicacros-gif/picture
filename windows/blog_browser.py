@@ -303,9 +303,11 @@ class BlogBrowser(NaverAutomation):
             return False
         return super()._article_ready_to_publish(driver, *args, **kwargs)
 
-    def publish_naver_article(self, blog_id: str, article: dict, *, publish: bool = True, save_draft: bool = False) -> dict:
+    def publish_naver_article(self, blog_id: str, article: dict, *, publish: bool = True, save_draft: bool = False,
+                              allow_quality_draft: bool = False) -> dict:
         target = self.bind_target_blog(blog_id)
-        return super().publish_naver_article(target, article, publish=publish, save_draft=save_draft)
+        options = {'allow_quality_draft': True} if allow_quality_draft else {}
+        return super().publish_naver_article(target, article, publish=publish, save_draft=save_draft, **options)
 
 
 def create_blog_browser(data_dir: Path, logger: Callable[[str], None], browser: str = "whale", *,

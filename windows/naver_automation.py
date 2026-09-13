@@ -4344,7 +4344,7 @@ class NaverAutomation:
                 "attributions_rendered": credit_matches}
 
     @classmethod
-    def _publication_key(cls, blog_id: str, article: dict) -> str:
+    def _publication_key(cls, blog_id: str, article: dict, *, draft_only=False) -> str:
         """Compute the original submission identity without opening image files."""
         blog_id = cls._clean_blog_id(blog_id)
         if not isinstance(article, dict):
@@ -4355,7 +4355,7 @@ class NaverAutomation:
         if (not isinstance(paragraphs, list) or len(paragraphs) != 8
                 or any(not isinstance(item, str) or not item.strip() for item in paragraphs)):
             raise ValueError("발행 기록 조회에는 비어 있지 않은 본문 8개 구역이 필요합니다.")
-        if not isinstance(images, list) or not 6 <= len(images) <= 16:
+        if not isinstance(images, list) or not (0 if draft_only else 6) <= len(images) <= 16:
             raise ValueError("발행 기록 조회에는 이미지 6~16장의 식별 정보가 필요합니다.")
         for item in images:
             if (not isinstance(item, dict) or type(item.get("paragraph_index")) is not int
@@ -4485,7 +4485,35 @@ class NaverAutomation:
             """, token))
         return bool(cls._find_across_frames(driver, finder))
 
+    def _dismiss_writer_help(self, driver):
+        """Close only the editor's identified help panel, never an unknown modal."""
+        def finder():
+            for heading in driver.find_elements(By.CSS_SELECTOR, '.se-help-title'):
+                if not heading.is_displayed():
+                    continue
+                buttons = driver.execute_script("""
+                    let panel=arguments[0].parentElement;
+                    for(let depth=0; panel && depth<4 && panel.tagName!=='BODY'; depth++,panel=panel.parentElement) {
+                        const buttons=Array.from(panel.querySelectorAll('button')).filter(b=>
+                            b.getClientRects().length && !b.disabled &&
+                            (/close/i.test(b.className)||/닫기/.test((b.innerText||'')+' '+(b.getAttribute('aria-label')||''))));
+                        if(buttons.length===1) return buttons;
+                        if(buttons.length>1) return [];
+                    }
+                    return [];
+                """, heading)
+                if isinstance(buttons, list) and len(buttons) == 1:
+                    return buttons[0]
+            return None
+        close = self._find_across_frames(driver, finder)
+        if close is None:
+            return False
+        close.click()
+        self.log('저장 버튼을 가리는 편집기 도움말을 닫았습니다.')
+        return True
+
     def _save_prepared_article_draft(self, driver, prepared: dict) -> dict:
+        self._dismiss_writer_help(driver)
         def single_save_button(d):
             buttons = self._find_draft_buttons(d) or []
             candidates = [button for button in buttons if self._normalized_text(button.text) in {"저장", "임시저장"}]
@@ -4499,7 +4527,18 @@ class NaverAutomation:
         token = str(uuid.uuid4())
         self._arm_article_draft_confirmation(driver, token)
         try:
-            button.click()
+            try:
+                button.click()
+            except ElementClickInterceptedException:
+                # Interception means no save click reached the page. Close only
+                # known help, then reacquire the identical save button once.
+                if not self._dismiss_writer_help(driver) or self.stop_event.is_set():
+                    raise
+                current = WebDriverWait(driver, 10).until(single_save_button)
+                if current != button:
+                    raise RuntimeError('도움말 처리 후 같은 저장 버튼을 확인하지 못했습니다.')
+                self._arm_article_draft_confirmation(driver, token)
+                current.click()
             WebDriverWait(driver, 20).until(lambda d: self._fresh_article_draft_confirmed(d, token))
         except WebDriverException as exc:
             raise RuntimeError(
@@ -4536,7 +4575,8 @@ class NaverAutomation:
                 return {**prior, "reused_receipt": True}
         title, paragraphs, images = (self._validate_quality_draft_article(article)
                                      if allow_quality_draft else self._validate_publish_article(article))
-        key = self._publication_key(blog_id, {"title": title, "paragraphs": paragraphs, "images": images})
+        key = self._publication_key(blog_id, {"title": title, "paragraphs": paragraphs, "images": images},
+                                    **({'draft_only': True} if allow_quality_draft else {}))
         receipt_path = self.data_dir / "publication_receipts" / f"{key}.json"
         driver = self._driver()
         bold_terms = article.get("bold_terms", [])

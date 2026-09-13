@@ -1,6 +1,7 @@
 """Shared draggable progress pane; all updates run on Tk's main thread."""
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
+import re
 
 
 class ProgressPanel:
@@ -116,7 +117,10 @@ class ProgressPanel:
     def append(self, message, account='primary'):
         target = self.account_texts.get(account, self.text)
         target.configure(state="normal")
-        target.insert("end", message + "\n")
+        dark = getattr(self.app, 'dark_mode', None)
+        target.tag_configure('failure', foreground='#ff646c' if dark is not None and dark.get() else '#ba1526')
+        tags = ('failure',) if re.search(r'실패|오류|거절|미달|(?:\bfailed\b|\berror\b)', message, re.I) else ()
+        target.insert("end", message + "\n", tags)
         lines = int(target.index("end-1c").split(".")[0])
         if lines > 5000:
             target.delete("1.0", f"{lines - 5000 + 1}.0")

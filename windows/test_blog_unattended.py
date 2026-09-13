@@ -100,17 +100,18 @@ class CandidateRetryTests(unittest.TestCase):
         config = {"steps": ["chatgpt"], "models": {}, "publish": True, "completion_label": "자동 발행"}
         return app, config
 
-    def test_generation_failure_retries_the_selected_topic(self):
+    def test_generation_failure_does_not_repeat_preparation_in_same_cycle(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
             app, config = self.make_cycle(folder)
             workflow.return_value.select_topic.side_effect = WorkflowError("의미 거절")
             app._prepare_cli_worker.side_effect = [WorkflowError("이미지 검수 실패"), {"run_dir": folder}]
-            app._cli_automation_cycle(config)
+            with self.assertRaises(WorkflowError):
+                app._cli_automation_cycle(config)
             app._rank_longtail_topics.assert_called_once()
             self.assertEqual(workflow.return_value.select_topic.call_count, 1)
             self.assertEqual(len(workflow.return_value.select_topic.call_args.args[0]), 4)
-            self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ["A", "A"])
-            app._publish_cli_worker.assert_called_once()
+            self.assertEqual([call.args[0] for call in app._prepare_cli_worker.call_args_list], ["A"])
+            app._publish_cli_worker.assert_not_called()
 
     def test_exhausted_attempts_keep_topic_across_next_cycle(self):
         with tempfile.TemporaryDirectory() as folder, patch("blog_controls.BlogWorkflow") as workflow:
@@ -119,7 +120,7 @@ class CandidateRetryTests(unittest.TestCase):
             app._prepare_cli_worker.side_effect = WorkflowError("도구 실패")
             with self.assertRaisesRegex(WorkflowError, "주제를 바꾸지 않고"):
                 app._cli_automation_cycle(config)
-            self.assertEqual([c.args[0] for c in app._prepare_cli_worker.call_args_list], ["A"] * 3)
+            self.assertEqual([c.args[0] for c in app._prepare_cli_worker.call_args_list], ["A"])
             app._publish_cli_worker.assert_not_called()
             app._prepare_cli_worker.side_effect = None
             app._prepare_cli_worker.return_value = {"topic": "A", "run_dir": folder}

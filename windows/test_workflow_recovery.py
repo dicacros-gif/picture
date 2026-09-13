@@ -54,7 +54,7 @@ class WorkflowRecoveryTests(unittest.TestCase):
         checkpoint = json.loads(Path(failed["run_dir"], "stage-2-antigravity.checkpoint.json").read_text(encoding="utf-8"))
         self.assertEqual(checkpoint["actual_route"]["provider"], "chatgpt")
         self.assertEqual(checkpoint["actual_route"]["model"], "writer")
-        self.assertEqual(checkpoint["response_name"], "stage-2-antigravity-recovery")
+        self.assertEqual(checkpoint["response_name"], "stage-2-antigravity")
         for key in ("upstream_sha256", "article_sha256", "request_sha256"):
             self.assertEqual(len(checkpoint[key]), 64)
         self.bridge.missing_image_index = None

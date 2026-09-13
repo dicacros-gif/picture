@@ -560,6 +560,26 @@ class PublishTests(unittest.TestCase):
                 "testblog", self.article, publish=True, save_draft=False, allow_quality_draft=True)
         self.app._driver.assert_not_called()
 
+    def test_save_intercepted_by_known_help_retries_only_same_button(self):
+        from selenium.common.exceptions import ElementClickInterceptedException
+        button = self._mock_draft_button()
+        button.click.side_effect = [ElementClickInterceptedException('se-help-title'), None]
+        self.app._dismiss_writer_help = MagicMock(side_effect=[False, True])
+        result = self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        self.assertTrue(result['saved'])
+        self.assertEqual(button.click.call_count, 2)
+        self.final.click.assert_not_called()
+
+    def test_save_intercepted_by_unknown_overlay_is_not_retried(self):
+        from selenium.common.exceptions import ElementClickInterceptedException
+        button = self._mock_draft_button()
+        button.click.side_effect = ElementClickInterceptedException('unknown overlay')
+        self.app._dismiss_writer_help = MagicMock(return_value=False)
+        with self.assertRaises(RuntimeError):
+            self.app.publish_naver_article('testblog', self.article, publish=False, save_draft=True)
+        button.click.assert_called_once()
+        self.final.click.assert_not_called()
+
     def test_draft_confirmation_timeout_is_failure_and_never_reclicked(self):
         button = self._mock_draft_button(confirmed=False)
         with self.assertRaisesRegex(RuntimeError, "저장 성공으로 처리하지"):
